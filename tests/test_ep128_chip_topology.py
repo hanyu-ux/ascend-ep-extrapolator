@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 import profile_ep128 as p
-import validate_ep128_capture as independent
+from tools import validate_ep128_capture as independent
 from test_ep128_layer_mean import synthetic_report, attach
 from test_ep128_v2_driver import measurements as source_measurements
 from test_ep128_v2_measure import fixture as csv_fixture, MODEL as CSV_MODEL

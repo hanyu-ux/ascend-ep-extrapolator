@@ -14,7 +14,7 @@ import unittest
 import xml.etree.ElementTree as ET
 from zipfile import ZipFile
 
-HERE=Path(__file__).resolve().parent
+HERE=Path(__file__).resolve().parents[1]
 RENDERER=HERE/'ep128_v2_excel.py'
 if not RENDERER.exists():
     RENDERER=HERE/'build_ep128_leadership_excel.py'

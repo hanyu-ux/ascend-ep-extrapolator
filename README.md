@@ -4,6 +4,21 @@
 
 当前实现针对已核对的 **DSpark：源模型 8 个主层 + 3 个草稿层、每轮一次草稿 forward**。示例场景为 EP16 → EP128、主模型 8 → 61 层、草稿仍为 3 层。这是一套带明确假设的工程估算工具；输出不是目标 EP128 的实测性能，也不适用于任意模型和采样结构。
 
+**日常使用只需要根目录这4个程序/配置文件**，另行准备自己的采样数据和通信参考表。`tests/` 用于维护回归测试，`tools/` 是可选检查工具，均不参与默认估算流程。
+
+```text
+ascend-ep-extrapolator/
+├── profile_ep128.py                  # 核心统计与外推
+├── build_ep128_leadership_excel.py   # Excel / HTML 展示
+├── ep128_xlsx_writer.py              # XLSX 写入器
+├── profile_ep128_cases.example.json  # 配置模板
+├── README.md
+├── tests/                           # 回归测试
+├── tools/                           # 可选检查工具
+├── docs/                            # 详细说明、版本记录与 PPT
+└── examples/                        # 合成数据示例
+```
+
 ## 依赖与文件
 
 离线运行需要 **Python 3.10+，仅使用标准库**；不需要安装 PyTorch、CANN、pandas、openpyxl 或 Office，也不需要在统计机器上连接 NPU。原始采样需要预先导出为 `kernel_details.csv`；同次 `trace_view.json` 可补充 Host 来源诊断。
@@ -15,9 +30,9 @@
 | `ep128_xlsx_writer.py` | 标准库 XLSX 写入器，支持可编辑的原生条形图和折线图 |
 | `profile_ep128_cases.example.json` | 源/目标模型、拓扑、BS、草稿长度和有效输出长度的配置模板 |
 | `examples/communication-reference.synthetic.csv` | **合成通信参考表**，仅演示格式和计算流程，不是历史硬件实测 |
-| `test_ep128*.py` | 当前统计、公式、展示和文件格式回归测试 |
-| `validate_ep128_capture.py` | 独立核对原始采样和导出账本的辅助工具 |
-| `profile_ep128_comm_reference.py` | 独立检查通信参考表并导出比值的辅助工具 |
+| `tests/test_ep128*.py` | 维护代码时检查统计、公式、展示和文件格式，不是运行时依赖 |
+| `tools/validate_ep128_capture.py` | 可选：独立核对原始采样和导出账本 |
+| `tools/profile_ep128_comm_reference.py` | 可选：独立检查通信参考表并导出比值 |
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
@@ -217,14 +232,23 @@ PPT 使用可编辑形状和文字，展示源8+3周期、层区间边界、层�
 
 ## 开发验证
 
-在仓库根目录运行标准库测试：
+日常统计无需执行测试。维护代码时，在仓库根目录运行：
 
 ```bash
-python -B -S -m unittest discover -s . -p "test_ep128*.py" -v
+python -B -S -m unittest discover -s tests -p "test_ep128*.py" -v
 ```
 
 测试涉及手算公式、rank 聚合、周期闭合、打包 FP4 原生证据路径、BS 分组/缺值处理与 XLSX 原生图表。相关 fixture 为合成数据，不能用于宣称目标硬件性能。若已安装 openpyxl，部分测试会额外校验第三方读取兼容性；它不是运行时依赖。
 
 当前独立仓库验证共发现 221 项测试：211 项通过，10 项跳过。其中 8 项依赖未归档的私有真实采样 fixture，另外 2 项是标准库隔离模式下的可选 openpyxl 兼容检查。合成通信表为新建的演示数据，未复制原历史实测表。
+
+需要独立复核时，可以从仓库根目录按需使用辅助工具：
+
+```bash
+python tools/validate_ep128_capture.py cases.local.json --stats-dir ep128_report
+python tools/profile_ep128_comm_reference.py data/communication-reference.csv --out communication_reference_report
+```
+
+辅助工具各自读取指定输入并输出复核结果，不是主脚本运行前必须执行的步骤；详细选项见各工具的 `--help`。
 
 原始 trace、采样目录、个人本地配置和生成报告由 `.gitignore` 排除。归档来源与 SHA-256 见 [版本记录](docs/versions.json)。

@@ -10,7 +10,7 @@ from unittest import mock
 import profile_ep128 as core
 
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[1]
 REMOVED_OPTIONS = (
     ("--source-point",),
     ("--assumption-scenarios",),

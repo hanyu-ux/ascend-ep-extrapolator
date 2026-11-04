@@ -18,7 +18,7 @@ from zipfile import ZipFile
 
 import profile_ep128 as core
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[1]
 
 
 def synthetic_report(directory, depth=61, target_k=24):

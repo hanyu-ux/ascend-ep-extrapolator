@@ -17,7 +17,7 @@ from zipfile import ZipFile
 import profile_ep128 as p
 from test_ep128_v2_measure import MODEL, CASE, EPOCH_NS, fixture, stamp_ns
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[1]
 
 
 def manifest(base, *, full=False):

@@ -182,7 +182,7 @@ class LayerMeanTests(unittest.TestCase):
 
     def test_fixed_14us_is_absolute_once_per_target_comm_call_in_method1_only(self):
         report, native = synthetic_report({"dp0": [1., 3.], "dp1": [2.2, 2.2]})
-        reference = Path(__file__).parent / "examples/communication-reference.synthetic.csv"
+        reference = Path(__file__).resolve().parents[1] / "examples/communication-reference.synthetic.csv"
         report["communication_reference"] = {"rows": core.read_reference(reference)}
         with patch.object(core, "METHOD1_EXTRA_US", 0.):
             plain_first, plain_second = attach(report, native)
@@ -292,7 +292,7 @@ class LayerMeanTests(unittest.TestCase):
 
     def test_synthetic_reference_method2_needs_no_manual_basis_or_component_flags(self):
         report, native = synthetic_report()
-        reference = Path(__file__).parent / "examples/communication-reference.synthetic.csv"
+        reference = Path(__file__).resolve().parents[1] / "examples/communication-reference.synthetic.csv"
         report["communication_reference"] = {"rows": core.read_reference(reference)}
         first, second = attach(report, native)
         self.assertEqual(second["status"], "LAYER_MEAN_ESTIMATE", second["reasons"])

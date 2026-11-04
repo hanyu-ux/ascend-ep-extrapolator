@@ -48,7 +48,8 @@
     "Example capture and real communication-reference paths are repository-relative placeholders.",
     "Tests use a newly generated synthetic communication table; no historical measured values were copied.",
     "Tests requiring private capture fixtures are skipped when those fixtures are absent.",
-    "The original machine-specific test import fallback was removed."
+    "The original machine-specific test import fallback was removed.",
+    "Regression tests were grouped under tests/ and optional standalone checks under tools/; runtime scripts and presentation assets are unchanged."
   ],
   "validation": {
     "discovered_tests": 221,

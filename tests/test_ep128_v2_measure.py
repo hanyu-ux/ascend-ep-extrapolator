@@ -934,7 +934,7 @@ class ResidualStageTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    (Path(__file__).resolve().parent / "real_validation_20261102"
+    (Path(__file__).resolve().parents[1] / "real_validation_20261102"
      / "dp9_pasted_evidence_20261103" / "stage_oracle.json").is_file(),
     "Optional private device trace fixture is not bundled; synthetic coverage remains enabled")
 class Dp9PastedStageTests(unittest.TestCase):
@@ -942,7 +942,7 @@ class Dp9PastedStageTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.fixture_dir = (Path(__file__).resolve().parent / "real_validation_20261102"
+        cls.fixture_dir = (Path(__file__).resolve().parents[1] / "real_validation_20261102"
                            / "dp9_pasted_evidence_20261103")
         cls.oracle = json.loads((cls.fixture_dir / "stage_oracle.json").read_text(encoding="utf-8"))
         cls.payloads = {}

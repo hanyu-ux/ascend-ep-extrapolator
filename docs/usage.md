@@ -4,15 +4,18 @@
 
 使用 Python 3.10 或更新版本。核心统计、Excel 写入和 HTML 导出均只依赖标准库，不需要安装 requirements，也不需要在运行统计的机器上安装 PyTorch、CANN 或连接 NPU。
 
-根目录的三个运行文件应保持在一起：
+日常使用只需要根目录的三个运行脚本和配置文件，并准备自己的采样数据；三个脚本应保持在同一目录：
 
 ```text
 profile_ep128.py
 build_ep128_leadership_excel.py
 ep128_xlsx_writer.py
+profile_ep128_cases.example.json
 ```
 
-`validate_ep128_capture.py` 和 `profile_ep128_comm_reference.py` 为可选辅助工具，不是默认估算的运行时依赖。
+`tests/` 是维护代码时运行的回归测试，`tools/` 是可选检查工具，`docs/` 保存说明与 PPT，`examples/` 保存合成数据示例。它们均不参与默认估算流程。
+
+`tools/validate_ep128_capture.py` 和 `tools/profile_ep128_comm_reference.py` 可按需独立复核采样或通信表，不是运行时依赖。
 
 ## 1. 准备配置和数据
 
@@ -112,8 +115,21 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 
 ## 7. 运行回归测试
 
+日常统计无需执行测试。维护代码时，从仓库根目录运行：
+
 ```bash
-python -B -S -m unittest discover -s . -p "test_ep128*.py" -v
+python -B -S -m unittest discover -s tests -p "test_ep128*.py" -v
 ```
 
 `-S` 用于验证标准库环境。依赖未归档私有采样的 8 项测试会明确跳过；可选 openpyxl 读取检查在未安装该包时跳过。测试使用的合成数据不能作为目标硬件实测证据。
+
+## 8. 可选独立检查工具
+
+从仓库根目录执行：
+
+```bash
+python tools/validate_ep128_capture.py cases.local.json --stats-dir ep128_report
+python tools/profile_ep128_comm_reference.py data/communication-reference.csv --out communication_reference_report
+```
+
+前者独立核对原始采样及已导出的账本，后者检查指定通信表并导出观测比值。它们不会被主估算脚本自动调用，也不是运行前的必需步骤。其他参数见各工具的 `--help`。

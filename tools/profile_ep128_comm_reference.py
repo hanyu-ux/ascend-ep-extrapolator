@@ -2,7 +2,7 @@
 """Validate another scenario's communication table and export observed EP ratios.
 
 Example:
-  python3 profile_ep128_comm_reference.py ep_comm_reference_20261028/raw.csv \
+  python3 tools/profile_ep128_comm_reference.py data/communication-reference.csv \
       --out ep128_empirical_report
 
 Standard library only. No model, Torch, NPU, network, or trace processing is used.
