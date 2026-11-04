@@ -36,7 +36,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-三个运行脚本应放在同一目录。当前版本：统计 `20261103.12.native_stages`、Excel 生成器 `20261104.2.bs_inventory`、写入器 `20261104.1.line_charts`。
+三个运行脚本应放在同一目录。当前版本：统计 `20261104.1.swa_u_drilldown`、Excel 生成器 `20261104.3.swa_u_drilldown`、写入器 `20261104.1.line_charts`。
 
 ## 快速运行
 
@@ -196,6 +196,8 @@ TPOT（ms/token） = R / Neff
 
 脚本默认尝试对源 U1、U2 识别连续的 8+7 个父阶段，并对 Markov 逐位置选 token 保留子阶段。15阶段仅用于解释 U，**不额外加到周期上，也不改变外推结果**。
 
+本次增加下一主模型 KV/输入准备、主/草稿 metadata 的子阶段，以及每 rank、每个草稿 SWA 层的 10 段诊断。metadata 本体与前后的映射准备分开；原始 Task Type 保留 AI_CPU 等执行类型，busy 不等于 AICORE 有效算力。详见[结果读取说明](docs/usage.md#6-如何核对结果)。
+
 - 当前外推直接使用同 BS、同 rank、同轮的 `U目标=U源`，不乘 EP 倍率，也不乘主层数；没有证明 EP 扩大后 U 一定不变。
 - U 包括输出处理、采样、上下文融合、KV/metadata/输入准备、主草稿切换以及其中的任务间隔，不是单一 Head、CPU 耗时或固定空闲。
 - 有同次 trace 时补充 PyTorch/CANN/queue/设备来源关联；Host 同时段覆盖不等于该阶段独有的 CPU 成本。缺 trace 不阻断设备统计。
@@ -215,8 +217,9 @@ TPOT（ms/token） = R / Neff
 | `layers.csv` / `components.csv` | 源层与组件实测 |
 | `rank_estimates.csv` / `round_estimates.csv` | 逐 rank 与逐轮外推 |
 | `boundary_accounting.csv` / `compute_evidence.csv` | 边界计账与路由 GMM 证据 |
-| `step_residual_stages.csv` / `step_residual_substages.csv` | U 父阶段与 Markov 子阶段汇总 |
-| `step_residual_details/` | 各 rank 的原始设备明细、精确阶段边界与来源链 |
+| `step_residual_stages.csv` / `step_residual_substages.csv` | U15 父阶段与 Markov、下一主输入及 metadata 子阶段汇总 |
+| `swa_stage_summary.csv` | 每 case、rank、草稿层的 SWA 10 段统计 |
+| `step_residual_details/` | 各 rank 的原始设备明细、精确阶段边界、来源链及 `*-swa-stages.csv` |
 
 Excel 的 BS 折线取 `config.bs` 数值排序；其他声明条件不同则分组。重复 BS 保留原值但不合并绘线；单点组只显示表格；未知值保留空白并断线，不补0。顶部索引列出全部采样组合，避免把单独分组误认为遗漏。
 
@@ -232,6 +235,10 @@ PPT 使用可编辑形状和文字，展示源8+3周期、层区间边界、层�
 
 ## 开发验证
 
+后续脚本迭代统一使用 **新分支 → 提 PR → 验证 → 合并 PR**。PR 说明脚本功能、统计口径和软件回归结果；验证通过后按仓库所有者授权直接合并。运行时性能优化还须在本地完成正确性与设备 A/B 验证，详细采样证据和优化分析不上传。
+
+远端只维护脚本、测试、通用使用说明和既有 PPT 归档。详细 profiling 分析、实测数据与优化方案保存在本地，不提交到仓库或 PR 正文。
+
 日常统计无需执行测试。维护代码时，在仓库根目录运行：
 
 ```bash
@@ -240,7 +247,7 @@ python -B -S -m unittest discover -s tests -p "test_ep128*.py" -v
 
 测试涉及手算公式、rank 聚合、周期闭合、打包 FP4 原生证据路径、BS 分组/缺值处理与 XLSX 原生图表。相关 fixture 为合成数据，不能用于宣称目标硬件性能。若已安装 openpyxl，部分测试会额外校验第三方读取兼容性；它不是运行时依赖。
 
-当前独立仓库验证共发现 221 项测试：211 项通过，10 项跳过。其中 8 项依赖未归档的私有真实采样 fixture，另外 2 项是标准库隔离模式下的可选 openpyxl 兼容检查。合成通信表为新建的演示数据，未复制原历史实测表。
+测试数量与结果见[版本记录](docs/versions.json)和对应 PR 的验证记录。跳过项包括 8 项未归档私有真实采样 fixture 和标准库隔离模式下的可选 openpyxl 兼容检查。PR 自动运行 Python 3.10、3.12 的标准库回归；真实采样的详细复核结果仅保存在本地。合成通信表为新建的演示数据，未复制原历史实测表。
 
 需要独立复核时，可以从仓库根目录按需使用辅助工具：
 
