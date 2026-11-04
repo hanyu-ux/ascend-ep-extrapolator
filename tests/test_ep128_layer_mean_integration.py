@@ -215,5 +215,81 @@ class LayerMeanIntegrationTests(unittest.TestCase):
             self.assertNotEqual(rejected.returncode, 0)
 
 
+class SWADrilldownTests(unittest.TestCase):
+    def fixture(self, directory, mutate=None):
+        from test_ep128_v2_measure import fixture, MODEL, CASE
+        def changes(rows, records):
+            for row in rows:
+                if row["Model ID"] == "49" and row["Name"] == "Attention":
+                    row.update(Name="aclnnSparseAttnSharedkv_SparseAttnSharedkv", Type="SparseAttnSharedkv")
+            if mutate:
+                mutate(rows)
+        capture, _ = fixture(directory, changes=changes)
+        return capture, core.measure_capture(capture, MODEL, CASE)
+
+    def test_swa_spans_close_to_each_layer_and_keep_main_comparisons(self):
+        with tempfile.TemporaryDirectory() as temp:
+            capture, measured = self.fixture(Path(temp))
+            diagnostic = core.swa_analyze_capture(capture, measured, temp)
+            self.assertEqual(diagnostic["status"], "MATCHED")
+            self.assertEqual(len(diagnostic["layer_summary"]), 11)
+            self.assertFalse(diagnostic["layer_summary"][0]["reference_eligible"])
+            self.assertEqual(len(diagnostic["stage_summary"]), 30)
+            for layer in (0, 1, 2):
+                rows = [row for row in diagnostic["stage_summary"] if row["layer"] == layer]
+                baseline = next(row for row in diagnostic["layer_summary"] if row["role"] == "draft" and row["layer"] == layer)
+                self.assertAlmostEqual(sum(row["duration_ms_mean"] for row in rows), baseline["wall_ms_mean"])
+                self.assertTrue(all(row["attention"] == "SWA" for row in rows))
+            with Path(diagnostic["stages_csv"]).open() as source:
+                rows = list(csv.DictReader(source))
+            first = rows[0]
+            self.assertIsInstance(json.loads(first["top_gaps"]), list)
+            self.assertIn("row_index", json.loads(first["start_anchor"]))
+
+    def test_missing_swa_anchor_is_unknown_and_preserves_whole_layer(self):
+        def missing(rows):
+            for row in rows:
+                if row["Model ID"] == "49" and row["Type"] == "SparseAttnSharedkv":
+                    row.update(Name="UnknownAttention", Type="UnknownAttention")
+        with tempfile.TemporaryDirectory() as temp:
+            capture, measured = self.fixture(Path(temp), missing)
+            diagnostic = core.swa_analyze_capture(capture, measured, temp)
+            self.assertEqual(diagnostic["status"], "PARTIAL")
+            self.assertTrue(all(row["stage_key"] == "unresolved" and row["duration_ms_mean"] is None
+                                for row in diagnostic["stage_summary"]))
+            self.assertTrue(all(row["wall_ms_mean"] > 0 for row in diagnostic["layer_summary"]))
+
+    def test_absent_wait_column_stays_unknown_without_losing_busy_or_wall(self):
+        def missing_wait(rows):
+            for row in rows:
+                row.pop("Wait Time(us)", None)
+        with tempfile.TemporaryDirectory() as temp:
+            capture, measured = self.fixture(Path(temp), missing_wait)
+            diagnostic = core.swa_analyze_capture(capture, measured, temp)
+            self.assertEqual(diagnostic["status"], "MATCHED")
+            self.assertTrue(all(row["total_cost_ms_mean"] is None for row in diagnostic["layer_summary"]))
+            self.assertTrue(all(row["total_cost_ms_mean"] is None for row in diagnostic["stage_summary"]
+                                if row["kernel_sum_ms_mean"] > 0))
+            self.assertTrue(all(row["total_cost_ms_mean"] == 0 for row in diagnostic["stage_summary"]
+                                if row["kernel_sum_ms_mean"] == 0))
+            self.assertTrue(all(row["recorded_busy_ms_mean"] > 0 for row in diagnostic["layer_summary"]))
+
+    def test_one_bad_round_never_becomes_a_zero_or_a_subset_mean(self):
+        # Mutate a retained round directly, avoiding any guessed epoch units.
+        with tempfile.TemporaryDirectory() as temp:
+            capture, measured = self.fixture(Path(temp))
+            layer = measured["rounds"][0]["layers"][8]
+            task = next(task for task in capture["tasks"] if int(layer["start_ns"]) <= task.start_ns < int(layer["end_ns"])
+                        and task.op_type == "SparseAttnSharedkv")
+            task.name, task.op_type = "UnknownAttention", "UnknownAttention"
+            diagnostic = core.swa_analyze_capture(capture, measured, temp)
+            partial = [row for row in diagnostic["stage_summary"] if row["layer"] == 0]
+            self.assertTrue(partial)
+            self.assertTrue(all(row["duration_ms_mean"] is None for row in partial))
+            self.assertTrue(any(row["status"] == "PARTIAL" for row in partial))
+            other = [row for row in diagnostic["stage_summary"] if row["layer"] != 0]
+            self.assertTrue(all(row["status"] == "MATCHED" for row in other))
+
+
 if __name__ == "__main__":
     unittest.main()
