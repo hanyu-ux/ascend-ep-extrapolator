@@ -1,0 +1,230 @@
+# Ascend EP Extrapolator
+
+基于 Ascend 原生设备采样，按 HC 层区间外推 MoE 推理的完整周期、TPOT 和单物理卡吞吐，并导出可复核的 CSV、JSON、HTML 和 Excel。
+
+当前实现针对已核对的 **DSpark：源模型 8 个主层 + 3 个草稿层、每轮一次草稿 forward**。示例场景为 EP16 → EP128、主模型 8 → 61 层、草稿仍为 3 层。这是一套带明确假设的工程估算工具；输出不是目标 EP128 的实测性能，也不适用于任意模型和采样结构。
+
+## 依赖与文件
+
+离线运行需要 **Python 3.10+，仅使用标准库**；不需要安装 PyTorch、CANN、pandas、openpyxl 或 Office，也不需要在统计机器上连接 NPU。原始采样需要预先导出为 `kernel_details.csv`；同次 `trace_view.json` 可补充 Host 来源诊断。
+
+| 文件 | 用途 |
+| --- | --- |
+| `profile_ep128.py` | 读取采样、识别层与 HC 周期、执行两种外推、输出证据和结果 |
+| `build_ep128_leadership_excel.py` | 从核心报告生成 Excel 与配套 HTML，不重新估算 |
+| `ep128_xlsx_writer.py` | 标准库 XLSX 写入器，支持可编辑的原生条形图和折线图 |
+| `profile_ep128_cases.example.json` | 源/目标模型、拓扑、BS、草稿长度和有效输出长度的配置模板 |
+| `examples/communication-reference.synthetic.csv` | **合成通信参考表**，仅演示格式和计算流程，不是历史硬件实测 |
+| `test_ep128*.py` | 当前统计、公式、展示和文件格式回归测试 |
+| `validate_ep128_capture.py` | 独立核对原始采样和导出账本的辅助工具 |
+| `profile_ep128_comm_reference.py` | 独立检查通信参考表并导出比值的辅助工具 |
+| `docs/usage.md` | 输入配置与操作说明 |
+| `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
+
+三个运行脚本应放在同一目录。当前版本：统计 `20261103.12.native_stages`、Excel 生成器 `20261104.2.bs_inventory`、写入器 `20261104.1.line_charts`。
+
+## 快速运行
+
+从仓库根目录执行。下面使用 `python`；Windows 可替换为 `py -3`，Linux 环境也可使用 `python3`。
+
+1. 复制配置模板：
+
+   ```bash
+   python -c "from shutil import copyfile; copyfile('profile_ep128_cases.example.json', 'cases.local.json')"
+   ```
+
+2. 编辑 `cases.local.json`：把示例输入路径替换为自己的采样目录，并核对模型、拓扑和输出 token 口径。模板将通信表指向 `data/communication-reference.csv`，请放入可比较的真实历史参考表；缺表时方法2不可用，方法1仍可运行。仓库的合成表仅用于测试和格式演示。 示例数据路径可以采用以下结构；本仓库不提供原始采样：
+
+   ```text
+   data/
+     bs8_s7/
+       dp0/ASCEND_PROFILER_OUTPUT/kernel_details.csv
+       dp0/ASCEND_PROFILER_OUTPUT/trace_view.json    # 可选，须为同次同 rank
+       dp1/ASCEND_PROFILER_OUTPUT/kernel_details.csv
+       ...
+   ```
+
+   case 的 `path` 支持递归查找 `kernel_details.csv`。多个目录可用 `paths`；若目录名无法唯一表示全局 rank，使用显式 `inputs`，每个 rank 只选择一次采样：
+
+   ```json
+   {
+     "name": "bs8-s7",
+     "bs": 8,
+     "draft_tokens": 7,
+     "inputs": [
+       {"rank": "dp0", "path": "data/bs8_s7/dp0/ASCEND_PROFILER_OUTPUT/kernel_details.csv"},
+       {"rank": "dp1", "path": "data/bs8_s7/dp1/ASCEND_PROFILER_OUTPUT/kernel_details.csv"}
+     ]
+   }
+   ```
+
+   上面只演示两个输入；实际应列出本次采样的全局 rank。相对输入路径相对于 **cases JSON 所在目录**。如需显式指定 trace，可在对应 `inputs` 项增加 `trace_path`。
+
+3. 先核对输入清单，再运行统计：
+
+   ```bash
+   python -u profile_ep128.py cases.local.json --list-inputs
+   python -u profile_ep128.py cases.local.json --out ep128_report --excel
+   ```
+
+   `--list-inputs` 只查找文件，不读取 CSV 内容。退出码为 0 不代表目标硬件性能已经验证；有 case 失败或主方法结果不可用时，统计命令会返回非零并保留具体原因。
+
+### 已有 JSON，只重绘 Excel
+
+```bash
+python -u build_ep128_leadership_excel.py --report ep128_report/model_architecture_report.json --out "ep128_report/10T模型推理估算.xlsx"
+```
+
+此命令仅读取 `--report` 指定的 JSON，不扫描新增 BS 目录，也不读取 cases 来补结果。新增 BS 后，先用更新的 cases 重新统计，再指向新 JSON。运行日志会打印报告路径、生成时间和各 case 的配置 BS，可据此检查是否读到了旧文件。
+
+## 配置口径
+
+| 字段 | 含义 |
+| --- | --- |
+| `bs` | **每个 DP rank/副本上的并发请求数**，不是整个系统请求数，也不是 MoE Dispatch 后的专家 token 行数 |
+| `draft_tokens` | 每轮草稿候选长度 S；不能直接作为有效输出长度 |
+| `effective_tokens_per_round` | 每请求、每轮平均有效新增输出 token 数 Neff，范围为 `[1, S+1]` |
+| `token_basis` | 说明 Neff 来自配置假设还是观测、是否包含 bonus token；必须填写 |
+| `base_ep` / `target_ep` | 源/目标专家并行组大小；EP 不自动等于 DP 或物理卡数 |
+| `source_dp` / `target_dp` | 源/目标 DP 副本数量，用于系统吞吐折算 |
+| `source_devices` / `target_devices` | **物理卡数**，用于单卡吞吐分母 |
+| `source_chips_per_card` / `target_chips_per_card` | 每张物理卡实际参与的逻辑 NPU/芯片数，缺省为 1；双芯片参与应显式配置为 2 |
+| `expected_ranks` | 源采样预期逻辑 rank 数，通常应等于源物理卡数 × 每卡参与芯片数 |
+| `ranks_per_node` | 节点内参与的逻辑 rank 数，用于逻辑远端份额模型 |
+| `trim_rounds` | 每个 rank 首尾裁剪的轮次数，用于去除不稳定边界轮次 |
+
+模板中的 `Neff=5.2` 是**包含 bonus token 的配置假设**，不是设备 trace 统计出来的接受长度。`with_stack=false` 是当前计时采样合同；不要将不同采样条件混为同一基线。
+
+配置中的模型结构须与采样一致，包括隐藏维度、专家数、TopK、MoE 中间维度和完整 `compress_ratios` 序列。`schema_version=2` 是 JSON 结构版本，新增 BS 不改变它。
+
+## 完整周期如何计算
+
+当前层区间定义为 **本层首 HCPre 开始 → 本层末 HCPost 结束**。它包住 Attention 和 FFN 主体，但不等同于完整 Python `DecoderLayer.forward`；例如首个残差 clone 可能位于该统计起点之前。
+
+```text
+本轮主0首 HCPre
+  → 主层区间 + 主层间衔接
+  → U1：主模型末 HCPost → 草稿首 HCPre
+  → 草稿层区间 + 草稿层间衔接
+  → U2：草稿末 HCPost → 下一轮主0首 HCPre
+```
+
+源周期等于相邻两轮主0首 HCPre 起点之差，拆为五项：
+
+```text
+R源 = 主层区间合计 + 主层间衔接合计
+    + 草稿层区间合计 + 草稿层间衔接合计 + U
+U = U1 + U2
+```
+
+**各时间区间互斥、完整覆盖；区间内部允许多流 kernel 重叠执行。** 区间跨度包含任务间隔，不能直接解释为独占 kernel 忙时或硬件算力利用率。层间衔接也不能一概称为空闲。
+
+当前示例中，主0仅从参考均值中排除，不从源周期删除，也不减少目标 61 层。HCA 参考主1/3/5/7，CSA 参考主2/4/6；草稿独立使用自身 SWA 均值。
+
+```text
+R目标 = 31 × 目标HCA层区间均值 + 30 × 目标CSA层区间均值
+      + 3 × 目标草稿SWA层区间均值
+      + 源主7段衔接之和 + 53 × 常规主衔接参考均值
+      + 源草稿2段衔接之和 + U源
+```
+
+新增 53 段主衔接的参考均值取不触及主0的 6 段边界；原来的 0→1 衔接仍保留在源7段合计中。
+
+脚本先**逐 rank、逐轮外推**，再对各 rank 的保留轮次求周期均值，最后选均值最大的 rank。各分项始终来自同一个选中 rank，不将不同 rank 的分项最大值拼接。两种方法及不同 BS 可以选中不同 rank。采样 rank 不全时会明确警告，不能声称已覆盖全系统最慢 rank。
+
+## 两种外推方法
+
+源层区间已经包含通信与路由计算，脚本仅添加目标相对源的变化量：
+
+```text
+W目标 = W源 + ΔDispatch + ΔCombine + Δ路由GMM
+```
+
+| 方法 | Dispatch / Combine 的处理 |
+| --- | --- |
+| 方法1：逻辑通信倍率 | 源耗时 × 逻辑远端份额倍率 × TopK 倍率，再对每次目标 Dispatch、Combine **分别加 14 μs** |
+| 方法2：历史通信倍率 | 源耗时 × 对应历史通信比值 × 负载形状倍率；**不再叠加 14 μs** |
+
+方法1在 `traffic_scope=interhost` 时使用 `(1−ranks_per_node/EP目标) / (1−ranks_per_node/EP源)` 作为远端份额倍率；这是逻辑份额假设，不是实际链路带宽测量。
+
+方法2当前仅支持 EP16 → EP128。按匹配 BS 的 EP32/64/128 历史值，在 `log2(EP/32)` 轴做三点 OLS，再取“EP128 原参考值 / 拟合外推 EP16 值”作为通信比值。负载形状倍率为 `(K目标×H目标)/(K源×H源)`；示例 H 相同时简化为 TopK 倍率。
+
+方法2需要单独提供原始通信参考表，可由 `communication_reference` 或 `--comm-reference` 指定。表头为：
+
+```csv
+bs,ep32_send,ep64_send,ep128_send,ep32_return,ep64_return,ep128_return
+```
+
+表中 `send` 对应 Dispatch，`return` 对应 Combine；同一 BS 必须唯一，值必须为正，且应保持可比较的共同单位。不要填写虚构参考值来解锁结果。没有表、BS 不匹配或拟合无效时，方法2显示 `UNAVAILABLE`，方法1仍可运行。
+
+仓库中的 [`communication-reference.synthetic.csv`](examples/communication-reference.synthetic.csv) 是明确标注的合成示例，不能作为真实通信参考或性能依据。将它与真实采样混用，得到的方法2数值也没有真实性能含义。使用自己的表时，例如：
+
+```bash
+python -u profile_ep128.py cases.local.json --comm-reference data/communication-reference.csv --out ep128_report --excel
+```
+
+路由 GMM 当前按 TopK 比例修正；其余层内成本沿用源均值。固定 14 μs 和历史比值迁移均属于模型假设，不是对目标系统的校准结论。
+
+## TPOT 与吞吐
+
+以选中 rank 的目标平均周期 `R`（ms）和 `Neff` 为基础：
+
+```text
+TPOT（ms/token） = R / Neff
+系统吞吐（token/s） = 1000 × BS × 目标DP × Neff / R
+单物理卡吞吐（token/s/card） = 系统吞吐 / 目标物理卡数
+```
+
+例如 `R=52 ms`、`Neff=5.2`，则 `TPOT=10 ms/token`。**TPOT 不再除 BS 或 DP**；它是周期与有效输出长度折算值，不是 HTTP 客户端逐 token 时间戳直接测量值。只有目标 DP 等于目标物理卡数时，单卡公式才可简化为 `1000×BS×Neff/R`。
+
+## U 的15阶段与外推边界
+
+脚本默认尝试对源 U1、U2 识别连续的 8+7 个父阶段，并对 Markov 逐位置选 token 保留子阶段。15阶段仅用于解释 U，**不额外加到周期上，也不改变外推结果**。
+
+- 当前外推直接使用同 BS、同 rank、同轮的 `U目标=U源`，不乘 EP 倍率，也不乘主层数；没有证明 EP 扩大后 U 一定不变。
+- U 包括输出处理、采样、上下文融合、KV/metadata/输入准备、主草稿切换以及其中的任务间隔，不是单一 Head、CPU 耗时或固定空闲。
+- 有同次 trace 时补充 PyTorch/CANN/queue/设备来源关联；Host 同时段覆盖不等于该阶段独有的 CPU 成本。缺 trace 不阻断设备统计。
+- 原生锚点不全、顺序不符或实现路径不支持时，保留整窗实测总耗时并标为 `UNRESOLVED`，不补零、不伪造15项分解。父阶段与子阶段不能重复相加。
+
+新增层衔接均值、U 平稳、路由效率与历史通信比值迁移都需要目标实测检验。路由器专家宽度增加、网络争用、慢 rank、调度、图模式、上下文长度和有效接受长度变化可能造成偏差。API server 数量等运行条件不同，也应作为采样背景记录，不能把跨 BS 差异全归于 BS。
+
+## 输出与复核
+
+主要结果位于 `--out` 目录：
+
+| 输出 | 内容 |
+| --- | --- |
+| `最终结果.csv` | 两种方法的周期、TPOT、单卡吞吐与可用状态 |
+| `model_architecture_report.json` | 核心结果、配置、源基线、逐 rank 汇总及证据索引，支持离线重绘 |
+| `10T模型推理估算.xlsx` / 同名 `.html` | 总览、源基线、时间账本、两方法估算、公式假设与复核记录 |
+| `layers.csv` / `components.csv` | 源层与组件实测 |
+| `rank_estimates.csv` / `round_estimates.csv` | 逐 rank 与逐轮外推 |
+| `boundary_accounting.csv` / `compute_evidence.csv` | 边界计账与路由 GMM 证据 |
+| `step_residual_stages.csv` / `step_residual_substages.csv` | U 父阶段与 Markov 子阶段汇总 |
+| `step_residual_details/` | 各 rank 的原始设备明细、精确阶段边界与来源链 |
+
+Excel 的 BS 折线取 `config.bs` 数值排序；其他声明条件不同则分组。重复 BS 保留原值但不合并绘线；单点组只显示表格；未知值保留空白并断线，不补0。顶部索引列出全部采样组合，避免把单独分组误认为遗漏。
+
+阅读结果时先看输入与 rank 覆盖，再看选中 rank、五项闭合、方法状态及假设。软件测试通过、源周期闭合，都不等于目标外推准确。
+
+## PPT 归档
+
+- [一页详解 PPT：HC周期拆解](docs/presentations/HC周期拆解_一页详解_20261104.pptx)
+- [PDF版](docs/presentations/HC周期拆解_一页详解_20261104.pdf)
+- [PNG预览](docs/presentations/HC周期拆解_一页详解_20261104.png)
+
+PPT 使用可编辑形状和文字，展示源8+3周期、层区间边界、层间衔接、U15阶段以及8→61层外推关系。时间线宽度是结构示意，不代表实测耗时比例。
+
+## 开发验证
+
+在仓库根目录运行标准库测试：
+
+```bash
+python -B -S -m unittest discover -s . -p "test_ep128*.py" -v
+```
+
+测试涉及手算公式、rank 聚合、周期闭合、打包 FP4 原生证据路径、BS 分组/缺值处理与 XLSX 原生图表。相关 fixture 为合成数据，不能用于宣称目标硬件性能。若已安装 openpyxl，部分测试会额外校验第三方读取兼容性；它不是运行时依赖。
+
+当前独立仓库验证共发现 221 项测试：211 项通过，10 项跳过。其中 8 项依赖未归档的私有真实采样 fixture，另外 2 项是标准库隔离模式下的可选 openpyxl 兼容检查。合成通信表为新建的演示数据，未复制原历史实测表。
+
+原始 trace、采样目录、个人本地配置和生成报告由 `.gitignore` 排除。归档来源与 SHA-256 见 [版本记录](docs/versions.json)。

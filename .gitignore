@@ -1,0 +1,36 @@
+# Local Python environment and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local credentials and configuration
+.env
+.env.*
+*.pem
+*.key
+*.local.json
+cases.local*.json
+
+# Raw profiling data and generated reports
+data/
+raw/
+profiles/
+ep128_report/
+ep128_empirical_report/
+reports/
+outputs/
+PROF_*/
+*_ascend_pt/
+*.db
+*.sqlite*
+*.log
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

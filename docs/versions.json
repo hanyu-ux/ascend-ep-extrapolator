@@ -1,0 +1,62 @@
+{
+  "archived_at": "2026-11-04",
+  "repository": "hanyu-ux/ascend-ep-extrapolator",
+  "runtime": {
+    "python": ">=3.10",
+    "dependencies": "Python standard library only"
+  },
+  "components": {
+    "profile_ep128.py": {
+      "version": "20261103.12.native_stages",
+      "sha256": "035f0c6312354ca0937361f1ab301452ed61c68239845b2c0c76f08653f9d7f7",
+      "matches_current_working_source": true
+    },
+    "build_ep128_leadership_excel.py": {
+      "version": "20261104.2.bs_inventory",
+      "sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
+      "matches_current_working_source": true
+    },
+    "ep128_xlsx_writer.py": {
+      "version": "20261104.1.line_charts",
+      "sha256": "210a6e7056cd23bdc491d200cf141c39f33c8f473c5d67176279f4a64bd1ede9",
+      "matches_current_working_source": true
+    }
+  },
+  "presentations": [
+    {
+      "path": "docs/presentations/HC周期拆解_一页详解_20261104.pdf",
+      "sha256": "82741e42fe1a7d17548a3ee98d2e95149e58f21b0c660223ea346a95ade6d4de",
+      "bytes": 137778
+    },
+    {
+      "path": "docs/presentations/HC周期拆解_一页详解_20261104.png",
+      "sha256": "97951f2ecbb1d5aa4b04e68dd6faca9abf2ceb91e01ce1140385f654afcd4db6",
+      "bytes": 774717
+    },
+    {
+      "path": "docs/presentations/HC周期拆解_一页详解_20261104.pptx",
+      "sha256": "bd463c5ba02bb771568f54750ce78be08b454afbb3f0e176815ea3ceb165168f",
+      "bytes": 41688
+    },
+    {
+      "path": "docs/presentations/HC周期拆解_一页详解_20261104.svg",
+      "sha256": "1f742842aef3b62a7a90097d3da9052df1d643a5cf9de631f9128a2f52eae454",
+      "bytes": 20427
+    }
+  ],
+  "portability_changes": [
+    "Example capture and real communication-reference paths are repository-relative placeholders.",
+    "Tests use a newly generated synthetic communication table; no historical measured values were copied.",
+    "Tests requiring private capture fixtures are skipped when those fixtures are absent.",
+    "The original machine-specific test import fallback was removed."
+  ],
+  "validation": {
+    "discovered_tests": 221,
+    "passed": 211,
+    "skipped": 10,
+    "skip_reasons": {
+      "private_capture_fixture_unavailable": 8,
+      "optional_openpyxl_in_standard_library_only_mode": 2
+    }
+  }
+}

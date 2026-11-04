@@ -1,0 +1,884 @@
+"""Synthetic old-style layer-mean presentation contracts; no NPU/data claims."""
+import copy
+import json
+import posixpath
+import re
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from zipfile import ZipFile
+from pathlib import Path
+import tempfile
+import unittest
+from unittest import mock
+
+from test_ep128_v2_excel import fixture, read_book, renderer
+
+
+def layer_mean_fixture():
+    return fixture()
+
+
+def residual_report():
+    report = layer_mean_fixture()
+    case = report['cases'][0]
+    case['measurements'], case['captures'] = [], []
+    for rank, residual in (('dp7', 13.125), ('dp3', 23.25)):
+        parents, children, summary = [], [], []
+        for window, count in (('main_to_draft', 8), ('draft_to_nextmain', 7)):
+            for order in range(1, count + 1):
+                parents.append(dict(window_key=window, stage_key=window + '_' + str(order),
+                    stage_order=order, label=rank + '_PARENT_' + window + '_' + str(order),
+                    level=0, parent_stage_key=None, duration_ms_mean=residual / 15,
+                    rounds=2, matched_windows=2, status='MATCHED', boundary_basis='SYNTHETIC_NATIVE_ANCHORS'))
+            summary.append(dict(window_key=window, rounds=2, duration_ms_mean=count * residual / 15))
+        for order in range(1, 8):
+            children.append(dict(window_key='draft_to_nextmain', stage_key='markov_' + str(order),
+                stage_order=order, label=rank + '_CHILD_NOT_ADDED_' + str(order), level=1,
+                parent_stage_key='draft_to_nextmain_3', duration_ms_mean=residual / 105,
+                rounds=2, matched_windows=2, status='MATCHED'))
+        case['measurements'].append(dict(rank=rank, rounds=[], step_residuals=dict(status='DEVICE_ONLY',
+            trace=dict(status='NOT_FOUND'), residual_ms_mean=residual, stage_summary=parents,
+            substage_summary=children, summary=summary)))
+        case['captures'].append(dict(rank=rank, sha256='SYNTHETIC_' + rank))
+    return report
+
+
+def bs_trend_report():
+    """Unsorted BS and changing selected ranks; values are synthetic core output."""
+    report = layer_mean_fixture()
+    template = report['cases'][0]
+    report['cases'] = []
+    for bs in (32, 4, 16, 8):
+        case = copy.deepcopy(template)
+        # Names and paths deliberately disagree with BS and differ per capture.
+        case['name'] = 'SYNTHETIC_LABEL_BS' + str(100 - bs)
+        case['config'].update(bs=bs, name=case['name'], path='synthetic/bs' + str(bs),
+                              inputs=[{'rank': 'dp0', 'path': 'synthetic/' + str(bs) + '.csv'}])
+        for number, method in enumerate(case['projection']['layer_mean_methods'], 1):
+            selected = 'dp7' if (bs in (4, 16)) == (number == 1) else 'dp3'
+            components = [number * 10. + bs + .125, bs / 8.,
+                          number * 5. + bs / 4., bs / 16., number * 2. + bs / 2.]
+            for row, value in zip(method['breakdown'], components):
+                row['value_ms'] = value
+            method.update(selected_rank=selected, cycle_ms=sum(components),
+                          tpot_ms=number * 20. + bs / 7.,
+                          per_device_tokens_s=number * 1000. + bs * 11.125)
+            method['role_details'][0].update(target_layer_envelopes_ms=components[0],
+                target_gap_ms=components[1], target_chain_ms=sum(components[:2]))
+            method['role_details'][1].update(target_layer_envelopes_ms=components[2],
+                target_gap_ms=components[3], target_chain_ms=sum(components[2:4]))
+            method['source_partition'].update(cross_role_tail_residual_ms=components[4],
+                                               residual_ms=components[4])
+            for rank in method['per_rank']:
+                chosen = rank['rank'] == selected
+                rank['cycle_ms'] = method['cycle_ms'] if chosen else 900000. + bs
+                rank['role_details'] = copy.deepcopy(method['role_details'])
+                rank['source_partition'] = copy.deepcopy(method['source_partition'])
+                if not chosen:
+                    for role in rank['role_details']:
+                        role['target_chain_ms'] += 900000.
+            if bs == 16:
+                # Canonical component keys, rather than JSON row position,
+                # determine the cross-BS series order.
+                method['breakdown'].reverse()
+        report['cases'].append(case)
+    return report
+
+
+class LayerMeanRendererTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='ep128-layer-mean-excel-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def build(self, report):
+        before = copy.deepcopy(report)
+        out = self.root / 'layer-means.xlsx'
+        renderer.build_workbook(out, report=self.root / 'source.json', report_data=report,
+                                expected_method_set='layer_mean_methods')
+        self.assertEqual(report, before)
+        return out, read_book(out)
+
+    def chart_parts_by_sheet(self, out, book):
+        """Follow actual OOXML relationships, independent of chart numbering."""
+        ns = {'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+              'p': 'http://schemas.openxmlformats.org/package/2006/relationships',
+              'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        result = {name: [] for name in book}
+        with ZipFile(out) as archive:
+            def related(part):
+                directory, filename = posixpath.split(part)
+                rels = posixpath.join(directory, '_rels', filename + '.rels')
+                if rels not in archive.namelist():
+                    return {}
+                root = ET.fromstring(archive.read(rels))
+                return {row.get('Id'): posixpath.normpath(posixpath.join(directory, row.get('Target')))
+                        for row in root.findall('p:Relationship', ns)}
+            for index, name in enumerate(book, 1):
+                part = f'xl/worksheets/sheet{index}.xml'
+                links = related(part)
+                for drawing in book[name][0].findall('{*}drawing'):
+                    drawing_part = links[drawing.get('{' + ns['r'] + '}id')]
+                    drawing_links = related(drawing_part)
+                    root = ET.fromstring(archive.read(drawing_part))
+                    for node in root.findall('.//c:chart', ns):
+                        chart_part = drawing_links[node.get('{' + ns['r'] + '}id')]
+                        result[name].append(ET.fromstring(archive.read(chart_part)))
+        return result
+
+    def chart_reference_cells(self, book, reference):
+        match = re.fullmatch(r"'([^']+)'!\$([A-Z]+)\$(\d+):\$([A-Z]+)\$(\d+)", reference)
+        self.assertIsNotNone(match, reference)
+        sheet, first_col, first, last_col, last = match.groups()
+        self.assertEqual(first_col, last_col)
+        return [book[sheet][1].get(first_col + str(row)) for row in range(int(first), int(last) + 1)]
+
+    def assert_line_cache_matches_sheet(self, chart, book, expected_bs):
+        ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        self.assertIsNotNone(chart.find('.//c:lineChart', ns))
+        self.assertEqual(chart.find('c:chart/c:dispBlanksAs', ns).get('val'), 'gap')
+        for series in chart.findall('.//c:lineChart/c:ser', ns):
+            categories = series.find('c:cat/c:strRef', ns)
+            self.assertIsNotNone(categories)
+            labels = [row.findtext('c:v', namespaces=ns)
+                      for row in categories.findall('c:strCache/c:pt', ns)]
+            self.assertEqual(labels, list(map(str, expected_bs)))
+            self.assertEqual([float(value) for value in self.chart_reference_cells(
+                book, categories.findtext('c:f', namespaces=ns))], expected_bs)
+            values = series.find('c:val/c:numRef', ns)
+            self.assertIsNotNone(values)
+            self.assertEqual(int(values.find('c:numCache/c:ptCount', ns).get('val')), len(expected_bs))
+            actual = {int(row.get('idx')): float(row.findtext('c:v', namespaces=ns))
+                      for row in values.findall('c:numCache/c:pt', ns)}
+            cells = self.chart_reference_cells(book, values.findtext('c:f', namespaces=ns))
+            self.assertEqual(actual, {index: value for index, value in enumerate(cells)
+                                      if isinstance(value, (int, float)) and not isinstance(value, bool)})
+        return chart.findall('.//c:lineChart/c:ser', ns)
+
+    def test_old_style_twelve_columns_cards_matrices_and_closed_charts(self):
+        report = layer_mean_fixture()
+        out, (book, files) = self.build(report)
+        self.assertEqual(tuple(book), renderer.SHEETS)
+        for sheet, _ in book.values():
+            self.assertEqual(len(sheet.findall('.//{*}cols/{*}col')), 12)
+            self.assertEqual(sheet.findall('.//{*}f'), [])
+        overview = book['估算总览'][1]
+        for method in report['cases'][0]['projection']['layer_mean_methods']:
+            for field in ('cycle_ms', 'per_device_tokens_s', 'tpot_ms'):
+                self.assertIn(method[field], overview.values())
+        for identity, name in (('method1', '方法1估算'), ('method2', '方法2估算')):
+            method = next(item for item in report['cases'][0]['projection']['layer_mean_methods'] if item['id'] == identity)
+            cells = book[name][1]
+            for field in ('cycle_ms', 'per_device_tokens_s', 'tpot_ms'):
+                self.assertIn(method[field], cells.values())
+            self.assertIn('源实测主模型', cells.values())
+            self.assertIn('源实测草稿', cells.values())
+            self.assertIn('目标主模型', cells.values())
+            self.assertIn('目标草稿', cells.values())
+            self.assertIn('CSA Dispatch', cells.values())
+            self.assertIn('HCA 路由计算', cells.values())
+            self.assertIn('SWA Combine', cells.values())
+            self.assertIn('层间衔接区间', cells.values())
+            self.assertIn('轮次剩余区间', cells.values())
+            card_row = next(int(cell[1:]) for cell, value in cells.items()
+                            if cell.startswith('A') and value == '完整周期 · ms')
+            self.assertEqual(cells['E' + str(card_row)], 'TPOT · ms/token')
+            self.assertEqual(cells['I' + str(card_row)], '预测单卡吞吐 · token/s/card')
+            self.assertEqual(cells['A' + str(card_row + 1)], method['cycle_ms'])
+            self.assertEqual(cells['E' + str(card_row + 1)], method['tpot_ms'])
+            self.assertEqual(cells['I' + str(card_row + 1)], method['per_device_tokens_s'])
+        self.assertTrue(any(name.startswith('xl/charts/chart') for name in files))
+        self.assertNotIn('全局吞吐', out.with_suffix('.html').read_text())
+
+    def test_selected_rank_class_means_are_not_combined_with_other_rank(self):
+        report = layer_mean_fixture()
+        _, (book, _) = self.build(report)
+        for name in ('方法1估算', '方法2估算'):
+            cells = book[name][1]
+            row = next(int(cell[1:]) for cell, value in cells.items() if value == 'HCA 单层')
+            self.assertEqual(cells['C' + str(row)], 3.12345)
+            self.assertEqual(cells['E' + str(row)], 4.32345)
+            self.assertEqual(cells['I' + str(row)], '[1,3,5,7]')
+            self.assertEqual(cells['D' + str(row)], renderer.NA)
+            self.assertNotIn(9003.12345, cells.values())
+
+    def test_new_reference_sheet_uses_excluded_zero_attention_means_without_router_column(self):
+        _, (book, _) = self.build(layer_mean_fixture())
+        values = list(book['层与组件实测'][1].values())
+        text = ' '.join(map(str, values))
+        self.assertNotIn('OLD_HASH_WITH_MAIN0_ONLY', text)
+        self.assertNotIn('Router均值(ms)', values)
+        self.assertIn('源路由GMM(ms)', values)
+        self.assertIn('[1,3,5,7]', values)
+        self.assertIn('[2,4,6]', values)
+        self.assertIn('CSA', values)
+        self.assertIn('HCA', values)
+        self.assertIn('SWA', values)
+
+    def test_strict_pending_records_and_global_metric_do_not_leak_into_new_presentation(self):
+        report = layer_mean_fixture()
+        _, (book, _) = self.build(report)
+        for name in ('估算总览', '方法1估算', '方法2估算', '公式与假设', '复核记录'):
+            text = ' '.join(map(str, book[name][1].values()))
+            for forbidden in ('OLD_STRICT_COMPONENT_CALIBRATION_ONLY', 'OLD_STRICT_ROUTER_ONLY',
+                              'COMMUNICATION_SENSITIVITY_ONLY', '+ 0.014', '全局吞吐',
+                              'LAYER_MEAN_ESTIMATE', 'layer_mean_methods', 'core_selected_max_rank_mean'):
+                self.assertNotIn(forbidden, text)
+            self.assertNotIn(998877.123456, book[name][1].values())
+        self.assertEqual(report['cases'][0]['projection']['methods'][0]['status'], 'PENDING')
+
+    def test_multiple_bs_cases_keep_their_own_three_card_values(self):
+        report = layer_mean_fixture()
+        other = copy.deepcopy(report['cases'][0])
+        other['name'] = 'SYNTHETIC_OTHER_BS8'
+        other['config']['bs'] = 8
+        for method in other['projection']['layer_mean_methods']:
+            method['per_device_tokens_s'] += 100.
+            method['cycle_ms'] += 10.
+            method['tpot_ms'] += 2.
+            method['breakdown'][-1]['value_ms'] += 10.
+        report['cases'].append(other)
+        _, (book, _) = self.build(report)
+        for case in report['cases']:
+            for method in case['projection']['layer_mean_methods']:
+                for name in ('估算总览', '方法1估算' if method['id'] == 'method1' else '方法2估算'):
+                    for field in ('cycle_ms', 'per_device_tokens_s', 'tpot_ms'):
+                        self.assertIn(method[field], book[name][1].values())
+
+    def test_bs_trends_sort_real_config_and_copy_both_methods_without_rank_reaggregation(self):
+        report = bs_trend_report()
+        out, (book, _) = self.build(report)
+        ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        charts = self.chart_parts_by_sheet(out, book)
+        ordered = sorted(report['cases'], key=lambda case: case['config']['bs'])
+        expected_bs = [4, 8, 16, 32]
+        overview = [chart for chart in charts['估算总览'] if chart.find('.//c:lineChart', ns) is not None]
+        self.assertEqual(len(overview), 3)
+        first_values = {tuple(case['projection']['layer_mean_methods'][0][field] for case in ordered): field
+                        for field in ('cycle_ms', 'tpot_ms', 'per_device_tokens_s')}
+        seen = set()
+        for chart in overview:
+            series = self.assert_line_cache_matches_sheet(chart, book, expected_bs)
+            self.assertEqual(len(series), 2)
+            vector = tuple(float(row.findtext('c:v', namespaces=ns))
+                           for row in series[0].findall('c:val/c:numRef/c:numCache/c:pt', ns))
+            self.assertIn(vector, first_values)
+            field = first_values[vector]
+            seen.add(field)
+            for index, item in enumerate(series):
+                values = [float(row.findtext('c:v', namespaces=ns))
+                          for row in item.findall('c:val/c:numRef/c:numCache/c:pt', ns)]
+                self.assertEqual(values, [case['projection']['layer_mean_methods'][index][field] for case in ordered])
+                self.assertIn(renderer._layer_mean_name({'id': 'method' + str(index + 1)}),
+                              ''.join(item.find('c:tx', ns).itertext()))
+            first_row = int(re.search(r'\$A\$(\d+):',
+                series[0].findtext('c:cat/c:strRef/c:f', namespaces=ns)).group(1))
+            for row, case in enumerate(ordered, first_row):
+                self.assertEqual(book['估算总览'][1]['D' + str(row)],
+                                 case['projection']['layer_mean_methods'][0]['selected_rank'])
+                self.assertEqual(book['估算总览'][1]['H' + str(row)],
+                                 case['projection']['layer_mean_methods'][1]['selected_rank'])
+        self.assertEqual(seen, {'cycle_ms', 'tpot_ms', 'per_device_tokens_s'})
+        for index, name in enumerate(('方法1估算', '方法2估算')):
+            line = [chart for chart in charts[name] if chart.find('.//c:lineChart', ns) is not None]
+            self.assertEqual(len(line), 1)
+            # Existing per-case closed bars remain, alongside one BS comparison.
+            self.assertEqual(len(charts[name]), 5)
+            series = self.assert_line_cache_matches_sheet(line[0], book, expected_bs)
+            self.assertEqual(len(series), 5)
+            methods = [case['projection']['layer_mean_methods'][index] for case in ordered]
+            self.assertGreater(len({method['selected_rank'] for method in methods}), 1)
+            keys = ('main_layer_envelopes', 'main_internal_gaps', 'draft_layer_envelopes',
+                    'draft_internal_gaps', 'residual_once')
+            labels = ('主模型层区间', '主模型层间衔接', '草稿层区间', '草稿层间衔接', '轮次剩余区间U')
+            for component, label, item in zip(keys, labels, series):
+                values = [float(row.findtext('c:v', namespaces=ns))
+                          for row in item.findall('c:val/c:numRef/c:numCache/c:pt', ns)]
+                rows = [next(row for row in method['breakdown'] if row['key'] == component) for method in methods]
+                self.assertEqual(values, [row['value_ms'] for row in rows])
+                self.assertIn(label, ''.join(item.find('c:tx', ns).itertext()))
+            first_row = int(re.search(r'\$A\$(\d+):',
+                series[0].findtext('c:cat/c:strRef/c:f', namespaces=ns)).group(1))
+            for row, method in enumerate(methods, first_row):
+                self.assertEqual(book[name][1]['D' + str(row)], method['selected_rank'])
+
+    def test_unavailable_middle_bs_is_a_blank_point_with_original_category_index(self):
+        report = bs_trend_report()
+        missing = next(case for case in report['cases'] if case['config']['bs'] == 8)
+        missing['projection']['layer_mean_methods'][1].update(
+            status='UNAVAILABLE', selected_rank=None, reasons=['SYNTHETIC_BS8_REFERENCE_MISSING'])
+        out, (book, _) = self.build(report)
+        ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        charts = self.chart_parts_by_sheet(out, book)
+        for chart in charts['估算总览']:
+            if chart.find('.//c:lineChart', ns) is None:
+                continue
+            series = self.assert_line_cache_matches_sheet(chart, book, [4, 8, 16, 32])
+            for index, item in enumerate(series):
+                points = item.findall('c:val/c:numRef/c:numCache/c:pt', ns)
+                self.assertEqual([int(row.get('idx')) for row in points], [0, 1, 2, 3] if index == 0 else [0, 2, 3])
+                values_ref = item.findtext('c:val/c:numRef/c:f', namespaces=ns)
+                if index == 1:
+                    self.assertIsNone(self.chart_reference_cells(book, values_ref)[1])
+        line = [chart for chart in charts['方法2估算'] if chart.find('.//c:lineChart', ns) is not None]
+        self.assertEqual(len(line), 1)
+        for series in self.assert_line_cache_matches_sheet(line[0], book, [4, 8, 16, 32]):
+            self.assertEqual([int(row.get('idx')) for row in series.findall('c:val/c:numRef/c:numCache/c:pt', ns)], [0, 2, 3])
+            self.assertIsNone(self.chart_reference_cells(book, series.findtext('c:val/c:numRef/c:f', namespaces=ns))[1])
+
+    def test_nonclosing_breakdown_blanks_all_five_parts_but_keeps_valid_headline(self):
+        report = bs_trend_report()
+        case = next(case for case in report['cases'] if case['config']['bs'] == 8)
+        method = case['projection']['layer_mean_methods'][0]
+        method['breakdown'][0]['value_ms'] += .75
+        out, (book, _) = self.build(report)
+        ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        charts = self.chart_parts_by_sheet(out, book)
+        line = [chart for chart in charts['方法1估算'] if chart.find('.//c:lineChart', ns) is not None]
+        self.assertEqual(len(line), 1)
+        for series in self.assert_line_cache_matches_sheet(line[0], book, [4, 8, 16, 32]):
+            self.assertEqual([int(row.get('idx')) for row in series.findall('c:val/c:numRef/c:numCache/c:pt', ns)],
+                             [0, 2, 3])
+            self.assertIsNone(self.chart_reference_cells(book, series.findtext('c:val/c:numRef/c:f', namespaces=ns))[1])
+        method_cells = book['方法1估算'][1]
+        row = next(int(cell[1:]) for cell, value in method_cells.items()
+                   if re.fullmatch(r'B\d+', cell) and value == case['name'])
+        self.assertTrue(all(method_cells.get(column + str(row)) is None for column in 'EFGHI'))
+        self.assertEqual(method_cells['J' + str(row)], method['cycle_ms'])
+        self.assertIn('不闭合', method_cells['K' + str(row)])
+        for chart in charts['估算总览']:
+            if chart.find('.//c:lineChart', ns) is not None:
+                series = self.assert_line_cache_matches_sheet(chart, book, [4, 8, 16, 32])[0]
+                self.assertEqual([int(point.get('idx')) for point in
+                                  series.findall('c:val/c:numRef/c:numCache/c:pt', ns)], [0, 1, 2, 3])
+        overview_cells = book['估算总览'][1]
+        row = next(int(cell[1:]) for cell, value in overview_cells.items()
+                   if re.fullmatch(r'B\d+', cell) and value == case['name'])
+        self.assertEqual([overview_cells[column + str(row)] for column in 'EFG'],
+                         [method[field] for field in ('per_device_tokens_s', 'cycle_ms', 'tpot_ms')])
+
+    def test_old_writer_missing_line_chart_interface_fails_clearly_before_saving(self):
+        out = self.root / 'old-writer.xlsx'
+        with mock.patch.object(renderer.xlsx_writer.Worksheet, 'add_line_chart', None), \
+                mock.patch.object(renderer.Workbook, 'save') as save, \
+                self.assertRaisesRegex(ValueError, 'Excel写入器缺少BS趋势图接口') as raised:
+            renderer.build_workbook(out, report=self.root / 'source.json', report_data=bs_trend_report(),
+                                    expected_method_set='layer_mean_methods')
+        self.assertIn('ep128_xlsx_writer.py', str(raised.exception))
+        self.assertIn('请同步更新', str(raised.exception))
+        save.assert_not_called()
+        self.assertFalse(out.exists())
+        self.assertFalse(out.with_suffix('.html').exists())
+
+    def test_offline_html_has_all_bs_trends_and_splits_missing_points(self):
+        report = bs_trend_report()
+        missing = next(case for case in report['cases'] if case['config']['bs'] == 8)
+        missing['projection']['layer_mean_methods'][1].update(
+            status='UNAVAILABLE', selected_rank=None, reasons=['SYNTHETIC_BS8_REFERENCE_MISSING'])
+        out, _ = self.build(report)
+        preview = out.with_suffix('.html').read_text(encoding='utf-8')
+        svgs = [ET.fromstring(svg) for svg in re.findall(r'<svg\b.*?</svg>', preview, re.DOTALL)]
+        self.assertEqual(len(svgs), 5)
+        self.assertEqual([svg.findtext('title') for svg in svgs[:3]],
+                         ['单卡吞吐随BS变化', '完整周期随BS变化', 'TPOT随BS变化'])
+        for index, svg in enumerate(svgs[3:], 1):
+            self.assertIn(renderer._layer_mean_name({'id': 'method' + str(index)}), svg.findtext('title'))
+            self.assertIn('整轮五项耗时构成随BS变化', svg.findtext('title'))
+        def xs(line):
+            return [float(point.split(',')[0]) for point in line.get('points').split()]
+        for svg in svgs[:3]:
+            first = [line for line in svg.findall('polyline') if line.get('stroke') == '#168B8D']
+            second = [line for line in svg.findall('polyline') if line.get('stroke') == '#D4793A']
+            self.assertEqual([xs(line) for line in first], [[100., 420., 740., 1060.]])
+            self.assertEqual([xs(line) for line in second], [[100.], [740., 1060.]])
+        self.assertEqual([xs(line) for line in svgs[3].findall('polyline')],
+                         [[100., 420., 740., 1060.]] * 5)
+        self.assertEqual([xs(line) for line in svgs[4].findall('polyline')],
+                         [[100.], [740., 1060.]] * 5)
+
+    def test_non_bs_config_models_and_observed_rank_changes_never_share_a_trend(self):
+        for changed in ('draft_tokens', 'effective_tokens_per_round', 'target_ep',
+                        'source_model', 'target_model', 'observed_ranks', 'rank_coverage'):
+            report = bs_trend_report()
+            other = [copy.deepcopy(case) for case in report['cases'] if case['config']['bs'] in (4, 8)]
+            for case in other:
+                case['name'] += '_OTHER_SCENARIO'
+                if changed == 'draft_tokens':
+                    case['config']['draft_tokens'] += 1
+                elif changed == 'effective_tokens_per_round':
+                    case['config']['effective_tokens_per_round'] += 1.
+                elif changed == 'target_ep':
+                    case['config']['target_ep'] = 256
+                elif changed == 'source_model':
+                    case['source_model']['expert_dtype'] = 'SYNTHETIC_OTHER_DTYPE'
+                elif changed == 'target_model':
+                    case['target_model']['main']['num_hidden_layers'] += 1
+                elif changed == 'observed_ranks':
+                    case['captures'].append(dict(rank='dp_extra', sha256='SYNTHETIC_EXTRA'))
+                    case['measurements'].append(dict(rank='dp_extra', rounds=[]))
+                else:
+                    for method in case['projection']['layer_mean_methods']:
+                        method.setdefault('coverage', {})['complete'] = False
+            report['cases'].extend(other)
+            before = copy.deepcopy(report)
+            with self.subTest(changed=changed):
+                groups = renderer._bs_comparison_groups(report)
+                self.assertEqual(report, before)
+                self.assertEqual(len(groups), 2)
+                self.assertCountEqual([[case['config']['bs'] for case in group['cases']]
+                                       for group in groups], [[4, 8], [4, 8, 16, 32]])
+                out, (book, _) = self.build(report)
+                ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+                charts = self.chart_parts_by_sheet(out, book)
+                for name, expected in (('估算总览', 6), ('方法1估算', 2), ('方法2估算', 2)):
+                    line = [chart for chart in charts[name] if chart.find('.//c:lineChart', ns) is not None]
+                    self.assertEqual(len(line), expected)
+                    for chart in line:
+                        categories = [node.text for node in chart.findall('.//c:ser/c:cat/c:strRef/c:strCache/c:pt/c:v', ns)]
+                        # Each chart contains one intact group, not duplicate
+                        # categories from unrelated source/target conditions.
+                        self.assertIn(categories[:len(set(categories))], [['4', '8'], ['4', '8', '16', '32']])
+
+    def test_duplicate_bs_keeps_each_case_row_and_suppresses_group_trends(self):
+        report = bs_trend_report()
+        duplicate = copy.deepcopy(next(case for case in report['cases'] if case['config']['bs'] == 8))
+        duplicate['name'] = 'SYNTHETIC_REPEATED_BS8'
+        for method in duplicate['projection']['layer_mean_methods']:
+            method['cycle_ms'] += 100.
+            method['breakdown'][-1]['value_ms'] += 100.
+        report['cases'].append(duplicate)
+        before = copy.deepcopy(report)
+        groups = renderer._bs_comparison_groups(report)
+        self.assertEqual(report, before)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]['duplicate_bs'], [8])
+        self.assertEqual([case['config']['bs'] for case in groups[0]['cases']], [4, 8, 8, 16, 32])
+        out, (book, _) = self.build(report)
+        ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        charts = self.chart_parts_by_sheet(out, book)
+        for name in ('估算总览', '方法1估算', '方法2估算'):
+            self.assertFalse(any(chart.find('.//c:lineChart', ns) is not None for chart in charts[name]))
+            self.assertIn('相同BS存在多条采样组合，未合并趋势', ' '.join(map(str, book[name][1].values())))
+        rows = [(int(cell[1:]), value) for cell, value in book['估算总览'][1].items()
+                if re.fullmatch(r'B\d+', cell) and value in {case['name'] for case in report['cases']}]
+        self.assertEqual(len(rows), 5)
+        cases = {case['name']: case for case in report['cases']}
+        for row, name in rows:
+            self.assertEqual(book['估算总览'][1]['F' + str(row)],
+                             cases[name]['projection']['layer_mean_methods'][0]['cycle_ms'])
+
+    def test_missing_bs_is_retained_without_guessing_case_name_or_drawing_trends(self):
+        report = bs_trend_report()
+        missing = report['cases'][0]
+        missing['config'].pop('bs')
+        missing['name'] = 'SYNTHETIC_NAME_ONLY_BS512'
+        out, (book, _) = self.build(report)
+        ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        charts = self.chart_parts_by_sheet(out, book)
+        for name in ('估算总览', '方法1估算', '方法2估算'):
+            self.assertFalse(any(chart.find('.//c:lineChart', ns) is not None for chart in charts[name]))
+            row = next(int(cell[1:]) for cell, value in book[name][1].items()
+                       if re.fullmatch(r'B\d+', cell) and value == missing['name'])
+            self.assertIsNone(book[name][1].get('A' + str(row)))
+
+    def test_bs_index_keeps_singleton_with_different_target_dp_visible_before_grouped_tables(self):
+        report = bs_trend_report()
+        report['cases'] = [case for case in report['cases'] if case['config']['bs'] != 32]
+        for case in report['cases']:
+            case['config']['target_dp'] = 128 if case['config']['bs'] == 16 else 64
+        groups = renderer._bs_comparison_groups(report)
+        self.assertCountEqual([[case['config']['bs'] for case in group['cases']] for group in groups],
+                              [[4, 8], [16]])
+        out, (book, _) = self.build(report)
+        ordered = sorted(report['cases'], key=lambda case: case['config']['bs'])
+        cells = book['估算总览'][1]
+        title = '本次报告全部采样组合（含单独分组的BS）'
+        title_row = next(int(cell[1:]) for cell, value in cells.items()
+                         if re.fullmatch(r'A\d+', cell) and value == title)
+        table_row = next(int(cell[1:]) for cell, value in cells.items()
+                         if re.fullmatch(r'B\d+', cell) and value == 'BS对比组')
+        self.assertLess(title_row, table_row)
+        index_rows = sorted((int(cell[1:]), value) for cell, value in cells.items()
+                            if re.fullmatch(r'D\d+', cell) and value in {case['name'] for case in ordered})
+        self.assertEqual([value for _, value in index_rows], [case['name'] for case in ordered])
+        first_grouped_row = min(int(cell[1:]) for cell, value in cells.items()
+                                if re.fullmatch(r'B\d+', cell) and value in {case['name'] for case in ordered})
+        for (row, name), case in zip(index_rows, ordered):
+            self.assertGreater(row, table_row)
+            self.assertLess(row, first_grouped_row)
+            self.assertEqual(cells['A' + str(row)], case['config']['bs'])
+            self.assertIn('BS对比组', cells['B' + str(row)])
+            self.assertIn('方法1', cells['G' + str(row)])
+            self.assertIn('方法2', cells['G' + str(row)])
+        self.assertIn('一个BS', cells['G' + str(index_rows[-1][0])])
+        single = ordered[-1]
+        for name in ('估算总览', '方法1估算', '方法2估算'):
+            original_rows = [int(cell[1:]) for cell, value in book[name][1].items()
+                             if re.fullmatch(r'B\d+', cell) and value == single['name']]
+            self.assertEqual(len(original_rows), 1)
+            self.assertEqual(book[name][1]['A' + str(original_rows[0])], 16.)
+        ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        charts = self.chart_parts_by_sheet(out, book)
+        for name in ('估算总览', '方法1估算', '方法2估算'):
+            line = [chart for chart in charts[name] if chart.find('.//c:lineChart', ns) is not None]
+            self.assertEqual(len(line), 3 if name == '估算总览' else 1)
+            for chart in line:
+                self.assert_line_cache_matches_sheet(chart, book, [4, 8])
+        preview = out.with_suffix('.html').read_text(encoding='utf-8')
+        start = preview.index(title)
+        index_html = preview[start:preview.index('</table>', start)]
+        self.assertEqual(sorted(ordered, key=lambda case: index_html.index(case['name'])), ordered)
+
+    def test_progress_reports_only_actual_disk_bs_and_silent_export_has_same_cells(self):
+        report = bs_trend_report()
+        report['cases'] = [case for case in report['cases'] if case['config']['bs'] in (4, 8)]
+        source = self.root / 'actual-bs4-bs8.json'
+        encoded = json.dumps(report, ensure_ascii=False)
+        source.write_text(encoded, encoding='utf-8')
+        silent, verbose = self.root / 'silent.xlsx', self.root / 'verbose.xlsx'
+        with mock.patch('builtins.print') as printer:
+            renderer.build_workbook(silent, report=source)
+        printer.assert_not_called()
+        messages = []
+        with mock.patch.object(renderer, '_read_json', wraps=renderer._read_json) as reader:
+            renderer.build_workbook(verbose, report=source, progress=messages.append)
+        reader.assert_called_once_with(source)
+        origins = [message for message in messages if message.startswith('输入报告：')]
+        self.assertEqual(len(origins), 1)
+        self.assertIn('磁盘JSON', origins[0])
+        self.assertIn(str(source.resolve()), origins[0])
+        self.assertIn('输入清单：case=2；配置BS=[4, 8]；失败case=0', messages)
+        combinations = [message for message in messages if message.startswith('输入组合：')]
+        self.assertEqual(len(combinations), 2)
+        for case in report['cases']:
+            line = next(message for message in combinations if case['name'] in message)
+            self.assertIn('config.bs=' + str(case['config']['bs']), line)
+            self.assertIn('方法1=条件估算', line)
+            self.assertIn('方法2=条件估算', line)
+        self.assertTrue(any(message.startswith('BS分组：') for message in messages))
+        self.assertFalse(any('config.bs=16' in message for message in messages))
+        self.assertEqual(source.read_text(encoding='utf-8'), encoded)
+        self.assertEqual({name: cells for name, (_, cells) in read_book(silent)[0].items()},
+                         {name: cells for name, (_, cells) in read_book(verbose)[0].items()})
+
+    def test_in_memory_input_index_and_diagnostics_ignore_stale_disk_case(self):
+        report = bs_trend_report()
+        stale = copy.deepcopy(report)
+        stale['cases'] = [case for case in stale['cases'] if case['config']['bs'] == 16]
+        stale['cases'][0]['name'] = 'STALE_DISK_ONLY_BS16'
+        report['cases'] = [case for case in report['cases'] if case['config']['bs'] in (4, 8)]
+        before = copy.deepcopy(report)
+        source = self.root / 'stale-source-label.json'
+        encoded = json.dumps(stale, ensure_ascii=False)
+        source.write_text(encoded, encoding='utf-8')
+        messages = []
+        out = self.root / 'memory.xlsx'
+        with mock.patch.object(renderer, '_read_json', side_effect=AssertionError('must not reread source label')) as reader:
+            renderer.build_workbook(out, report=source, report_data=report, progress=messages.append)
+        reader.assert_not_called()
+        self.assertEqual(report, before)
+        self.assertEqual(source.read_text(encoding='utf-8'), encoded)
+        origin = next(message for message in messages if message.startswith('输入报告：'))
+        self.assertIn('复用内存报告（来源路径仅为标签）', origin)
+        self.assertIn(str(source.resolve()), origin)
+        self.assertIn('输入清单：case=2；配置BS=[4, 8]；失败case=0', messages)
+        self.assertFalse(any('STALE_DISK_ONLY_BS16' in message or 'config.bs=16' in message for message in messages))
+        book = read_book(out)[0]
+        for name in ('估算总览', '方法1估算', '方法2估算'):
+            self.assertNotIn('STALE_DISK_ONLY_BS16', book[name][1].values())
+
+    def test_unavailable_method_keeps_source_means_but_does_not_publish_target_values(self):
+        report = layer_mean_fixture()
+        method = report['cases'][0]['projection']['layer_mean_methods'][1]
+        method.update(status='UNAVAILABLE', reasons=['ACTUAL_REFERENCE_BS_ROW_MISSING'])
+        method.update(cycle_ms=111222.333, per_device_tokens_s=222333.444, tpot_ms=333444.555)
+        _, (book, _) = self.build(report)
+        for name in ('估算总览', '方法2估算'):
+            for value in (111222.333, 222333.444, 333444.555):
+                self.assertNotIn(value, book[name][1].values())
+        self.assertIn(3.12345, book['方法2估算'][1].values())
+        self.assertIn('ACTUAL_REFERENCE_BS_ROW_MISSING', ' '.join(map(str, book['复核记录'][1].values())))
+
+    def test_canonical_cell_audit_refuses_incorrect_layer_mean_cards(self):
+        report = layer_mean_fixture()
+        original = renderer._method
+        def wrong(case, identity):
+            method = copy.deepcopy(original(case, identity))
+            method['per_device_tokens_s'] = 123456789.987
+            return method
+        with mock.patch.object(renderer, '_method', side_effect=wrong), \
+                mock.patch.object(renderer.Workbook, 'save') as save, \
+                self.assertRaisesRegex(ValueError, '阶段=核对Excel关键结果'):
+            renderer.build_workbook(self.root / 'wrong.xlsx', report=self.root / 'source.json',
+                                    report_data=report, expected_method_set='layer_mean_methods')
+        save.assert_not_called()
+
+    def test_layer_mean_status_and_selected_rank_are_explicit(self):
+        for invalid in ('wrong_set', 'missing_rank', 'ambiguous_rank', 'missing_rate'):
+            report = layer_mean_fixture()
+            method = report['cases'][0]['projection']['layer_mean_methods'][0]
+            if invalid == 'wrong_set':
+                report['cases'][0]['projection']['display_method_set'] = 'methods'
+            elif invalid == 'missing_rank':
+                method['selected_rank'] = 'not sampled'
+            elif invalid == 'ambiguous_rank':
+                method['per_rank'].append(copy.deepcopy(method['per_rank'][0]))
+            else:
+                method['per_device_tokens_s'] = None
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                renderer._validate_report(report)
+
+    def test_actual_math_helper_contract_renders_without_strict_component_evidence(self):
+        from test_ep128_layer_mean import attach, synthetic_report
+        report, native = synthetic_report({'dp0': [1., 3.], 'dp1': [2.2, 2.2]})
+        methods = attach(report, native)
+        self.assertEqual(methods[0]['status'], 'LAYER_MEAN_ESTIMATE')
+        self.assertEqual(methods[0]['selected_rank'], 'dp1')
+        _, (book, _) = self.build(report)
+        self.assertIn(methods[0]['cycle_ms'], book['估算总览'][1].values())
+        self.assertIn(methods[0]['per_device_tokens_s'], book['方法1估算'][1].values())
+        self.assertIn('缺少实际输入', book['方法2估算'][1].values())
+        self.assertNotIn('missing ownership, basis and component calibration',
+                         ' '.join(map(str, book['复核记录'][1].values())))
+
+    def test_fixed_communication_cost_is_shown_only_when_core_report_includes_it(self):
+        report = layer_mean_fixture()
+        _, (book, _) = self.build(report)
+        values = list(book['公式与假设'][1].values())
+        self.assertIn(.014, values)
+        self.assertIn('方法一每次Dispatch/Combine附加14μs；已计入核心增量', values)
+        self.assertIn('方法二按历史通信倍率换算，无额外14μs', values)
+        for method in report['cases'][0]['projection']['layer_mean_methods']:
+            method.pop('communication')
+        _, (book, _) = self.build(report)
+        self.assertNotIn('14μs', ' '.join(map(str, book['公式与假设'][1].values())))
+
+    def test_unavailable_target_does_not_present_source_rank_as_a_selected_target(self):
+        report = layer_mean_fixture()
+        method = report['cases'][0]['projection']['layer_mean_methods'][1]
+        method.update(status='UNAVAILABLE', reasons=['ACTUAL_INPUT_MISSING'], selected_rank=None, source_rank='dp7')
+        out, (book, _) = self.build(report)
+        text = ' '.join(map(str, book['方法2估算'][1].values()))
+        self.assertIn('目标rank未选择；源参考rank=dp7', text)
+        self.assertNotIn('所选rank=dp7', text)
+        self.assertNotIn('所选rank=dp3', text)
+        self.assertIn('目标rank未选择；源参考rank=dp7', out.with_suffix('.html').read_text())
+
+    def test_ledger_uses_core_rank_partitions_without_expanding_task_intervals(self):
+        report = layer_mean_fixture()
+        case = report['cases'][0]
+        # Old per-task evidence is irrelevant to the selected layer-mean report.
+        case['measurements'][0]['rounds'][0]['ledger']['intervals'][0]['label'] = 'OLD_ATOMIC_TASK_ONLY'
+        _, (book, _) = self.build(report)
+        values = list(book['时间账本'][1].values())
+        self.assertIn('源主模型层链(ms)', values)
+        self.assertIn('源草稿层链(ms)', values)
+        self.assertIn(12.25, values)
+        self.assertIn(3.25, values)
+        self.assertIn('SYNTHETIC_SOURCE_PARTITION', values)
+        self.assertNotIn('OLD_ATOMIC_TASK_ONLY', values)
+
+    def test_method_pages_do_not_dump_component_record_metadata(self):
+        report = layer_mean_fixture()
+        for method in report['cases'][0]['projection']['layer_mean_methods']:
+            method['detail_rows'][0].update(status='LAYER_MEAN_ESTIMATE',
+                                            basis='INTERNAL_RECORD_METADATA_ONLY')
+        _, (book, _) = self.build(report)
+        for name in ('方法1估算', '方法2估算'):
+            text = ' '.join(map(str, book[name][1].values()))
+            self.assertNotIn('LAYER_MEAN_ESTIMATE', text)
+            self.assertNotIn('INTERNAL_RECORD_METADATA_ONLY', text)
+
+
+    def test_selected_rank_u_tables_and_horizontal_charts_close_without_markov_double_count(self):
+        report = residual_report()
+        out, (book, files) = self.build(report)
+        methods = report['cases'][0]['projection']['layer_mean_methods']
+        chart_ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        with ZipFile(out) as archive:
+            charts = [ET.fromstring(archive.read(name)) for name in files if name.startswith('xl/charts/chart')]
+        u_charts = [chart for chart in charts if '轮次剩余区间耗时构成' in ''.join(chart.find('c:chart/c:title', chart_ns).itertext())]
+        self.assertEqual(len(u_charts), 2)
+        self.assertEqual(renderer.METHOD_RESIDUAL_HEADERS,
+                         ['过渡区间', '阶段', '耗时均值(ms)', '匹配轮次 / 状态'])
+        for index, method in enumerate(methods):
+            rank = method['selected_rank']
+            other_rank = 'dp3' if rank == 'dp7' else 'dp7'
+            rows, items, note = renderer._method_residual_data(report['cases'][0], method)
+            self.assertEqual(len(rows), 15)
+            self.assertEqual(len(items), 15)
+            self.assertAlmostEqual(sum(item['value_ms'] for item in items), method['source_partition']['residual_ms'])
+            self.assertTrue(all(item['label'].startswith(rank + '_PARENT_') for item in items))
+            name = '方法1估算' if index == 0 else '方法2估算'
+            cells = book[name][1]
+            self.assertFalse(any(other_rank + '_PARENT_' in str(value) for value in cells.values()))
+            self.assertFalse(any('_CHILD_NOT_ADDED_' in str(value) for value in cells.values()))
+            table_rows = sorted(int(cell[1:]) for cell, value in cells.items()
+                                if cell.startswith('C') and str(value).startswith(rank + '_PARENT_'))
+            self.assertEqual(len(table_rows), 15)
+            chart = next(chart for chart in u_charts if renderer._layer_mean_name(method)
+                         in ''.join(chart.find('c:chart/c:title', chart_ns).itertext()))
+            self.assertEqual(chart.find('.//c:barDir', chart_ns).get('val'), 'bar')
+            series = chart.find('.//c:ser', chart_ns)
+            self.assertIn('阶段耗时(ms)', ''.join(series.find('c:tx', chart_ns).itertext()))
+            values = [float(node.text) for node in series.findall('c:val/c:numRef/c:numCache/c:pt/c:v', chart_ns)]
+            labels = [node.text for node in series.findall('c:cat/c:strRef/c:strCache/c:pt/c:v', chart_ns)]
+            self.assertEqual(values, [cells['I' + str(row)] for row in table_rows])
+            self.assertEqual(labels, [cells['C' + str(row)] for row in table_rows])
+            self.assertAlmostEqual(sum(values), method['source_partition']['residual_ms'])
+            self.assertEqual(series.find('c:cat/c:strRef/c:f', chart_ns).text,
+                             f"'{name}'!$C${table_rows[0]}:$C${table_rows[-1]}")
+            self.assertEqual(series.find('c:val/c:numRef/c:f', chart_ns).text,
+                             f"'{name}'!$I${table_rows[0]}:$I${table_rows[-1]}")
+            method_html = renderer._method_residual_html(report['cases'][0], method)
+            self.assertEqual(method_html.count('class="u-bar"'), 15)
+            self.assertNotIn(other_rank + '_PARENT_', method_html)
+            self.assertNotIn('_CHILD_NOT_ADDED_', method_html)
+        self.assertEqual(out.with_suffix('.html').read_text().count('class="u-bar"'), 30)
+        titles = [''.join(chart.find('c:chart/c:title', chart_ns).itertext()) for chart in charts]
+        self.assertTrue(titles[0].startswith('完整周期分解'))
+        self.assertTrue(titles[1].startswith('轮次剩余区间耗时构成'))
+        self.assertTrue(titles[2].startswith('完整周期分解'))
+        self.assertTrue(titles[3].startswith('轮次剩余区间耗时构成'))
+
+    def test_missing_unselected_or_duplicate_rank_never_falls_back_to_other_capture(self):
+        for invalid in ('unselected', 'missing', 'duplicate'):
+            report = residual_report()
+            case = report['cases'][0]
+            method = case['projection']['layer_mean_methods'][0]
+            if invalid == 'unselected':
+                method.update(selected_rank=None, source_rank='dp3', status='UNAVAILABLE', reasons=['MISSING_TARGET'])
+            elif invalid == 'missing':
+                case['measurements'] = [row for row in case['measurements'] if row['rank'] != method['selected_rank']]
+            else:
+                case['measurements'].append(copy.deepcopy(case['measurements'][0]))
+            with self.subTest(invalid=invalid):
+                rows, items, note = renderer._method_residual_data(case, method)
+                self.assertEqual(rows, [])
+                self.assertIsNone(items)
+                self.assertNotIn('dp3_PARENT_', renderer._method_residual_html(case, method))
+                self.assertTrue(note)
+        _, (book, _) = self.build(report)
+        self.assertFalse(any('_PARENT_' in str(value) for value in book['方法1估算'][1].values()))
+
+    def test_partial_missing_disordered_or_nonclosing_u_never_draws_numeric_bars(self):
+        for invalid in ('partial', 'missing', 'order', 'sample_count', 'window_sum', 'diag_sum', 'method_sum', 'unavailable'):
+            report = residual_report()
+            case = report['cases'][0]
+            method = case['projection']['layer_mean_methods'][0]
+            diagnostic = case['measurements'][0]['step_residuals']
+            if invalid == 'partial':
+                diagnostic['stage_summary'][0].update(status='PARTIAL', matched_windows=1)
+            elif invalid == 'missing':
+                diagnostic['stage_summary'].pop(0)
+            elif invalid == 'order':
+                diagnostic['stage_summary'][0]['stage_order'] = 2
+            elif invalid == 'sample_count':
+                diagnostic['stage_summary'][0].update(rounds=1, matched_windows=1)
+            elif invalid == 'window_sum':
+                diagnostic['summary'][0]['duration_ms_mean'] += 1
+            elif invalid == 'diag_sum':
+                diagnostic['residual_ms_mean'] += 1
+            elif invalid == 'method_sum':
+                method['source_partition']['cross_role_tail_residual_ms'] += 1
+            else:
+                method.update(status='UNAVAILABLE', reasons=['SYNTHETIC_TARGET_INPUT_MISSING'])
+            with self.subTest(invalid=invalid):
+                rows, items, note = renderer._method_residual_data(case, method)
+                self.assertTrue(rows)
+                self.assertIsNone(items)
+                self.assertIn('未绘图', note)
+                self.assertNotIn('class="u-bar"', renderer._method_residual_html(case, method))
+                if invalid == 'partial':
+                    self.assertEqual(rows[0][1], '阶段未识别（原窗口实测总耗时）')
+                    self.assertEqual(rows[0][2], diagnostic['summary'][0]['duration_ms_mean'])
+                    self.assertIn('1/2', rows[0][3])
+                    self.assertNotIn('请重跑基础统计', note)
+
+    def test_wholly_unresolved_window_keeps_measured_total_without_semantic_mean_or_chart(self):
+        report = residual_report()
+        case = report['cases'][0]
+        method = case['projection']['layer_mean_methods'][0]
+        diagnostic = case['measurements'][0]['step_residuals']
+        original = copy.deepcopy(diagnostic)
+        for summary in diagnostic['summary']:
+            summary.update(recorded_busy_ms_mean=summary['duration_ms_mean'] * .7,
+                           no_recorded_ms_mean=summary['duration_ms_mean'] * .3,
+                           host_span_union_ms_mean=summary['duration_ms_mean'] * .4)
+            unknown = dict(window_key=summary['window_key'], stage_key='unresolved', stage_order=1,
+                label='ORIGINAL_UNRESOLVED', level=0, parent_stage_key=None, rounds=2, matched_windows=0,
+                status='UNRESOLVED', duration_ms_mean=None,
+                duration_ns_total=round(summary['duration_ms_mean'] * 2e6), reason='SYNTHETIC_MISSING_STAGE_ANCHOR')
+            diagnostic['stage_summary'] = [row for row in diagnostic['stage_summary']
+                                            if row['window_key'] != summary['window_key']] + [unknown]
+            ledger_rows = renderer._residual_stage_rows([unknown], summary)
+            self.assertEqual(ledger_rows[0][0], '阶段未识别（原窗口实测总耗时）')
+            self.assertEqual(ledger_rows[0][1:5], [summary[key] for key in
+                ('duration_ms_mean', 'recorded_busy_ms_mean', 'no_recorded_ms_mean', 'host_span_union_ms_mean')])
+            self.assertIn('0/2', ledger_rows[0][-1])
+            self.assertIn('UNRESOLVED', ledger_rows[0][-1])
+        before = copy.deepcopy(diagnostic)
+        rows, items, note = renderer._method_residual_data(case, method)
+        self.assertEqual(len(rows), 2)
+        self.assertAlmostEqual(sum(row[2] for row in rows), diagnostic['residual_ms_mean'])
+        self.assertTrue(all(row[1] == '阶段未识别（原窗口实测总耗时）' for row in rows))
+        self.assertTrue(all('0/2' in row[3] and 'SYNTHETIC_MISSING_STAGE_ANCHOR' in row[3] for row in rows))
+        self.assertIsNone(items)
+        self.assertNotIn('请重跑基础统计', note)
+        html = renderer._method_residual_html(case, method)
+        self.assertIn('阶段未识别（原窗口实测总耗时）', html)
+        self.assertNotIn('class="u-bar"', html)
+        out, (book, _) = self.build(report)
+        self.assertEqual(diagnostic, before)
+        self.assertTrue(all(row['duration_ms_mean'] is None for row in diagnostic['stage_summary']))
+        cells = book['方法1估算'][1]
+        self.assertIn('阶段未识别（原窗口实测总耗时）', cells.values())
+        self.assertIn(original['summary'][0]['duration_ms_mean'], cells.values())
+        self.assertIn('阶段未识别（原窗口实测总耗时）', out.with_suffix('.html').read_text())
+
+    def test_partial_unresolved_subgroup_never_claims_full_window_stage_or_occupancy_means(self):
+        report = residual_report()
+        case = report['cases'][0]
+        method = case['projection']['layer_mean_methods'][0]
+        diagnostic = case['measurements'][0]['step_residuals']
+        summary = diagnostic['summary'][0]
+        stages = [row for row in diagnostic['stage_summary'] if row['window_key'] == summary['window_key']]
+        for row in stages:
+            row.update(status='PARTIAL', matched_windows=1, duration_ms_mean=None)
+        unknown = dict(window_key=summary['window_key'], stage_key='unresolved', stage_order=1,
+            label='PARTIAL_UNRESOLVED', level=0, parent_stage_key=None, rounds=2, matched_windows=0,
+            status='UNRESOLVED', duration_ms_mean=None,
+            duration_ns_total=round(summary['duration_ms_mean'] * 1e6), reason='ONLY_ONE_ROUND_UNRESOLVED')
+        diagnostic['stage_summary'].append(unknown)
+        ledger_rows = renderer._residual_stage_rows([unknown], summary)
+        self.assertEqual(ledger_rows[0][1:5], [renderer.NA] * 4)
+        self.assertIn('UNRESOLVED', ledger_rows[0][-1])
+        rows, items, note = renderer._method_residual_data(case, method)
+        self.assertEqual(len(rows), 8)  # One known whole window and the other seven matched stages.
+        self.assertEqual(rows[0][1], '阶段未识别（原窗口实测总耗时）')
+        self.assertEqual(rows[0][2], summary['duration_ms_mean'])
+        self.assertIn('1/2', rows[0][3])
+        self.assertIn('ONLY_ONE_ROUND_UNRESOLVED', rows[0][3])
+        self.assertIsNone(items)
+        self.assertNotIn('class="u-bar"', renderer._method_residual_html(case, method))
+        self.assertNotIn('请重跑基础统计', note)
+
+    def test_default_renderer_filename_overview_and_titles_use_product_name(self):
+        source = self.root / 'core.json'
+        source.write_text(json.dumps(layer_mean_fixture()), encoding='utf-8')
+        result = subprocess.run([sys.executable, '-S', str(Path(renderer.__file__).resolve()), '--report', str(source)],
+                                cwd=self.root, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        out = self.root / '10T模型推理估算.xlsx'
+        self.assertTrue(out.is_file())
+        book, _ = read_book(out)
+        self.assertEqual(next(iter(book)), '估算总览')
+        self.assertEqual(book['估算总览'][1]['A1'], '10T模型推理估算')
+        preview = out.with_suffix('.html').read_text()
+        self.assertIn('<title>10T模型推理估算</title>', preview)
+        self.assertIn('<h1>10T模型推理估算</h1>', preview)
+
+
+if __name__ == '__main__':
+    unittest.main()
