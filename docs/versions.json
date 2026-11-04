@@ -7,19 +7,25 @@
   },
   "components": {
     "profile_ep128.py": {
-      "version": "20261103.12.native_stages",
-      "sha256": "035f0c6312354ca0937361f1ab301452ed61c68239845b2c0c76f08653f9d7f7",
-      "matches_current_working_source": true
+      "version": "20261104.1.swa_u_drilldown",
+      "sha256": "b9b6bd5db459c8d30f5bc5eb5bc3975bbe722eda89fabda75deea3f1bba347bc",
+      "imported_version": "20261103.12.native_stages",
+      "imported_sha256": "035f0c6312354ca0937361f1ab301452ed61c68239845b2c0c76f08653f9d7f7",
+      "matches_imported_source": false
     },
     "build_ep128_leadership_excel.py": {
-      "version": "20261104.2.bs_inventory",
-      "sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
-      "matches_current_working_source": true
+      "version": "20261104.3.swa_u_drilldown",
+      "sha256": "36e2e1c68cfd835dcfb44bd55d3d1e11733a8fad9bae2e71ac50a2c8a2ee332c",
+      "imported_version": "20261104.2.bs_inventory",
+      "imported_sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
+      "matches_imported_source": false
     },
     "ep128_xlsx_writer.py": {
       "version": "20261104.1.line_charts",
       "sha256": "210a6e7056cd23bdc491d200cf141c39f33c8f473c5d67176279f4a64bd1ede9",
-      "matches_current_working_source": true
+      "imported_version": "20261104.1.line_charts",
+      "imported_sha256": "210a6e7056cd23bdc491d200cf141c39f33c8f473c5d67176279f4a64bd1ede9",
+      "matches_imported_source": true
     }
   },
   "presentations": [
@@ -49,15 +55,28 @@
     "Tests use a newly generated synthetic communication table; no historical measured values were copied.",
     "Tests requiring private capture fixtures are skipped when those fixtures are absent.",
     "The original machine-specific test import fallback was removed.",
-    "Regression tests were grouped under tests/ and optional standalone checks under tools/; runtime scripts and presentation assets are unchanged."
+    "Regression tests were grouped under tests/ and optional standalone checks under tools/; runtime scripts and presentation assets are unchanged.",
+    "SWA and U diagnostic drill-downs add evidence only; original source/target cycle, TPOT and rank-selection formulas are unchanged. Repository iterations use branches and pull requests with offline regression checks."
   ],
   "validation": {
-    "discovered_tests": 221,
-    "passed": 211,
+    "discovered_tests": 238,
+    "passed": 228,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,
       "optional_openpyxl_in_standard_library_only_mode": 2
+    },
+    "a3_offline_replay": {
+      "captures": 8,
+      "retained_rank_cycles": 944,
+      "source_measurements_unchanged": true,
+      "swa_partitions_closed": true,
+      "u_parent_and_child_partitions_closed": true,
+      "aligned_trace_retained_cycles": 68,
+      "matched_u_parent_intervals": 1020,
+      "matched_u_child_intervals": 1904,
+      "trace_dma_coverage_validated": true,
+      "runtime_optimization_benchmarked": false
     }
   }
 }
