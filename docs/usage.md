@@ -113,6 +113,49 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 
 不同 BS 的折线按数值排序。非 BS 条件不同会分组；重复 BS 不合并，缺值断线，单点组只显示表格。总览开头列出全部采样组合，日志中可核对实际读入的 JSON。
 
+### U15 与输入、metadata 子阶段
+
+`step_residual_stages.csv` 继续保留原来的 U1 8 段、U2 7 段父阶段；`step_residual_substages.csv` 和每 rank 阶段明细保存 `level=1` 子阶段，`parent_stage_key` 指向父段。原有逐位置 Markov 子阶段继续保留。
+
+下一主模型 `main_inputs` 可细分为：
+
+| 子阶段 | 原生任务锚点 | 缺失处理 |
+| --- | --- | --- |
+| KV block 清零 | `_zero_kv_blocks_kernel` | 无 block 需清理时可自然缺席，允许多个清理任务 |
+| 应用待写入项 | `_apply_write_kernel` | 无待写入项时可自然缺席 |
+| 展开请求与 token 映射 | `_expand_idx_mapping_kernel` | 必需 |
+| 准备位置及序列长度 | `_prepare_pos_seq_lens_kernel` | 必需 |
+| 拼接采样与草稿 token | `_combine_sampled_and_draft_tokens_kernel` | 必需 |
+| 聚合 KV 块表 | `_gather_block_tables_kernel` | 必需 |
+| 计算 KV slot 映射 | `_compute_slot_mappings_kernel` | 必需 |
+
+锚点须满足顺序、唯一性及父区间边界。缺少必需锚点或顺序冲突时，保留父阶段总耗时，细分标为 `UNRESOLVED`，不能自行补 0 或借其他轮次边界。
+
+`main_metadata`、`draft_metadata` 按实际设备任务的 start/end 提取 Attention metadata 和 Indexer metadata **本体**，并把首个本体之前、每个本体之后至下一个本体/父段结尾的区间保留为“映射与准备”。重复本体带各自序号，不假设一次构建必定只有一个 metadata 任务。映射准备中可能包括 RoPE 查表、序列处理、slot 格式化和 Cast/Copy；这些宽标签不等于完整 Python 模块边界。
+
+`recorded_busy_ms` 合并已记录设备任务区间，`kernel_sum_ms` 求 task duration 和，二者不混用。AI_CPU metadata 同样进入设备 busy；busy 高不代表 AICORE 有效算力高。`no_recorded_ms` 是 CSV 任务没有覆盖的区间，不自动等于可消除的空闲。有同次已对齐 trace 时，`trace_dma_union_ms` 记录阶段内 DMA 并集，`trace_dma_in_csv_uncovered_ms` 只计算其填补 CSV 未覆盖的部分，`uncovered_after_trace_dma_ms` 保留补 DMA 后仍未覆盖的区间；最后一列仍不自动等于 idle。Host 来源缺失和 graph 共享来源继续保留未知状态。
+
+**U 子阶段只展开父阶段，所有子段含在原来的 U 中。** 不能把父段和子段重复相加，不能将 U 中的工作移入层区间后宣称周期已经缩短。
+
+### SWA 10 段与同 rank 对照
+
+`swa_stage_summary.csv` 给出每 case、每 rank、每草稿层的汇总；每 rank 的 `*-swa-stages.csv` 保留逐轮 stage 边界与状态，位于 `step_residual_details/` 相应 case/rank 的证据目录。Excel/HTML 从报告 JSON 展示同一份诊断；旧 JSON 没有这些证据时保持不可用，不补造结果。
+
+| stage key | 含义 |
+| --- | --- |
+| `attention_prepare` | Attention HCPre、Q/KV 投影与 cache 准备 |
+| `attention` | Attention 内核 |
+| `attention_output` | Attention 输出投影与整理 |
+| `attention_post` | Attention HCPost 与层内衔接 |
+| `moe_prepare` | FFN HCPre、共享/路由准备至 Dispatch 前 |
+| `dispatch` | 专家 Dispatch |
+| `experts` | 路由专家计算及其间隔 |
+| `combine` | 专家 Combine |
+| `ffn_output` | FFN 输出投影与整理 |
+| `ffn_post` | FFN HCPost |
+
+10 段按原层首 HCPre → 末 HCPost 的连续锚点分割，合计闭合到该层的实测 wall。它们不额外加入外推层均值或周期；不支持模板保留未识别状态。对照时先固定 case、rank 和周期，再区分“整层 wall”与“attention 内核”，并核对主、草稿实际输入 token 数、padding、图模式与 Task Type。A3 回放与优化验证边界见 [SWA 与 U 分析](swa-u-analysis.md)。
+
 ## 7. 运行回归测试
 
 日常统计无需执行测试。维护代码时，从仓库根目录运行：
@@ -122,6 +165,8 @@ python -B -S -m unittest discover -s tests -p "test_ep128*.py" -v
 ```
 
 `-S` 用于验证标准库环境。依赖未归档私有采样的 8 项测试会明确跳过；可选 openpyxl 读取检查在未安装该包时跳过。测试使用的合成数据不能作为目标硬件实测证据。
+
+后续修改统一从新分支发起 PR，完成相关回归与证据复核再合并；仓库所有者已授权验证通过后直接合并。每次 PR 保留变更范围、验证命令、结果与尚未验证的性能假设。
 
 ## 8. 可选独立检查工具
 

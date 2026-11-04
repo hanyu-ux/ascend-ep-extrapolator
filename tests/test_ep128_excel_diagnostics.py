@@ -232,6 +232,120 @@ class ExcelDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(renderer.RENDERER_VERSION, result.stdout)
 
+    def test_swa_drilldown_preserves_unknown_zero_and_attention_scope(self):
+        diagnostic = dict(status='PARTIAL', scope='SYNTHETIC_HC_MARKER_INTERVAL', stages_csv='synthetic-swa.csv',
+            layer_summary=[dict(role='main', layer=0, attention='HCA', reference_eligible=False, rounds=3,
+                                wall_ms_mean=1.234, wall_ms_p50=None, no_recorded_ms_mean=0.)],
+            stage_summary=[dict(role='draft', layer=1, attention='SWA', stage_key='attention',
+                                label='SYNTHETIC_SWA_ATTENTION', rounds=3, matched_windows=3, status='MATCHED',
+                                duration_ms_mean=.4321, recorded_busy_ms_mean=None, no_recorded_ms_mean=0.),
+                           dict(role='draft', layer=1, attention='SWA', stage_key='missing_projection',
+                                label='SYNTHETIC_PARTIAL_SWA', rounds=3, matched_windows=2, status='PARTIAL',
+                                duration_ms_mean=99999.),
+                           dict(role='main', layer=2, attention='CSA', stage_key='attention',
+                                label='SYNTHETIC_CSA_NOT_SWA', rounds=3, matched_windows=3, status='MATCHED',
+                                duration_ms_mean=88888.)])
+        rows = renderer._swa_stage_rows(diagnostic)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][4], .4321)
+        self.assertEqual(rows[0][7:9], [renderer.NA, 0.])
+        self.assertEqual(rows[1][4:], [renderer.NA] * 7)
+        report = fixture()
+        report['cases'][0]['measurements'][0]['swa_diagnostics'] = diagnostic
+        out = self.base / 'swa-diagnostic.xlsx'
+        renderer.build_workbook(out, report=self.base / 'source.json', report_data=report)
+        cells = read_book(out)[0]['层与组件实测'][1]
+        self.assertIn('SYNTHETIC_SWA_ATTENTION', cells.values())
+        self.assertIn('SYNTHETIC_PARTIAL_SWA', cells.values())
+        self.assertNotIn('SYNTHETIC_CSA_NOT_SWA', cells.values())
+        self.assertNotIn(99999., cells.values())
+        self.assertNotIn(88888., cells.values())
+        preview = out.with_suffix('.html').read_text()
+        self.assertIn('SYNTHETIC_SWA_ATTENTION', preview)
+        self.assertNotIn('SYNTHETIC_CSA_NOT_SWA', preview)
+        self.assertIn('未知值显示—，不补0', preview)
+
+    def test_swa_details_are_display_only_and_never_change_cycle_or_tpot(self):
+        report = fixture()
+        capture = report['cases'][0]['measurements'][0]
+        capture['swa_diagnostics'] = dict(status='MATCHED', scope='SYNTHETIC_ONLY', stages_csv='swa.csv',
+            layer_summary=[dict(role='draft', layer=0, attention='SWA', reference_eligible=True,
+                                rounds=2, wall_ms_mean=1234567.)],
+            stage_summary=[dict(role='draft', layer=0, attention='SWA', stage_key='attention',
+                                label='SYNTHETIC_LARGE_DETAIL_ALREADY_INCLUDED', status='MATCHED',
+                                rounds=2, matched_windows=2, duration_ms_mean=1234567.,
+                                kernel_sum_ms_mean=2345678., total_cost_ms_mean=3456789.)])
+        before = copy.deepcopy(report)
+        out = self.base / 'swa-unchanged-estimate.xlsx'
+        renderer.build_workbook(out, report=self.base / 'source.json', report_data=report)
+        self.assertEqual(report, before)
+        book = read_book(out)[0]
+        self.assertIn(1234567., book['层与组件实测'][1].values())
+        for method, name in zip(report['cases'][0]['projection']['layer_mean_methods'], ('方法1估算', '方法2估算')):
+            for field in ('cycle_ms', 'tpot_ms', 'per_device_tokens_s'):
+                self.assertIn(method[field], book[name][1].values())
+            self.assertNotIn(1234567., book[name][1].values())
+        self.assertIn('不加到层链、U、完整周期或TPOT', out.with_suffix('.html').read_text())
+
+    def test_u_children_stay_with_their_parents_without_changing_parent_partition(self):
+        from test_ep128_layer_mean_excel import residual_report
+        report = residual_report()
+        case = report['cases'][0]
+        diagnostic = case['measurements'][0]['step_residuals']
+        for parent, label in (('draft_to_nextmain_1', 'SYNTHETIC_METADATA_BODY'),
+                              ('draft_to_nextmain_2', 'SYNTHETIC_KV_INPUTS')):
+            diagnostic['substage_summary'].append(dict(window_key='draft_to_nextmain', parent_stage_key=parent,
+                stage_key=label, stage_order=1, label=label, level=1, rounds=2, matched_windows=2,
+                status='MATCHED', duration_ms_mean=456789., source_status='PARTIAL',
+                source_cpu_tasks_total=1, source_device_tasks_total=3, source_cpu_union_ms_mean=.12345))
+        groups = renderer._residual_substage_groups(diagnostic, 'draft_to_nextmain')
+        self.assertEqual({parent for parent, _, _ in groups},
+                         {'draft_to_nextmain_1', 'draft_to_nextmain_2', 'draft_to_nextmain_3'})
+        for parent, _, children in groups:
+            self.assertTrue(all(item['parent_stage_key'] == parent for item in children))
+        method = case['projection']['layer_mean_methods'][0]
+        rows, bars, _ = renderer._method_residual_data(case, method)
+        self.assertEqual(len(rows), 15)
+        self.assertEqual(len(bars), 15)
+        self.assertAlmostEqual(sum(item['value_ms'] for item in bars), diagnostic['residual_ms_mean'])
+        preview = renderer._residual_html(diagnostic, 'dp7')
+        self.assertIn('父阶段细分', preview)
+        self.assertNotIn('Markov顺序选词子阶段', preview)
+        self.assertIn('SYNTHETIC_METADATA_BODY', preview)
+        self.assertIn('SYNTHETIC_KV_INPUTS', preview)
+        self.assertIn('本组子阶段的关联Host提交来源', preview)
+        out = self.base / 'u-parent-groups.xlsx'
+        renderer.build_workbook(out, report=self.base / 'source.json', report_data=report)
+        book = read_book(out)[0]
+        self.assertIn('SYNTHETIC_METADATA_BODY', book['时间账本'][1].values())
+        self.assertNotIn(456789., book['方法1估算'][1].values())
+
+    def test_dma_coverage_stays_separate_from_u_and_does_not_fill_missing_trace_with_zero(self):
+        from test_ep128_layer_mean_excel import residual_report
+        report = residual_report()
+        diagnostic = report['cases'][0]['measurements'][0]['step_residuals']
+        stage = diagnostic['stage_summary'][-1]
+        stage.update(label='SYNTHETIC_MAIN_INPUTS_DMA', trace_dma_union_ms_mean=.7654321,
+                     trace_dma_in_csv_uncovered_ms_mean=.4567891, uncovered_after_trace_dma_ms_mean=0.)
+        missing = diagnostic['stage_summary'][-2]
+        missing.update(label='SYNTHETIC_NO_ALIGNED_TRACE', trace_dma_union_ms_mean=None,
+                       trace_dma_in_csv_uncovered_ms_mean=None, uncovered_after_trace_dma_ms_mean=None)
+        rows = renderer._residual_dma_rows([stage, missing])
+        self.assertEqual(rows[0][1:], [.7654321, .4567891, 0.])
+        self.assertEqual(rows[1][1:], [renderer.NA] * 3)
+        expected = diagnostic['residual_ms_mean']
+        out = self.base / 'dma-coverage.xlsx'
+        renderer.build_workbook(out, report=self.base / 'source.json', report_data=report)
+        book = read_book(out)[0]
+        self.assertIn(.7654321, book['时间账本'][1].values())
+        self.assertIn(.4567891, book['时间账本'][1].values())
+        self.assertNotIn(.7654321, book['方法1估算'][1].values())
+        self.assertEqual(diagnostic['residual_ms_mean'], expected)
+        preview = out.with_suffix('.html').read_text()
+        self.assertIn('DMA对CSV未记录区间的补充覆盖', preview)
+        self.assertIn('也不代表已证实的NPU硬件空闲', preview)
+        self.assertIn('无trace或条件不足显示—', preview)
+
 
 if __name__ == "__main__":
     unittest.main()

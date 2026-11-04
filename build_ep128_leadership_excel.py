@@ -18,7 +18,7 @@ import traceback
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261104.2.bs_inventory"
+RENDERER_VERSION = "20261104.3.swa_u_drilldown"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -730,6 +730,12 @@ RESIDUAL_STAGE_SPANS = ((1, 6), (7, 8), (9, 9), (10, 10), (11, 11), (12, 12))
 RESIDUAL_SOURCE_HEADERS = ["设备阶段对应的Host来源", "CPU已关联 / 全部任务", "已关联CPU区间并集(ms)",
                            "队列等待并集(ms)", "提交→执行延迟均值(ms)", "来源覆盖状态"]
 RESIDUAL_SOURCE_SPANS = ((1, 4), (5, 6), (7, 8), (9, 9), (10, 11), (12, 12))
+RESIDUAL_DMA_HEADERS = ["设备锚点阶段", "trace DMA并集(ms)", "其中覆盖CSV未记录(ms)",
+                        "扣除DMA仍未覆盖(ms)"]
+RESIDUAL_DMA_SPANS = ((1, 6), (7, 8), (9, 10), (11, 12))
+RESIDUAL_DMA_SCOPE = ("仅同次trace与CSV时钟已对齐且确认单设备时，补充该阶段的DMA区间覆盖；"
+                      "DMA可与CSV记录设备任务重叠，不能把整列追加到阶段跨度或busy。"
+                      "扣除DMA后仍未覆盖，也不代表已证实的NPU硬件空闲；无trace或条件不足显示—。")
 RESIDUAL_SOURCE_SCOPE = ("按设备阶段反查同次trace的CPU、队列与CANN提交链，来源可以早于U窗口。"
                          "任务数为全部保留轮次合计；时间为每轮已关联子集的均值，PARTIAL仍展示已测子集。"
                          "CPU区间可能含等待，不是CPU忙时；队列等待与其他区间可能重叠。"
@@ -822,7 +828,7 @@ def _method_residual_data(case, method):
     if not _layer_mean_publishable(method):
         problems.append("本方法目标结果尚不可发布")
     note = ("仅本方法所选rank=" + _text(selected) + "；以下为已含在完整周期中的轮次剩余区间U组成，"
-            "不额外加到完整周期。设备锚点之间的连续跨度包含间隔，不代表完整Python模块耗时；Markov子项不另加。")
+            "不额外加到完整周期。设备锚点之间的连续跨度包含间隔，不代表完整Python模块耗时；各父阶段的细分子项不另加。")
     if problems:
         note += "未绘图：" + "；".join(dict.fromkeys(problems)) + "。"
         note += ("阶段识别未完成，原窗口耗时仍保留，按具体原因核对原始设备明细；原匹配详情见时间账本。"
@@ -896,6 +902,34 @@ def _residual_source_rows(stages):
     return rows
 
 
+def _residual_dma_rows(stages):
+    fields = ("trace_dma_union_ms_mean", "trace_dma_in_csv_uncovered_ms_mean",
+              "uncovered_after_trace_dma_ms_mean")
+    return [[item.get("label", item.get("stage_key")),
+             *[_diagnostic_value(item, field) for field in fields]] for item in stages]
+
+
+def _has_dma_fields(stages):
+    return any(any(key.startswith("trace_dma_") or key.startswith("uncovered_after_trace_dma_")
+                   for key in item) for item in stages)
+
+
+def _residual_substage_groups(diagnostic, window_key):
+    """Keep children with their own parent; never merge independent U trees."""
+    parents = {item.get("stage_key"): item.get("label") or item.get("stage_key")
+               for item in diagnostic.get("stage_summary") or []
+               if item.get("window_key") == window_key}
+    groups = collections.defaultdict(list)
+    for item in _residual_stages(diagnostic, window_key, "substage_summary"):
+        groups[item.get("parent_stage_key")].append(item)
+    return [(key, parents.get(key) or key or "未提供父阶段", children)
+            for key, children in groups.items()]
+
+
+def _has_source_fields(stages):
+    return any(any(key.startswith("source_") for key in item) for item in stages)
+
+
 def _residual_stage_tables(sheet, row, diagnostic):
     row = _note(sheet, row, RESIDUAL_STAGE_SCOPE)
     row = _note(sheet, row, RESIDUAL_SOURCE_SCOPE)
@@ -906,6 +940,10 @@ def _residual_stage_tables(sheet, row, diagnostic):
         if stages:
             row = _table(sheet, row, RESIDUAL_STAGE_HEADERS, _residual_stage_rows(stages, summary.get(key)),
                          spans=RESIDUAL_STAGE_SPANS)
+            if _has_dma_fields(stages):
+                row = _note(sheet, row, label + " · DMA对CSV未记录区间的补充覆盖；" + RESIDUAL_DMA_SCOPE)
+                row = _table(sheet, row, RESIDUAL_DMA_HEADERS, _residual_dma_rows(stages),
+                             spans=RESIDUAL_DMA_SPANS)
             row = _note(sheet, row, label + " · 关联Host提交来源（独立于同时段Host覆盖）")
             source_rows, written_rows = _residual_source_rows(stages), []
             row = _table(sheet, row, RESIDUAL_SOURCE_HEADERS, source_rows,
@@ -916,16 +954,79 @@ def _residual_stage_tables(sheet, row, diagnostic):
                          spans=((1, 6), (7, 12)))
         else:
             row = _note(sheet, row, "UNRESOLVED：核心未提供本窗口的阶段锚点统计。", warning=True)
-        substages = _residual_stages(diagnostic, key, "substage_summary")
-        if substages:
-            row = _note(sheet, row, label + " · Markov顺序选词子阶段；已包含在父阶段中，以下行不能再次加到窗口或U。")
+        for parent_key, parent_label, substages in _residual_substage_groups(diagnostic, key):
+            row = _note(sheet, row, label + " · 父阶段细分：" + _text(parent_label) +
+                        "（" + _text(parent_key) + "）；已包含在父阶段中，以下行不能再次加到窗口或U。")
             row = _table(sheet, row, RESIDUAL_STAGE_HEADERS, _residual_stage_rows(substages),
                          spans=RESIDUAL_STAGE_SPANS)
+            if _has_dma_fields(substages):
+                row = _note(sheet, row, "本组子阶段的DMA覆盖；" + RESIDUAL_DMA_SCOPE)
+                row = _table(sheet, row, RESIDUAL_DMA_HEADERS, _residual_dma_rows(substages),
+                             spans=RESIDUAL_DMA_SPANS)
+            if _has_source_fields(substages):
+                row = _note(sheet, row, "本组子阶段的关联Host提交来源；与父阶段重复覆盖，不额外相加。")
+                row = _table(sheet, row, RESIDUAL_SOURCE_HEADERS, _residual_source_rows(substages),
+                             spans=RESIDUAL_SOURCE_SPANS)
             row = _table(sheet, row, ["子阶段", "父阶段（已含） / 边界依据"],
                          [[item.get("label", item.get("stage_key")),
                            "父阶段=" + _text(item.get("parent_stage_key")) + "；" + _text(item.get("boundary_basis"))]
                           for item in substages], spans=((1, 6), (7, 12)))
     return row
+
+
+SWA_LAYER_HEADERS = ["主/草稿", "层号", "attention", "参考可用", "轮次", "层跨度均值(ms)",
+                     "层p50(ms)", "层p90(ms)", "设备任务并集(ms)", "无设备记录(ms)",
+                     "kernel累加(ms)", "duration+wait累加(ms)"]
+SWA_STAGE_HEADERS = ["草稿层号", "阶段标识", "SWA内部阶段（已含）", "匹配轮次 / 状态",
+                     "跨度均值(ms)", "p50(ms)", "p90(ms)", "设备任务并集(ms)",
+                     "无设备记录(ms)", "kernel累加(ms)", "duration+wait累加(ms)"]
+SWA_DIAGNOSTIC_SCOPE = ("同rank、同保留HC周期的逐层对照；层跨度为首HCPre开始→末HCPost结束。"
+                        "主0保留展示，是否纳入参考由核心给定；SWA内部阶段只展示draft/SWA。"
+                        "所有细分已含在原层跨度中，不加到层链、U、完整周期或TPOT。"
+                        "kernel累加可因多流重叠大于跨度；duration+wait为诊断累加，不能当互斥占用或额外时延。"
+                        "无设备记录只表示CSV任务未覆盖；未知值显示—，不补0。")
+
+
+def _diagnostic_value(item, field):
+    value = item.get(field)
+    return value if _number(value) else NA
+
+
+def _swa_layer_rows(diagnostic):
+    fields = ("wall_ms_mean", "wall_ms_p50", "wall_ms_p90", "recorded_busy_ms_mean",
+              "no_recorded_ms_mean", "kernel_sum_ms_mean", "total_cost_ms_mean")
+    return [[item.get("role"), item.get("layer"), item.get("attention"),
+             item.get("reference_eligible") if item.get("reference_eligible") is not None else NA,
+             item.get("rounds"), *[_diagnostic_value(item, field) for field in fields]]
+            for item in diagnostic.get("layer_summary") or []]
+
+
+def _swa_stage_rows(diagnostic):
+    fields = ("duration_ms_mean", "duration_ms_p50", "duration_ms_p90", "recorded_busy_ms_mean",
+              "no_recorded_ms_mean", "kernel_sum_ms_mean", "total_cost_ms_mean")
+    rows = []
+    for item in diagnostic.get("stage_summary") or []:
+        if item.get("role") != "draft" or item.get("attention") != "SWA":
+            continue
+        complete = (item.get("status") == "MATCHED" and _number(item.get("rounds"))
+                    and item["rounds"] > 0 and item.get("matched_windows") == item["rounds"])
+        source = item if complete else {}
+        rows.append([item.get("layer"), item.get("stage_key"), item.get("label", item.get("stage_key")),
+                     str(item.get("matched_windows", NA)) + "/" + str(item.get("rounds", NA)) +
+                     " · " + str(item.get("status", "UNRESOLVED")),
+                     *[_diagnostic_value(source, field) for field in fields]])
+    return rows
+
+
+def _swa_tables(sheet, row, diagnostic, rank):
+    row = _note(sheet, row, "源rank=" + _text(rank) + " · 逐层对照与SWA内部细分；状态=" +
+                _text(diagnostic.get("status")))
+    row = _note(sheet, row, SWA_DIAGNOSTIC_SCOPE + "核心scope=" + _text(diagnostic.get("scope")))
+    if diagnostic.get("reason"):
+        row = _note(sheet, row, "SWA诊断未完成原因：" + _text(diagnostic["reason"]), warning=True)
+    row = _table(sheet, row, SWA_LAYER_HEADERS, _swa_layer_rows(diagnostic))
+    row = _table(sheet, row, SWA_STAGE_HEADERS, _swa_stage_rows(diagnostic))
+    return _note(sheet, row, "逐轮SWA阶段锚点和形状证据：" + _text(diagnostic.get("stages_csv")))
 
 
 def _ledger_sheet(book, report):
@@ -1004,6 +1105,10 @@ def _layers_sheet(book, report):
                     for rank in method.get("per_rank") or [] for item in rank.get("class_means") or []]
             row = _table(sheet, row, ["采样组合", "方法", "rank", "主/草稿", "attention", "参考层号（主0排除）",
                          "参考样本数", "源单层(ms)", "源Dispatch(ms)", "源Combine(ms)", "源路由GMM(ms)", "核心选中rank"], rows)
+        for capture in case.get("measurements") or []:
+            diagnostic = capture.get("swa_diagnostics")
+            if isinstance(diagnostic, dict):
+                row = _swa_tables(sheet, row, diagnostic, capture.get("rank"))
     return sheet
 
 
@@ -1093,15 +1198,25 @@ def _residual_html(diagnostic, rank):
         stages = _residual_stages(diagnostic, key)
         if stages:
             parts.append('<div class="stages">' + _html_table(RESIDUAL_STAGE_HEADERS, _residual_stage_rows(stages, summary.get(key))) + '</div>')
+            if _has_dma_fields(stages):
+                parts.append('<p>' + esc(label) + ' · DMA对CSV未记录区间的补充覆盖；' + esc(RESIDUAL_DMA_SCOPE) + '</p>')
+                parts.append(_html_table(RESIDUAL_DMA_HEADERS, _residual_dma_rows(stages)))
             parts.append('<p>' + esc(label) + ' · 关联Host提交来源（独立于同时段Host覆盖）</p>')
             parts.append('<div class="stages sources">' + _html_table(RESIDUAL_SOURCE_HEADERS, _residual_source_rows(stages)) + '</div>')
             parts.append(_html_table(["阶段", "边界依据 / 缺锚原因"], _residual_stage_basis_rows(stages)))
         else:
             parts.append('<p>UNRESOLVED：核心未提供本窗口的阶段锚点统计。</p>')
-        substages = _residual_stages(diagnostic, key, "substage_summary")
-        if substages:
-            parts.append('<p>Markov顺序选词子阶段；已包含在父阶段中，以下行不能再次加到窗口或U。</p>')
+        for parent_key, parent_label, substages in _residual_substage_groups(diagnostic, key):
+            parts.append('<h4>' + esc(label) + ' · 父阶段细分：' + esc(parent_label) +
+                         '（' + esc(parent_key) + '）</h4><p>已包含在父阶段中，以下行不能再次加到窗口或U。</p>')
             parts.append('<div class="stages">' + _html_table(RESIDUAL_STAGE_HEADERS, _residual_stage_rows(substages)) + '</div>')
+            if _has_dma_fields(substages):
+                parts.append('<p>本组子阶段的DMA覆盖；' + esc(RESIDUAL_DMA_SCOPE) + '</p>')
+                parts.append(_html_table(RESIDUAL_DMA_HEADERS, _residual_dma_rows(substages)))
+            if _has_source_fields(substages):
+                parts.append('<p>本组子阶段的关联Host提交来源；与父阶段重复覆盖，不额外相加。</p>')
+                parts.append('<div class="stages sources">' +
+                             _html_table(RESIDUAL_SOURCE_HEADERS, _residual_source_rows(substages)) + '</div>')
             parts.append(_html_table(["子阶段", "父阶段（已含） / 边界依据"],
                          [[item.get("label", item.get("stage_key")),
                            "父阶段=" + _text(item.get("parent_stage_key")) + "；" + _text(item.get("boundary_basis"))]
@@ -1111,6 +1226,17 @@ def _residual_html(diagnostic, rank):
     parts.append('<p>逐任务Host来源链：<code>' + esc(diagnostic.get("source_links_csv") or "核心未提供来源链CSV") +
                  '</code>；CPU提交跨度、CANN API并集及完整关联计数见阶段汇总step_residual_stages.csv。</p></section>')
     return ''.join(parts)
+
+
+def _swa_html(diagnostic, rank):
+    esc = lambda value: html.escape(_text(value), quote=True)
+    return ('<section><h3>逐层对照与SWA内部细分 · rank=' + esc(rank) + '</h3><p>状态：' +
+            esc(diagnostic.get("status")) + '；scope=' + esc(diagnostic.get("scope")) + '</p><p>' +
+            esc(SWA_DIAGNOSTIC_SCOPE) + '</p>' +
+            ('<p>SWA诊断未完成原因：' + esc(diagnostic["reason"]) + '</p>' if diagnostic.get("reason") else '') +
+            _html_table(SWA_LAYER_HEADERS, _swa_layer_rows(diagnostic)) +
+            _html_table(SWA_STAGE_HEADERS, _swa_stage_rows(diagnostic)) +
+            '<p>逐轮SWA阶段锚点和形状证据：<code>' + esc(diagnostic.get("stages_csv")) + '</code></p></section>')
 
 
 def _bs_svg(title, categories, series, unit):
@@ -1219,6 +1345,9 @@ def _html_preview(report, out):
             parts.append(_method_residual_html(case, method))
             parts.append('<p><code>' + esc(method.get("formula")) + '</code></p><p>' + esc(_explanation(method)) + '</p></section>')
         for capture in case.get("measurements") or []:
+            swa = capture.get("swa_diagnostics")
+            if isinstance(swa, dict):
+                parts.append(_swa_html(swa, capture.get("rank")))
             diagnostic = capture.get("step_residuals") or {}
             if diagnostic:
                 parts.append(_residual_html(diagnostic, capture.get("rank")))
