@@ -154,7 +154,7 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 | `ffn_output` | FFN 输出投影与整理 |
 | `ffn_post` | FFN HCPost |
 
-10 段按原层首 HCPre → 末 HCPost 的连续锚点分割，合计闭合到该层的实测 wall。它们不额外加入外推层均值或周期；不支持模板保留未识别状态。对照时先固定 case、rank 和周期，再区分“整层 wall”与“attention 内核”，并核对主、草稿实际输入 token 数、padding、图模式与 Task Type。A3 回放与优化验证边界见 [SWA 与 U 分析](swa-u-analysis.md)。
+10 段按原层首 HCPre → 末 HCPost 的连续锚点分割，合计闭合到该层的实测 wall。它们不额外加入外推层均值或周期；不支持模板保留未识别状态。对照时先固定 case、rank 和周期，再区分“整层 wall”与“attention 内核”，并核对主、草稿实际输入 token 数、padding、图模式与 Task Type。具体采样的分析结果和优化方案仅保存在本地。
 
 ## 7. 运行回归测试
 

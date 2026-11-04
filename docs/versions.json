@@ -65,18 +65,6 @@
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,
       "optional_openpyxl_in_standard_library_only_mode": 2
-    },
-    "a3_offline_replay": {
-      "captures": 8,
-      "retained_rank_cycles": 944,
-      "source_measurements_unchanged": true,
-      "swa_partitions_closed": true,
-      "u_parent_and_child_partitions_closed": true,
-      "aligned_trace_retained_cycles": 68,
-      "matched_u_parent_intervals": 1020,
-      "matched_u_child_intervals": 1904,
-      "trace_dma_coverage_validated": true,
-      "runtime_optimization_benchmarked": false
     }
   }
 }
