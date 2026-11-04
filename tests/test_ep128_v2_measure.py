@@ -510,7 +510,7 @@ class ResidualStageTests(unittest.TestCase):
                 start_ns=RESIDUAL_EPOCH + start, end_ns=RESIDUAL_EPOCH + start + duration,
                 row_index=row, row_indices=[row], stream_id="1", task_id=str(row), model_id="12",
                 device_id="0", wait_ns=0, input_shapes=inputs, output_shapes=outputs,
-                input_dtypes="", output_dtypes=""))
+                input_dtypes="", output_dtypes="", task_type="AI_VECTOR_CORE"))
         task("output_merge", 2)
         task("RmsNorm", 10, 2, '"4,16;16"', '"4,16;4,1"')
         task("aclnnMatmul_MatMulCommon_MatMulV2", 15, 2, '"4,16;64,16"', '"4,64"', "MatMulV2")
@@ -589,7 +589,7 @@ class ResidualStageTests(unittest.TestCase):
         window, tasks, boundaries = self.stage_fixture("draft_to_nextmain")
         rows = residual.residual_stage_plan(window, tasks, {"draft_layers": 3, "draft_tokens": 7})
         parents = self.assert_spans(rows, window, boundaries)
-        children = [row for row in rows if row["level"] == 1]
+        children = [row for row in rows if row["level"] == 1 and row["parent_stage_key"] == "markov"]
         self.assertEqual(len(parents), 7)
         self.assertEqual(len(children), 7)
         markov = parents[2]
@@ -600,6 +600,168 @@ class ResidualStageTests(unittest.TestCase):
         self.assertTrue(all(int(a["end_ns"]) == int(b["start_ns"]) for a, b in zip(children, children[1:])))
         # Vocab MatMul and Markov MatMuls share a native type, but are distinct stages.
         self.assertNotEqual(parents[1]["stage_key"], markov["stage_key"])
+
+    def test_focus_children_partition_each_parent_without_changing_cycle_spans(self):
+        expected = {"main_inputs": 7, "main_metadata": 3, "draft_metadata": 3}
+        for kind in ("main_to_draft", "draft_to_nextmain"):
+            window, tasks, boundaries = self.stage_fixture(kind)
+            rows = residual.residual_stage_plan(window, tasks, {"draft_layers": 3, "draft_tokens": 7})
+            parents = self.assert_spans(rows, window, boundaries)
+            for parent in parents:
+                if parent["stage_key"] not in expected:
+                    continue
+                children = [row for row in rows if row["parent_stage_key"] == parent["stage_key"]]
+                with self.subTest(kind=kind, parent=parent["stage_key"]):
+                    self.assertEqual(len(children), expected[parent["stage_key"]])
+                    self.assertEqual(int(children[0]["start_ns"]), int(parent["start_ns"]))
+                    self.assertEqual(int(children[-1]["end_ns"]), int(parent["end_ns"]))
+                    self.assertEqual(sum(row["duration_ns"] for row in children), parent["duration_ns"])
+                    self.assertTrue(all(a["end_ns"] == b["start_ns"] for a, b in zip(children, children[1:])))
+                    self.assertTrue(all(row["duration_ns"] > 0 for row in children))
+
+    def test_optional_kv_clear_and_write_are_absent_instead_of_fabricated_zero(self):
+        for removed in (("_zero_kv_blocks_kernel",), ("_apply_write_kernel",),
+                        ("_zero_kv_blocks_kernel", "_apply_write_kernel")):
+            window, tasks, _ = self.stage_fixture("draft_to_nextmain")
+            tasks = [task for task in tasks if task.name not in removed]
+            rows = residual.residual_stage_plan(window, tasks, {"draft_tokens": 7})
+            parent = next(row for row in rows if row["stage_key"] == "main_inputs")
+            children = [row for row in rows if row["parent_stage_key"] == "main_inputs"]
+            with self.subTest(removed=removed):
+                self.assertEqual(len(children), 7 - len(removed))
+                self.assertTrue(all(row["status"] == "MATCHED" and row["duration_ns"] > 0 for row in children))
+                self.assertEqual(sum(row["duration_ns"] for row in children), parent["duration_ns"])
+                for name in removed:
+                    self.assertFalse(any(row["start_anchor"]["name"] == name for row in children))
+
+    def test_invalid_fine_metadata_anchors_preserve_valid_parent_partition(self):
+        for mode in ("missing", "overlap", "past_parent"):
+            window, tasks, _ = self.stage_fixture("draft_to_nextmain")
+            rows = residual.residual_stage_plan(window, tasks, {"draft_tokens": 7})
+            parents = [row for row in rows if row["level"] == 0]
+            before = copy.deepcopy(parents)
+            metadata = next(task for task in tasks if task.name == "SparseAttnSharedkvMetadata")
+            if mode == "missing":
+                tasks.remove(metadata)
+            elif mode == "overlap":
+                duplicate = copy.copy(metadata)
+                duplicate.row_index = 999
+                duplicate.start_ns = metadata.start_ns
+                tasks.append(duplicate)
+            else:
+                metadata.end_ns = RESIDUAL_EPOCH + 111
+            children = residual.residual_focus_substages(parents, tasks)
+            selected = [row for row in children if row["parent_stage_key"] == "main_metadata"]
+            with self.subTest(mode=mode):
+                self.assertEqual(parents, before)
+                self.assertEqual(len(parents), 7)
+                self.assertEqual(len(selected), 1)
+                self.assertEqual(selected[0]["status"], "UNRESOLVED")
+                self.assertTrue(selected[0]["reason"])
+                self.assertEqual(selected[0]["duration_ns"], 15)
+
+    def test_focus_helper_sorts_inputs_and_rejects_input_execution_outside_parent(self):
+        window, tasks, _ = self.stage_fixture("draft_to_nextmain")
+        rows = residual.residual_stage_plan(window, tasks, {"draft_tokens": 7})
+        parents = [row for row in rows if row["level"] == 0]
+        self.assertEqual(residual.residual_focus_substages(parents, tasks),
+                         residual.residual_focus_substages(parents, list(reversed(tasks))))
+        slots = next(task for task in tasks if task.name == "_compute_slot_mappings_kernel")
+        slots.end_ns = RESIDUAL_EPOCH + 96
+        children = residual.residual_focus_substages(parents, tasks)
+        selected = [row for row in children if row["parent_stage_key"] == "main_inputs"]
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["status"], "UNRESOLVED")
+        self.assertEqual(selected[0]["duration_ns"], 15)
+
+    def test_metadata_boundaries_do_not_invent_empty_mapping_spans(self):
+        _, tasks, _ = self.stage_fixture("draft_to_nextmain")
+        window, _, _ = self.stage_fixture("draft_to_nextmain")
+        rows = residual.residual_stage_plan(window, tasks, {"draft_tokens": 7})
+        parent = next(row for row in rows if row["stage_key"] == "main_metadata")
+        metadata = next(task for task in tasks if task.name == "SparseAttnSharedkvMetadata")
+        metadata.start_ns, metadata.end_ns = int(parent["start_ns"]), int(parent["end_ns"])
+        children = residual.residual_focus_substages([parent], tasks)
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0]["duration_ns"], parent["duration_ns"])
+        self.assertEqual(children[0]["status"], "MATCHED")
+
+    def test_multiple_metadata_families_keep_execution_separate_from_mapping(self):
+        window, tasks, _ = self.stage_fixture("draft_to_nextmain")
+        rows = residual.residual_stage_plan(window, tasks, {"draft_tokens": 7})
+        parent = next(row for row in rows if row["stage_key"] == "main_metadata")
+        self.extra_task(tasks, "aclnnVllmAscendQuantLightningIndexerV2Metadata", 102,
+                        "QuantLightningIndexerV2Metadata", duration=2)
+        self.extra_task(tasks, "aclnnSparseAttnSharedkvMetadata", 106,
+                        "SparseAttnSharedkvMetadata", duration=1)
+        for task in tasks:
+            if "Metadata" in task.name:
+                task.task_type = "AI_CPU"
+        children = residual.residual_focus_substages([parent], list(reversed(tasks)))
+        self.assertEqual(len(children), 7)
+        self.assertEqual(sum(row["duration_ns"] for row in children), parent["duration_ns"])
+        executions = [row for row in children if "_op_" in row["stage_key"]]
+        self.assertEqual([row["duration_ns"] for row in executions], [1, 2, 1])
+        self.assertEqual(sum("Indexer" in row["label"] for row in executions), 1)
+        self.assertTrue(all(row["status"] == "MATCHED" for row in children))
+
+    def test_diagnostics_clip_multistream_union_and_keep_wait_out_of_idle(self):
+        tasks = []
+        for row, start, end, stream, wait in ((1, -10, 40, "1", 1000),
+                                              (2, 20, 80, "2", 0), (3, 90, 95, "1", 7)):
+            tasks.append(SimpleNamespace(row_index=row, name="work_" + str(row), op_type="SyntheticWork",
+                start_ns=RESIDUAL_EPOCH + start, end_ns=RESIDUAL_EPOCH + end,
+                stream_id=stream, wait_ns=wait, task_type="AI_VECTOR_CORE", input_shapes="4", output_shapes="4"))
+        metrics = residual.diagnostic_metrics(list(reversed(tasks)), RESIDUAL_EPOCH, RESIDUAL_EPOCH + 100)
+        self.assertAlmostEqual(metrics["recorded_busy_ms"], 85 / 1e6)
+        self.assertAlmostEqual(metrics["no_recorded_ms"], 15 / 1e6)
+        self.assertAlmostEqual(metrics["kernel_sum_ms"], 105 / 1e6)
+        self.assertAlmostEqual(metrics["task_wait_sum_ms"], 1007 / 1e6)
+        self.assertAlmostEqual(metrics["total_cost_ms"], 1112 / 1e6)
+        self.assertGreater(metrics["task_wait_sum_ms"], metrics["no_recorded_ms"])
+        self.assertIn("nonadditive", metrics["wait_scope"])
+        gap = metrics["top_gaps"][0]
+        self.assertEqual((gap["start_ns"], gap["end_ns"]),
+                         (str(RESIDUAL_EPOCH + 80), str(RESIDUAL_EPOCH + 90)))
+        self.assertEqual((gap["previous"]["row_index"], gap["following"]["row_index"]), (2, 3))
+        self.assertEqual(gap["previous"]["stream_id"], "2")
+        self.assertEqual(gap["following"]["duration_ms"], 5 / 1e6)
+        self.assertEqual(metrics["top_kernels"][0]["example"]["row_index"], 2)
+
+    def test_trace_dma_union_fills_csv_uncovered_without_becoming_host_time(self):
+        capture, measured = residual_fixture(self.directory)
+        offset = 12_345_678
+        events = residual_trace_events(capture, offset_ns=offset)
+        for start, end, pid in ((14.5, 15.75, 900), (15.25, 16, 900),
+                                (35, 37, 900), (36, 38, 900), (38, 40, 901)):
+            events.append({"ph": "X", "name": "MEMCPY_ASYNC", "pid": pid, "tid": 7,
+                "ts": _residual_us_string(RESIDUAL_EPOCH + int(start * 1000) - offset),
+                "dur": str(end - start), "args": {"Task Type": "PCIE_DMA_SQE", "Physic Stream Id": 7}})
+        events.append({"ph": "M", "name": "process_name", "pid": 901,
+                       "args": {"name": "Ascend Hardware"}})
+        trace = self.directory / "trace_view.json"
+        trace.write_text(json.dumps(events), encoding="utf-8")
+        result = residual.residual_analyze_capture(capture, measured, self.directory / "dma")
+        self.assertEqual(result["trace"]["status"], "ALIGNED_X_EVENTS")
+        first, tail = result["windows"]
+        self.assertAlmostEqual(first["recorded_busy_ms"], .009)
+        self.assertAlmostEqual(first["no_recorded_ms"], .001)
+        self.assertAlmostEqual(first["trace_dma_union_ms"], .0015)
+        self.assertAlmostEqual(first["trace_dma_in_csv_uncovered_ms"], .001)
+        self.assertAlmostEqual(first["uncovered_after_trace_dma_ms"], 0)
+        self.assertAlmostEqual(tail["trace_dma_union_ms"], .003)
+        self.assertAlmostEqual(tail["trace_dma_in_csv_uncovered_ms"], .002)
+        # The other device's 38..40us copy has no matching CSV clock anchors.
+        self.assertAlmostEqual(tail["uncovered_after_trace_dma_ms"], .002)
+        with Path(result["host_events_csv"]).open(encoding="utf-8-sig") as stream:
+            self.assertFalse(any(row["name"] == "MEMCPY_ASYNC" for row in csv.DictReader(stream)))
+
+    def test_missing_trace_keeps_dma_coverage_unknown(self):
+        capture, measured = residual_fixture(self.directory)
+        result = residual.residual_analyze_capture(capture, measured, self.directory / "no-trace")
+        for window in result["windows"]:
+            for field in ("trace_dma_union_ms", "trace_dma_in_csv_uncovered_ms", "uncovered_after_trace_dma_ms"):
+                self.assertIsNone(window[field])
 
     def test_missing_ambiguous_or_out_of_order_anchors_preserve_full_unknown_span(self):
         for mode in ("missing", "ambiguous", "out_of_order", "count_mismatch"):
@@ -823,7 +985,7 @@ class ResidualStageTests(unittest.TestCase):
                                                  case={"draft_layers": 3, "draft_tokens": 7})
         self.assertEqual(result["status"], "DEVICE_AND_HOST")
         self.assertEqual(len(result["stage_summary"]), 15)
-        self.assertEqual(len(result["substage_summary"]), 7)
+        self.assertEqual(len([row for row in result["substage_summary"] if row["parent_stage_key"] == "markov"]), 7)
         for key in ("main_to_draft", "draft_to_nextmain"):
             phases = [row for row in result["stage_summary"] if row["window_key"] == key]
             self.assertTrue(all(row["rounds"] == row["matched_windows"] == 1 and row["status"] == "MATCHED" for row in phases))
@@ -831,9 +993,10 @@ class ResidualStageTests(unittest.TestCase):
             for row in phases:
                 self.assertAlmostEqual(row["recorded_busy_ms_mean"] + row["no_recorded_ms_mean"], row["duration_ms_mean"])
                 self.assertLessEqual(row["host_span_union_ms_mean"], row["duration_ms_mean"])
-        children = result["substage_summary"]
-        parent = next(row for row in result["stage_summary"] if row["stage_key"] == children[0]["parent_stage_key"])
-        self.assertAlmostEqual(sum(row["duration_ms_mean"] for row in children), parent["duration_ms_mean"])
+        for parent in result["stage_summary"]:
+            children = [row for row in result["substage_summary"] if row["parent_stage_key"] == parent["stage_key"]]
+            if children:
+                self.assertAlmostEqual(sum(row["duration_ms_mean"] for row in children), parent["duration_ms_mean"])
 
     def test_host_gap_intersections_match_independent_endpoint_partition_for_all_stages(self):
         capture, measured = self.matched_capture()
@@ -875,7 +1038,8 @@ class ResidualStageTests(unittest.TestCase):
 
         with Path(result["stages_csv"]).open(encoding="utf-8-sig", newline="") as stream:
             stages = list(csv.DictReader(stream))
-        self.assertEqual(len(stages), 22)  # 15 parents and seven Markov children.
+        self.assertEqual(len([row for row in stages if row["level"] == "0"]), 15)
+        self.assertEqual(len([row for row in stages if row["parent_stage_key"] == "markov"]), 7)
         self.assertTrue(all(row["status"] == "MATCHED" for row in stages))
         for row in result["windows"] + stages:
             with self.subTest(window=row["window_key"], stage=row.get("stage_key")):

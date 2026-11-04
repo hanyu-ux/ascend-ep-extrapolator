@@ -22,12 +22,14 @@ profiles/
 ep128_report/
 ep128_empirical_report/
 reports/
+local-analysis/
 outputs/
 PROF_*/
 *_ascend_pt/
 *.db
 *.sqlite*
 *.log
+/docs/swa-u-analysis.md
 
 # Editor and OS files
 .idea/

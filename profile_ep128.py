@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261103.12.native_stages"
+PROFILE_VERSION = "20261104.1.swa_u_drilldown"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -64,6 +64,7 @@ class ATask:
     task_type: str | None
     op_state: str | None
     row_indices: list = field(default_factory=list)
+    wait_available: bool = True
 
     @property
     def label(self):
@@ -173,7 +174,7 @@ def read_capture(path, rank):
                            lambda value: a_ns(value, "wait"))
             if wait is not None and wait < 0:
                 raise ValueError("negative Wait Time in data record " + str(index))
-            values = dict(start_ns=stamp, end_ns=stamp + duration, wait_ns=wait or 0,
+            values = dict(start_ns=stamp, end_ns=stamp + duration, wait_ns=wait or 0, wait_available=wait is not None,
                           name=name, op_type=str(row.get("Type") or "").strip(), **metadata,
                           input_shapes=str(row.get("Input Shapes") or ""),
                           output_shapes=str(row.get("Output Shapes") or ""),
@@ -1067,12 +1068,18 @@ def analyze_case(case, model, target, base, reference_rows=None):
             # returning references to deleted temporary detail files.
             with (nullcontext(residual_dir) if residual_dir is not None else
                   tempfile.TemporaryDirectory(prefix='ep128-residual-')) as detail_dir:
+                try:
+                    measured['swa_diagnostics'] = swa_analyze_capture(capture, measured, detail_dir)
+                except (OSError, ValueError, TypeError, ArithmeticError) as error:
+                    measured['swa_diagnostics'] = {'status': 'ERROR', 'reason': str(error),
+                                                  'layer_summary': [], 'stage_summary': [], 'stages_csv': None}
                 measured['step_residuals'] = residual_analyze_capture(
                     capture, measured, detail_dir, trace_path=trace_path, case=case,
                     progress=lambda message: print('    ' + message, flush=True))
             if residual_dir is None:
                 for field in ('device_tasks_csv', 'host_events_csv', 'stages_csv', 'source_links_csv'):
                     measured['step_residuals'][field] = None
+                measured['swa_diagnostics']['stages_csv'] = None
         except (OSError, ValueError, TypeError, ArithmeticError) as error:
             measured['step_residuals'] = {'status': 'ERROR', 'windows': [], 'summary': [],
                                           'trace': {'status': 'ERROR', 'reason': str(error)}}
@@ -1222,6 +1229,8 @@ RESIDUAL_HOST_FIELDS = ("rank", "round_id", "window_key", "trace_event_index", "
 
 RESIDUAL_HOST_NUMBERS = ("host_span_union_ms", "host_in_device_no_recorded_ms", "host_event_count",
                  "host_sync_events", "host_copy_events", "host_graph_replay_events")
+
+RESIDUAL_DMA_NUMBERS = ("trace_dma_union_ms", "trace_dma_in_csv_uncovered_ms", "uncovered_after_trace_dma_ms")
 
 RESIDUAL_SOURCE_COUNTS = ("source_device_tasks", "source_cpu_tasks", "source_api_tasks", "source_queue_tasks",
                           "source_graph_tasks", "source_ambiguous_tasks")
@@ -1804,6 +1813,11 @@ def residual_host_rows(path, capture, windows, uncovered, trace, offset, destina
     starts, ends = [residual_ns(row["start_ns"]) for row in windows], [residual_ns(row["end_ns"]) for row in windows]
     counts = [{key: 0 for key in RESIDUAL_HOST_NUMBERS} for _ in windows]
     by_window = collections.defaultdict(list)
+    device_pids = {row["trace_pid"] for row in trace.get("anchors", [])}
+    dma_available = len(device_pids) == 1
+    for row in list(windows) + list(stages):
+        row.update(dict.fromkeys(RESIDUAL_DMA_NUMBERS, 0. if dma_available else None),
+                   trace_dma_status="ALIGNED_SINGLE_DEVICE" if dma_available else "DEVICE_AMBIGUOUS")
     for row in stages:
         row.update(dict.fromkeys(RESIDUAL_HOST_NUMBERS, 0))
         by_window[(row["round_id"], row["window_key"])].append(
@@ -1837,6 +1851,7 @@ def residual_host_rows(path, capture, windows, uncovered, trace, offset, destina
         connection.execute("PRAGMA temp_store=FILE")
         connection.execute("PRAGMA cache_size=-2048")
         connection.execute("CREATE TABLE clips (window INTEGER, start INTEGER, end INTEGER)")
+        connection.execute("CREATE TABLE dma_clips (window INTEGER, start INTEGER, end INTEGER)")
         connection.execute("CREATE TABLE source_events(event_index INTEGER PRIMARY KEY,kind TEXT,pid TEXT,tid TEXT,name TEXT,"
                            "start INTEGER,end INTEGER,connection_id TEXT,correlation_id TEXT)")
         connection.execute("CREATE TABLE source_flows(cat TEXT,flow_key TEXT,ph TEXT,pid TEXT,tid TEXT,stamp INTEGER)")
@@ -1888,6 +1903,11 @@ def residual_host_rows(path, capture, windows, uncovered, trace, offset, destina
                 args, name = residual_args(event), str(event.get("name", ""))
                 device_hint = residual_device_hint(event, args)
                 if device_hint or residual_device_process(trace["process_names"].get(pid, "")):
+                    dma_type = re.sub(r"[^A-Z0-9]", "", str(args.get("tasktype", "")).upper())
+                    if dma_available and pid in device_pids and ("DMA" in dma_type or name.upper().startswith("MEMCPY_ASYNC")):
+                        first, final = bisect.bisect_right(ends, left), bisect.bisect_left(starts, right)
+                        connection.executemany("INSERT INTO dma_clips VALUES (?,?,?)",
+                            [(index, max(starts[index], left), min(ends[index], right)) for index in range(first, final)])
                     for task in wanted.get((name, left, right), []):
                         identifiers = ((getattr(task, "stream_id", None), args.get("physicstreamid", args.get("streamid"))),
                                        (getattr(task, "task_id", None), args.get("taskid")), (getattr(task, "model_id", None), args.get("modelid")))
@@ -1957,6 +1977,29 @@ def residual_host_rows(path, capture, windows, uncovered, trace, offset, destina
                 else:
                     right = max(right, b)
             flush()
+            if dma_available:
+                current, intervals = None, []
+
+                def flush_dma():
+                    if current is None:
+                        return
+                    union = a_union(intervals)
+                    window = windows[current]
+                    window["trace_dma_union_ms"] = sum(b - a for a, b in union) / 1e6
+                    window["trace_dma_in_csv_uncovered_ms"] = sum(gap_overlap(a, b, window_gaps[current]) for a, b in union) / 1e6
+                    for stage, start, end in by_window[(window["round_id"], window["window_key"])]:
+                        clipped = [(max(start, a), min(end, b)) for a, b in union if a < end and b > start]
+                        stage["trace_dma_union_ms"] = sum(b - a for a, b in clipped) / 1e6
+                        stage["trace_dma_in_csv_uncovered_ms"] = sum(gap_overlap(a, b, stage_gaps[id(stage)]) for a, b in clipped) / 1e6
+
+                for window_index, a, b in connection.execute("SELECT window,start,end FROM dma_clips ORDER BY window,start,end"):
+                    if current != window_index:
+                        flush_dma()
+                        current, intervals = window_index, []
+                    intervals.append((a, b))
+                flush_dma()
+                for row in list(windows) + list(stages):
+                    row["uncovered_after_trace_dma_ms"] = max(0., row["no_recorded_ms"] - row["trace_dma_in_csv_uncovered_ms"])
         for window, values in zip(windows, counts):
             window.update(values)
         trace["host_window_event_records"] = sum(row["host_event_count"] for row in counts)
@@ -1979,6 +2022,127 @@ def residual_host_rows(path, capture, windows, uncovered, trace, offset, destina
 RESIDUAL_STAGE_BASIS = ("同次设备锚点之间的连续时间跨度，包含段内任务间隔；"
     "按下一阶段首锚点划界，不以算子Duration求和，不等同Python模块调用耗时。"
     "缺失或歧义锚点保留整段未识别；子阶段已包含于父阶段。")
+
+
+def diagnostic_metrics(tasks, left, right):
+    """Clipped wall/busy clocks and locateable evidence; waits are not wall costs."""
+    tasks = sorted((task for task in tasks if task.start_ns < right and task.end_ns > left),
+                   key=lambda task: (task.start_ns, task.end_ns, task.row_index))
+    clips = [(max(left, task.start_ns), min(right, task.end_ns)) for task in tasks]
+    union = a_union(clips)
+    busy = sum(b - a for a, b in union)
+    gaps = residual_complement(left, right, union)
+    groups = collections.defaultdict(list)
+    for task, (a, b) in zip(tasks, clips):
+        groups[(task.name, getattr(task, "op_type", ""), getattr(task, "stream_id", None))].append((task, b - a))
+
+    def evidence(task):
+        return {key: getattr(task, key, None) for key in
+                ("row_index", "name", "task_type", "stream_id", "input_shapes", "output_shapes")} | {
+                    "start_ns": str(task.start_ns), "end_ns": str(task.end_ns),
+                    "duration_ms": (task.end_ns - task.start_ns) / 1e6}
+
+    top = []
+    for (name, op_type, stream), values in groups.items():
+        top.append({"name": name, "op_type": op_type, "stream_id": stream, "calls": len(values),
+                    "kernel_sum_ms": sum(duration for _, duration in values) / 1e6,
+                    "wait_sum_ms": sum(task.wait_ns for task, _ in values) / 1e6
+                        if all(getattr(task, "wait_available", True) for task, _ in values) else None,
+                    "example": evidence(values[0][0])})
+    top.sort(key=lambda row: (-row["kernel_sum_ms"], row["name"]))
+    gap_rows = []
+    for a, b in sorted(gaps, key=lambda pair: (-(pair[1] - pair[0]), pair[0]))[:5]:
+        previous = max((task for task in tasks if task.end_ns <= a),
+                       key=lambda task: task.end_ns, default=None)
+        following = min((task for task in tasks if task.start_ns >= b),
+                        key=lambda task: task.start_ns, default=None)
+        gap_rows.append({"start_ns": str(a), "end_ns": str(b), "duration_ms": (b - a) / 1e6,
+                         "previous": evidence(previous) if previous else None,
+                         "following": evidence(following) if following else None})
+    kernel_sum = sum(b - a for a, b in clips) / 1e6
+    wait_sum = sum(task.wait_ns for task in tasks) / 1e6 if all(getattr(task, "wait_available", True) for task in tasks) else None
+    return {"recorded_busy_ms": busy / 1e6, "no_recorded_ms": (right - left - busy) / 1e6,
+            "kernel_sum_ms": kernel_sum, "task_count": len(tasks), "task_wait_sum_ms": wait_sum,
+            "total_cost_ms": kernel_sum + wait_sum if wait_sum is not None else None,
+            "wait_scope": "source Wait values of overlapping tasks; nonadditive, may precede this interval; not idle or CPU time",
+            "small_task_count": sum(task.end_ns - task.start_ns <= 10000 for task in tasks),
+            "small_kernel_sum_ms": sum(b - a for task, (a, b) in zip(tasks, clips)
+                                       if task.end_ns - task.start_ns <= 10000) / 1e6,
+            "largest_gap_ms": max((b - a for a, b in gaps), default=0) / 1e6,
+            "top_kernels": top[:5], "top_gaps": gap_rows}
+
+
+def residual_focus_substages(parents, tasks):
+    """Refine observed input and metadata paths; never invent missing anchors."""
+    result = []
+    input_names = (("zero_kv", "KV块清零", "_zero_kv_blocks_kernel"),
+                   ("apply_write", "应用待写入KV", "_apply_write_kernel"),
+                   ("expand_mapping", "展开请求与token映射", "_expand_idx_mapping_kernel"),
+                   ("positions", "准备位置与序列长度", "_prepare_pos_seq_lens_kernel"),
+                   ("tokens", "拼接采样与草稿token", "_combine_sampled_and_draft_tokens_kernel"),
+                   ("block_tables", "聚合KV块表", "_gather_block_tables_kernel"),
+                   ("slot_mapping", "计算KV slot映射", "_compute_slot_mappings_kernel"))
+    metadata_pattern = re.compile(r"SparseAttnSharedkvMetadata|MixedQuantSparseFlashMlaMetadata|QuantLightningIndexer(?:V\d+)?Metadata", re.I)
+    for parent in parents:
+        key = parent["stage_key"]
+        if key not in ("main_inputs", "main_metadata", "draft_metadata"):
+            continue
+        left, right = int(parent["start_ns"]), int(parent["end_ns"])
+        inside = sorted((task for task in tasks if left <= task.start_ns < right and task.end_ns > task.start_ns),
+                        key=lambda task: (task.start_ns, task.end_ns, task.row_index))
+
+        def child(suffix, label, order, a, b, first=None, following=None, status="MATCHED", reason=None):
+            return {**parent, "stage_key": key + "_" + suffix, "label": label, "level": 1,
+                    "parent_stage_key": key, "stage_order": parent["stage_order"] * 1000 + order,
+                    "start_ns": str(a), "end_ns": str(b), "duration_ns": b - a, "duration_ms": (b - a) / 1e6,
+                    "status": status, "reason": reason,
+                    "start_anchor": {"name": first.name, "row_index": first.row_index, "timestamp_ns": str(a)} if first else parent["start_anchor"],
+                    "end_anchor": {"name": following.name, "row_index": following.row_index, "timestamp_ns": str(b)} if following else parent["end_anchor"],
+                    "boundary_basis": (first.name + (".end" if a == first.end_ns else ".start") if first else "父阶段.start")
+                        + " → " + (following.name + (".end" if b == following.end_ns else ".start") if following else "父阶段.end")
+                        + "；子区间已含在父阶段中"}
+
+        try:
+            rows = []
+            if key == "main_inputs":
+                anchors = []
+                for number, (suffix, label, name) in enumerate(input_names):
+                    found = [task for task in inside if task.name == name]
+                    if (number >= 2 and len(found) != 1) or (number == 1 and len(found) > 1):
+                        raise ValueError("missing or ambiguous next-main input anchor " + name)
+                    if found:
+                        if any(task.end_ns > right for task in found):
+                            raise ValueError("input anchor exceeds its parent interval: " + name)
+                        anchors.append((suffix, label, found))
+                if not anchors or anchors[0][2][0].start_ns != left or any(
+                        max(task.end_ns for task in a[2]) > b[2][0].start_ns for a, b in zip(anchors, anchors[1:])):
+                    raise ValueError("input substage anchors are overlapping or reversed")
+                for number, (suffix, label, found) in enumerate(anchors):
+                    following = anchors[number + 1][2][0] if number + 1 < len(anchors) else None
+                    rows.append(child(suffix, label, number, found[0].start_ns,
+                                      following.start_ns if following else right, found[0], following))
+            else:
+                anchors = [task for task in inside if metadata_pattern.search(str(getattr(task, "op_type", "")) + " " + task.name)]
+                if not anchors or any(task.end_ns > right for task in anchors) or any(
+                        a.end_ns > b.start_ns for a, b in zip(anchors, anchors[1:])):
+                    raise ValueError("missing, overlapping or out-of-bounds metadata execution anchors")
+                rows.append(child("mapping_0", "首个metadata前的映射与准备", 0, left, anchors[0].start_ns,
+                                  following=anchors[0]))
+                for number, task in enumerate(anchors, 1):
+                    label = "Indexer metadata本体" if "indexer" in (str(getattr(task, "op_type", "")) + " " + task.name).lower() else "Attention metadata本体"
+                    rows.append(child("op_" + str(number), label + " #" + str(number), number * 2 - 1,
+                                      task.start_ns, task.end_ns, task, task))
+                    following = anchors[number] if number < len(anchors) else None
+                    rows.append(child("mapping_" + str(number), "metadata后的映射与准备 #" + str(number), number * 2,
+                                      task.end_ns, following.start_ns if following else right, task, following))
+            if sum(row["duration_ns"] for row in rows) != right - left or any(
+                    row["duration_ns"] < 0 for row in rows):
+                raise ValueError("substage partition does not close to its parent")
+            result.extend(row for row in rows if row["duration_ns"] > 0)
+        except ValueError as error:
+            result.append(child("unresolved", parent["label"] + "（细分未识别）", 0, left, right,
+                                status="UNRESOLVED", reason=str(error)))
+    return result
 
 
 def residual_stage_plan(window, tasks, case=None):
@@ -2251,7 +2415,7 @@ def residual_stage_plan(window, tasks, case=None):
             raise ValueError("execution-stage boundaries are reversed, empty or outside the U window")
         result = [record(key, label, order, stamps[order - 1], stamps[order], boundaries[order - 1], boundaries[order])
                   for order, (key, label) in enumerate(phases, 1)]
-        return result + children
+        return result + children + residual_focus_substages(result, tasks)
     except (ValueError, IndexError, AttributeError) as error:
         return [record("unresolved", "未识别过渡阶段（保留原窗口）", 1, left, right, None, None,
                        status="UNRESOLVED", reason=str(error))]
@@ -2264,7 +2428,8 @@ def residual_stage_summary(stages, windows, level):
         if row["level"] == level:
             groups[(row["window_key"], row["stage_key"])].append(row)
     result = []
-    fields = ("duration_ms", "recorded_busy_ms", "no_recorded_ms", "kernel_sum_ms", "task_count") + RESIDUAL_HOST_NUMBERS
+    fields = ("duration_ms", "recorded_busy_ms", "no_recorded_ms", "kernel_sum_ms", "task_count",
+              "task_wait_sum_ms", "total_cost_ms", "small_task_count", "small_kernel_sum_ms", "largest_gap_ms") + RESIDUAL_HOST_NUMBERS + RESIDUAL_DMA_NUMBERS
     for (key, stage), rows in groups.items():
         complete = len(rows) == totals[key] and all(row["status"] == "MATCHED" for row in rows)
         item = {field: rows[0][field] for field in ("stage_key", "stage_order", "label", "level", "parent_stage_key", "boundary_basis")}
@@ -2273,8 +2438,10 @@ def residual_stage_summary(stages, windows, level):
                     duration_ns_total=sum(row["duration_ns"] for row in rows),
                     reason="; ".join(dict.fromkeys(row["reason"] for row in rows if row.get("reason"))) or None)
         for field in fields:
-            values = [row[field] for row in rows]
+            values = [row.get(field) for row in rows]
             item[field + "_mean"] = statistics.fmean(values) if complete and all(value is not None for value in values) else None
+        item["duration_ms_p50"] = statistics.median(row["duration_ms"] for row in rows) if complete else None
+        item["duration_ms_p90"] = quantile([row["duration_ms"] for row in rows], .9) if complete else None
         for field in RESIDUAL_SOURCE_COUNTS:
             values = [row[field] for row in rows]
             item[field + "_total"] = sum(values) if all(value is not None for value in values) else None
@@ -2288,6 +2455,111 @@ def residual_stage_summary(stages, windows, level):
                                   "PARTIAL" if any(value in ("COMPLETE", "PARTIAL") for value in statuses) else "UNAVAILABLE")
         result.append(item)
     return sorted(result, key=lambda row: (row["window_key"], row["stage_order"]))
+
+
+def swa_stage_plan(layer, tasks):
+    """Ten exclusive device-anchor spans inside a draft SWA HC layer wall."""
+    left, right = int(layer["start_ns"]), int(layer["end_ns"])
+    inside = sorted((task for task in tasks if left <= task.start_ns < right and task.end_ns > task.start_ns),
+                    key=lambda task: (task.start_ns, task.end_ns, task.row_index))
+
+    def unique(pattern):
+        found = [task for task in inside if pattern.search(task.label)]
+        if len(found) != 1:
+            raise ValueError("expected one " + pattern.pattern + ", observed " + str(len(found)))
+        return found[0]
+
+    def point(task, end=False):
+        return {"row_index": task.row_index, "name": task.name,
+                "timestamp_ns": str(task.end_ns if end else task.start_ns), "edge": "end" if end else "start"}
+
+    try:
+        pre = [task for task in inside if A_PRE.search(task.name) or A_PRE.search(task.op_type)]
+        post = [task for task in inside if A_POST.search(task.name) or A_POST.search(task.op_type)]
+        if len(pre) != 2 or len(post) != 2:
+            raise ValueError("SWA requires two ordered HCPre/HCPost pairs")
+        attention = unique(re.compile(r"(?<![A-Za-z])(?:SparseAttnSharedkv|MixedQuantSparseFlashMla|SparseFlashAttention)(?![A-Za-z])", re.I))
+        dispatch, combine = unique(A_DISPATCH), unique(A_COMBINE)
+        chain = [pre[0], attention, post[0], pre[1], dispatch, combine, post[1]]
+        if pre[0].start_ns != left or post[1].end_ns != right or any(
+                a.end_ns > b.start_ns for a, b in zip(chain, chain[1:])):
+            raise ValueError("SWA anchors overlap, are reversed or disagree with the HC layer boundary")
+        stamps = [left, attention.start_ns, attention.end_ns, post[0].start_ns, pre[1].start_ns,
+                  dispatch.start_ns, dispatch.end_ns, combine.start_ns, combine.end_ns, post[1].start_ns, right]
+        anchors = [point(pre[0]), point(attention), point(attention, True), point(post[0]), point(pre[1]),
+                   point(dispatch), point(dispatch, True), point(combine), point(combine, True), point(post[1]), point(post[1], True)]
+        labels = [("attention_prepare", "SWA HCPre与Q/KV准备"), ("attention", "SWA attention本体"),
+                  ("attention_output", "SWA输出投影与拷贝"), ("attention_post", "Attention HCPost与衔接"),
+                  ("moe_prepare", "FFN HCPre与MoE路由准备"), ("dispatch", "MoE Dispatch"),
+                  ("experts", "专家计算与Dispatch/Combine衔接"), ("combine", "MoE Combine"),
+                  ("ffn_output", "共享专家与FFN归并"), ("ffn_post", "FFN HCPost收尾")]
+        return [{"stage_key": key, "label": label, "stage_order": number + 1, "status": "MATCHED", "reason": None,
+                 "start_ns": str(stamps[number]), "end_ns": str(stamps[number + 1]),
+                 "duration_ns": stamps[number + 1] - stamps[number], "duration_ms": (stamps[number + 1] - stamps[number]) / 1e6,
+                 "start_anchor": anchors[number], "end_anchor": anchors[number + 1],
+                 "boundary_basis": "设备锚点连续跨度；含段内间隙，已包含于SWA层，不额外计入周期或TPOT"}
+                for number, (key, label) in enumerate(labels)]
+    except ValueError as error:
+        return [{"stage_key": "unresolved", "label": "SWA细分未识别（保留层实测总跨度）", "stage_order": 1,
+                 "status": "UNRESOLVED", "reason": str(error), "start_ns": str(left), "end_ns": str(right),
+                 "duration_ns": right - left, "duration_ms": (right - left) / 1e6,
+                 "start_anchor": None, "end_anchor": None, "boundary_basis": "原始HC层边界；未猜测缺失语义锚点"}]
+
+
+def swa_analyze_capture(capture, measured, detail_dir):
+    """Report SWA substructure and same-rank layer comparisons without re-estimating."""
+    index = ATimeIndex(capture["tasks"])
+    groups, stages, stage_groups = collections.defaultdict(list), [], collections.defaultdict(list)
+    for cycle in measured["rounds"]:
+        for layer in cycle["layers"]:
+            left, right = int(layer["start_ns"]), int(layer["end_ns"])
+            tasks = index.overlapping(left, right)
+            metrics = diagnostic_metrics(tasks, left, right)
+            groups[(layer["role"], layer["layer"], layer["attention"])].append({"wall_ms": (right - left) / 1e6, **metrics})
+            if layer["role"] != "draft" or layer["attention"] != "SWA":
+                continue
+            rows = swa_stage_plan(layer, tasks)
+            if sum(row["duration_ns"] for row in rows) != right - left:
+                raise ValueError("SWA substages do not close to the original layer interval")
+            for row in rows:
+                a, b = int(row["start_ns"]), int(row["end_ns"])
+                row.update(round_id=cycle["round_id"], role=layer["role"], layer=layer["layer"], attention="SWA",
+                           **diagnostic_metrics(index.overlapping(a, b), a, b))
+                stages.append(row)
+                stage_groups[(layer["layer"], row["stage_key"])].append(row)
+    layer_summary = []
+    for (role, layer, attention), rows in groups.items():
+        item = {"role": role, "layer": layer, "attention": attention, "rounds": len(rows),
+                "reference_eligible": role != "main" or layer != 0,
+                "wall_ms_p50": statistics.median(row["wall_ms"] for row in rows),
+                "wall_ms_p90": quantile([row["wall_ms"] for row in rows], .9)}
+        for field in ("wall_ms", "recorded_busy_ms", "no_recorded_ms", "kernel_sum_ms", "total_cost_ms"):
+            values = [row[field] for row in rows]
+            item[field + "_mean"] = statistics.fmean(values) if all(value is not None for value in values) else None
+        layer_summary.append(item)
+    summary = []
+    for (layer, key), rows in stage_groups.items():
+        complete = len(rows) == len(measured["rounds"]) and all(row["status"] == "MATCHED" for row in rows)
+        item = {field: rows[0][field] for field in ("role", "layer", "attention", "stage_key", "label", "stage_order")}
+        item.update(rounds=len(measured["rounds"]), matched_windows=sum(row["status"] == "MATCHED" for row in rows),
+                    status="MATCHED" if complete else "UNRESOLVED" if key == "unresolved" else "PARTIAL",
+                    reason="; ".join(dict.fromkeys(row["reason"] for row in rows if row.get("reason"))) or None)
+        for field in ("duration_ms", "recorded_busy_ms", "no_recorded_ms", "kernel_sum_ms", "total_cost_ms"):
+            values = [row[field] for row in rows]
+            item[field + "_mean"] = statistics.fmean(values) if complete and all(value is not None for value in values) else None
+        item["duration_ms_p50"] = statistics.median(row["duration_ms"] for row in rows) if complete else None
+        item["duration_ms_p90"] = quantile([row["duration_ms"] for row in rows], .9) if complete else None
+        summary.append(item)
+    rank, source = str(capture["rank"]), str(capture.get("path", ""))
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", rank).strip("._")[:60] or "rank"
+    suffix = hashlib.sha256((rank + "\0" + source).encode()).hexdigest()[:10]
+    destination = Path(detail_dir) / (safe + "-" + suffix + "-swa-stages.csv")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    write_csv(destination, [{"rank": rank, **row} for row in stages])
+    return {"status": "MATCHED" if summary and all(row["status"] == "MATCHED" for row in summary) else "PARTIAL",
+            "scope": "源采样同rank逐层HCPre→末HCPost；SWA子段已含于原层，wait和kernel_sum非互斥成本；不同token桶不可等同工作量",
+            "stages_csv": str(destination), "layer_summary": layer_summary,
+            "stage_summary": sorted(summary, key=lambda row: (row["layer"], row["stage_order"]))}
 
 
 def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, progress=None, case=None):
@@ -2328,6 +2600,7 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
                        kernel_sum_ms=sum(b - a for a, b in clips) / 1e6, task_count=len(clips),
                        _uncovered=residual_complement(left, right, union), _task_rows=[task.row_index for task in tasks],
                        source_status="UNAVAILABLE", **dict.fromkeys(RESIDUAL_HOST_NUMBERS + RESIDUAL_SOURCE_COUNTS + RESIDUAL_SOURCE_NUMBERS))
+            row.update(diagnostic_metrics(tasks, left, right))
             row["source_device_tasks"] = len(tasks)
         stages.extend(rows)
     path = Path(trace_path) if trace_path is not None else Path(source_path).parent / "trace_view.json"
@@ -2364,6 +2637,8 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
         sources = {"source_links_csv": None, "source_status": "UNAVAILABLE", "source_scope": RESIDUAL_SOURCE_SCOPE}
         for row in stages:
             row.update(dict.fromkeys(RESIDUAL_SOURCE_COUNTS[1:] + RESIDUAL_SOURCE_NUMBERS), source_status="UNAVAILABLE")
+        for row in windows + stages:
+            row.update(dict.fromkeys(RESIDUAL_DMA_NUMBERS), trace_dma_status="UNAVAILABLE")
     stage_path = directory / (prefix + "-stages.csv")
     residual_progress(progress, "按有序执行阶段导出过渡耗时，核对逐窗口闭合")
     fields = tuple(key for key in stages[0] if not key.startswith("_"))
@@ -2372,12 +2647,12 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
             row.pop("_uncovered", None)
             row.pop("_task_rows", None)
             writer.writerow({"rank": rank, **{key: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-                             if isinstance(value, dict) else value for key, value in row.items()}})
+                             if isinstance(value, (dict, list, tuple)) else value for key, value in row.items()}})
     summary = []
     for key in ("main_to_draft", "draft_to_nextmain"):
         rows = [window for window in windows if window["window_key"] == key]
         record = {"window_key": key, "label": rows[0]["label"], "rounds": len(rows), "scope": RESIDUAL_SCOPE}
-        for field in ("duration_ms", "recorded_busy_ms", "no_recorded_ms", "kernel_sum_ms", "task_count") + RESIDUAL_HOST_NUMBERS:
+        for field in ("duration_ms", "recorded_busy_ms", "no_recorded_ms", "kernel_sum_ms", "task_count") + RESIDUAL_HOST_NUMBERS + RESIDUAL_DMA_NUMBERS:
             values = [row[field] for row in rows]
             record[field + "_mean"] = statistics.fmean(values) if all(value is not None for value in values) else None
         summary.append(record)
@@ -3001,6 +3276,11 @@ def iter_report_rows(report, kind):
             yield from ({'case': name, **item} for item in source['per_rank'])
         elif kind == 'components':
             yield from ({'case': name, **item} for item in source.get('class_stats', []))
+        elif kind == 'swa_stage_summary':
+            for capture in case.get('measurements', []):
+                diagnostic = capture.get('swa_diagnostics') or {}
+                yield from ({'case': name, 'rank': capture['rank'], **item}
+                            for item in diagnostic.get('stage_summary', []))
         elif kind in ('step_residual_windows', 'step_residual_summary', 'step_residual_sources',
                       'step_residual_stages', 'step_residual_substages'):
             for capture in case.get('measurements', []):
@@ -3109,6 +3389,8 @@ def export_report(report, out, reference_rows, progress=None):
     if any('step_residuals' in capture for case in report['cases'] for capture in case.get('measurements', [])):
         kinds += ['step_residual_windows', 'step_residual_summary', 'step_residual_sources',
                   'step_residual_stages', 'step_residual_substages']
+    if any('swa_diagnostics' in capture for case in report['cases'] for capture in case.get('measurements', [])):
+        kinds += ['swa_stage_summary']
     for kind in kinds:
         write(kind + '.csv', lambda path, kind=kind:
               write_csv(path, lambda: iter_report_rows(report, kind), progress=progress))
