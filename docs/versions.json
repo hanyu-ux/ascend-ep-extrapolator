@@ -7,15 +7,15 @@
   },
   "components": {
     "profile_ep128.py": {
-      "version": "20261105.1.layer_stage_charts",
-      "sha256": "6d6d3b0a0ed755571930020751dc671734c4f420935e31b1f99f9d4468814ba8",
+      "version": "20261105.2.target_layer_stages",
+      "sha256": "37523b2899df96193a6dbbfb0beec61eb3e5cd77aa66ae36905f0e03f4e3064e",
       "imported_version": "20261103.12.native_stages",
       "imported_sha256": "035f0c6312354ca0937361f1ab301452ed61c68239845b2c0c76f08653f9d7f7",
       "matches_imported_source": false
     },
     "build_ep128_leadership_excel.py": {
-      "version": "20261105.1.method_stage_charts",
-      "sha256": "56d609f25947a9ff5089206559805018116b183a61a4e8bd93412c453c4a3b8f",
+      "version": "20261105.2.target_layer_stages",
+      "sha256": "3f92d00e6210e5cdd23dccb717e971b36351e37456fea16d7877dfaab044d317",
       "imported_version": "20261104.2.bs_inventory",
       "imported_sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
       "matches_imported_source": false
@@ -57,11 +57,11 @@
     "The original machine-specific test import fallback was removed.",
     "Regression tests were grouped under tests/ and optional standalone checks under tools/; runtime scripts and presentation assets are unchanged.",
     "SWA and U diagnostic drill-downs add evidence only; original source/target cycle, TPOT and rank-selection formulas are unchanged. Repository iterations use branches and pull requests with offline regression checks.",
-    "Main CSA/HCA and draft SWA retain per-layer ten-stage evidence; both method sheets display five independent source-stage tables and native editable horizontal charts after the U composition. Core estimates and rank selection are unchanged; legacy SWA outputs remain available."
+    "Main CSA/HCA and draft SWA retain per-layer source evidence. Both method sheets now show core-provided target ten-stage estimates, target same-type all-layer totals and complete-cycle shares; only Dispatch, Combine and routed-GMM deltas modify source spans. The two U drill-downs remain measured and retained once. Parent cycle, TPOT, throughput and rank-selection formulas are unchanged; missing stage evidence only disables the affected target drill-down."
   ],
   "validation": {
-    "discovered_tests": 254,
-    "passed": 244,
+    "discovered_tests": 271,
+    "passed": 261,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,

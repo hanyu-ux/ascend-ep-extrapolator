@@ -51,6 +51,61 @@ SWA_STAGE_KEYS = ('attention_prepare', 'attention', 'attention_output', 'attenti
                   'moe_prepare', 'dispatch', 'experts', 'combine', 'ffn_output', 'ffn_post')
 
 
+def attach_target_stage_contract(report):
+    """Synthetic core output, kept independent of the display implementation."""
+    case = report['cases'][0]
+    for method in case['projection']['layer_mean_methods']:
+        capture = next(row for row in case['measurements'] if row['rank'] == method['selected_rank'])
+        diagnostic = capture.get('layer_diagnostics', capture.get('swa_diagnostics', {}))
+        groups = []
+        for parent in method['class_means']:
+            role, attention = parent['role'], parent['attention']
+            reference_layers = parent['reference_layers']
+            group = dict(role=role, attention=attention, reference_layers=list(reference_layers),
+                         target_layers=parent['target_layers'], rounds=2, status='UNAVAILABLE',
+                         reason='SYNTHETIC_TARGET_STAGES_NOT_CAPTURED', stage_rows=[],
+                         source_wall_ms=parent['wall_ms'], target_wall_ms=parent['target_wall_ms'],
+                         target_total_ms=parent['target_layers'] * parent['target_wall_ms'])
+            source_stages = [row for row in diagnostic.get('stage_summary', [])
+                             if row['role'] == role and row['attention'] == attention
+                             and row['layer'] in reference_layers]
+            if len(source_stages) == 10 * len(reference_layers):
+                stages = []
+                for order, key in enumerate(SWA_STAGE_KEYS, 1):
+                    matches = [row for row in source_stages if row['stage_key'] == key]
+                    source = sum(row['duration_ms_mean'] for row in matches) / len(matches)
+                    delta = {'dispatch': parent['dispatch_delta_ms'], 'combine': parent['combine_delta_ms'],
+                             'experts': parent['routed_compute_delta_ms']}.get(key, 0.)
+                    target = source + delta
+                    stages.append(dict(stage_key=key, stage_order=order, label=matches[0]['label'],
+                                       source_ms=source, delta_ms=delta, target_ms=target,
+                                       target_total_ms=target * parent['target_layers']))
+                parent.update(wall_ms=sum(row['source_ms'] for row in stages),
+                              target_wall_ms=sum(row['target_ms'] for row in stages))
+                group.update(status='MATCHED', reason=None, stage_rows=stages,
+                             source_wall_ms=parent['wall_ms'], target_wall_ms=parent['target_wall_ms'],
+                             target_total_ms=parent['target_layers'] * parent['target_wall_ms'])
+            groups.append(group)
+        for role in method['role_details']:
+            role['target_layer_envelopes_ms'] = sum(parent['target_layers'] * parent['target_wall_ms']
+                                                  for parent in method['class_means'] if parent['role'] == role['role'])
+            role['target_chain_ms'] = role['target_layer_envelopes_ms'] + role['target_gap_ms']
+        components = [method['role_details'][0]['target_layer_envelopes_ms'], method['role_details'][0]['target_gap_ms'],
+                      method['role_details'][1]['target_layer_envelopes_ms'], method['role_details'][1]['target_gap_ms'],
+                      method['source_partition']['residual_ms']]
+        method['cycle_ms'] = sum(components)
+        for item, value in zip(method['breakdown'], components):
+            item['value_ms'] = value
+        for group in groups:
+            for stage in group['stage_rows']:
+                stage['cycle_share'] = stage['target_total_ms'] / method['cycle_ms']
+        method['target_stage_breakdowns'] = groups
+        selected = next(rank for rank in method['per_rank'] if rank['rank'] == method['selected_rank'])
+        selected.update(cycle_ms=method['cycle_ms'], class_means=copy.deepcopy(method['class_means']),
+                        role_details=copy.deepcopy(method['role_details']), target_stage_breakdowns=copy.deepcopy(groups))
+    return report
+
+
 def drilldown_report():
     """Two independently measured ranks, with three unequal SWA layer means."""
     report = residual_report()
@@ -82,7 +137,7 @@ def drilldown_report():
                     status='MATCHED', reason=None))
         capture['swa_diagnostics'] = dict(status='MATCHED', layer_summary=layer_summary,
                                            stage_summary=stage_summary)
-    return report
+    return attach_target_stage_contract(report)
 
 
 def full_layer_drilldown_report():
@@ -105,7 +160,7 @@ def full_layer_drilldown_report():
                         label=rank + '_' + attention + '_DETAIL_' + str(order), rounds=2,
                         matched_windows=2, duration_ms_mean=value, status='MATCHED', reason=None))
         capture['layer_diagnostics'] = diagnostic
-    return report
+    return attach_target_stage_contract(report)
 
 
 def bs_trend_report():
@@ -986,14 +1041,17 @@ class LayerMeanRendererTests(unittest.TestCase):
                 self.assertIn(renderer._layer_mean_name(method), self.chart_title(chart))
                 self.assert_bar_cache_matches_own_sheet(chart, book, name)
             swa = self.assert_bar_cache_matches_own_sheet(charts[0], book, name)
-            self.assertEqual(len(swa), 3)
-            for layer, (labels, values) in enumerate(swa):
-                expected = sorted((row for row in capture['swa_diagnostics']['stage_summary']
-                                   if row['layer'] == layer), key=lambda row: row['stage_order'])
-                self.assertEqual(labels, [row['label'] for row in expected])
-                self.assertEqual(values, [row['duration_ms_mean'] for row in expected])
-                self.assertEqual(len(values), 10)
-                self.assertAlmostEqual(sum(values), capture['swa_diagnostics']['layer_summary'][layer]['wall_ms_mean'])
+            self.assertEqual(len(swa), 1)
+            target = next(group for group in method['target_stage_breakdowns'] if group['attention'] == 'SWA')
+            expected = sorted(target['stage_rows'], key=lambda row: row['stage_order'])
+            labels, values = swa[0]
+            self.assertEqual(labels, [row['label'] for row in expected])
+            self.assertEqual(values, [row['target_total_ms'] for row in expected])
+            self.assertEqual(len(values), 10)
+            self.assertAlmostEqual(sum(values), target['target_total_ms'])
+            self.assertAlmostEqual(values[5], 1.26 if capture['rank'] == 'dp7' else 1.98)
+            self.assertAlmostEqual(values[6], 1.92 if capture['rank'] == 'dp7' else 2.76)
+            self.assertNotEqual(values, [row['source_ms'] for row in expected])
             for chart, parent_key in zip(charts[1:], ('main_inputs', 'main_metadata')):
                 series = self.assert_bar_cache_matches_own_sheet(chart, book, name)
                 self.assertEqual(len(series), 1)
@@ -1055,6 +1113,7 @@ class LayerMeanRendererTests(unittest.TestCase):
             else:
                 case['measurements'][0].pop('swa_diagnostics')
                 case['measurements'][0]['step_residuals'].pop('substage_summary')
+                method.pop('target_stage_breakdowns')
             with self.subTest(missing=missing):
                 out, (book, _) = self.build(report)
                 cells = book['方法1估算'][1]
@@ -1062,11 +1121,13 @@ class LayerMeanRendererTests(unittest.TestCase):
                     self.assertTrue(any(isinstance(value, str) and value.startswith(title)
                                         for value in cells.values()), title)
                 charts = self.chart_parts_by_sheet(out, book)['方法1估算']
-                self.assertFalse(any(any(self.chart_title(chart).startswith(title) for title in DRILLDOWN_TITLES)
-                                     for chart in charts))
+                for title in DRILLDOWN_TITLES:
+                    expected_target = missing in ('capture', 'duplicate_capture') and title == DRILLDOWN_TITLES[0]
+                    self.assertEqual(any(self.chart_title(chart).startswith(title) for chart in charts), expected_target)
                 text = ' '.join(map(str, cells.values()))
                 self.assertTrue(any(word in text for word in ('缺', '不足', '未绘', '不可用', '未提供')))
-                self.assertNotIn('dp3_SWA_DETAIL_', text)
+                if missing not in ('capture', 'duplicate_capture'):
+                    self.assertNotIn('dp3_SWA_DETAIL_', text)
                 self.assertNotIn('dp3_main_inputs_DETAIL_', text)
                 self.assertNotIn('dp3_main_metadata_DETAIL_', text)
 
@@ -1100,19 +1161,20 @@ class LayerMeanRendererTests(unittest.TestCase):
     def test_incomplete_or_nonclosing_swa_layer_cannot_publish_a_ten_stage_chart(self):
         for invalid in ('partial', 'missing_stage', 'layer_sum', 'missing_layer_wall', 'sample_count', 'order'):
             report = drilldown_report()
-            diagnostic = report['cases'][0]['measurements'][0]['swa_diagnostics']
+            method = report['cases'][0]['projection']['layer_mean_methods'][0]
+            group = next(row for row in method['target_stage_breakdowns'] if row['attention'] == 'SWA')
             if invalid == 'partial':
-                diagnostic['stage_summary'][0].update(status='PARTIAL', matched_windows=1)
+                group.update(status='UNAVAILABLE', reason='SYNTHETIC_PARTIAL_NATIVE_STAGE')
             elif invalid == 'missing_stage':
-                diagnostic['stage_summary'].pop(0)
+                group['stage_rows'].pop(0)
             elif invalid == 'layer_sum':
-                diagnostic['layer_summary'][0]['wall_ms_mean'] += .5
+                group['target_wall_ms'] += .5
             elif invalid == 'missing_layer_wall':
-                diagnostic['layer_summary'].pop(0)
+                group.pop('target_wall_ms')
             elif invalid == 'sample_count':
-                diagnostic['stage_summary'][0].update(rounds=1, matched_windows=1)
+                group['rounds'] = 0
             else:
-                diagnostic['stage_summary'][0]['stage_order'] = 2
+                group['stage_rows'][0]['stage_order'] = 2
             with self.subTest(invalid=invalid):
                 out, (book, _) = self.build(report)
                 charts = self.chart_parts_by_sheet(out, book)['方法1估算']
@@ -1132,6 +1194,12 @@ class LayerMeanRendererTests(unittest.TestCase):
                           if row['parent_stage_key'] == parent_key]
                 stages[1]['duration_ms_mean'] += stages[0]['duration_ms_mean']
                 stages[0]['duration_ms_mean'] = 0.
+        for method in report['cases'][0]['projection']['layer_mean_methods']:
+            group = next(item for item in method['target_stage_breakdowns'] if item['attention'] == 'SWA')
+            first, second = group['stage_rows'][:2]
+            for field in ('source_ms', 'target_ms', 'target_total_ms', 'cycle_share'):
+                second[field] += first[field]
+                first[field] = 0.
         out, (book, _) = self.build(report)
         by_sheet = self.chart_parts_by_sheet(out, book)
         for name in ('方法1估算', '方法2估算'):
@@ -1169,20 +1237,22 @@ class LayerMeanRendererTests(unittest.TestCase):
             rank_row = next(int(re.search(r'\d+', cell).group()) for cell, value in cells.items()
                             if value == '采样rank')
             self.assertEqual([u_row, *title_rows, rank_row], sorted([u_row, *title_rows, rank_row]))
-            for chart, role, attention, layers in zip(charts[:3], ('main', 'main', 'draft'),
-                    ('CSA', 'HCA', 'SWA'), ((2, 4, 6), (0, 1, 3, 5, 7), (0, 1, 2))):
+            for chart, role, attention in zip(charts[:3], ('main', 'main', 'draft'), ('CSA', 'HCA', 'SWA')):
                 series = self.assert_bar_cache_matches_own_sheet(chart, book, name)
-                self.assertEqual(len(series), len(layers))
-                for layer, (labels, values) in zip(layers, series):
-                    expected = sorted((row for row in capture['layer_diagnostics']['stage_summary']
-                                       if row['role'] == role and row['attention'] == attention and row['layer'] == layer),
-                                      key=lambda row: row['stage_order'])
-                    self.assertEqual(labels, [row['label'] for row in expected])
-                    self.assertEqual(values, [row['duration_ms_mean'] for row in expected])
-                    self.assertEqual(len(values), 10)
-                    parent = next(row for row in capture['layer_diagnostics']['layer_summary']
-                                  if row['role'] == role and row['attention'] == attention and row['layer'] == layer)
-                    self.assertAlmostEqual(sum(values), parent['wall_ms_mean'])
+                self.assertEqual(len(series), 1)
+                parent = next(row for row in method['target_stage_breakdowns']
+                              if row['role'] == role and row['attention'] == attention)
+                expected = sorted(parent['stage_rows'], key=lambda row: row['stage_order'])
+                labels, values = series[0]
+                self.assertEqual(labels, [row['label'] for row in expected])
+                self.assertEqual(values, [row['target_total_ms'] for row in expected])
+                self.assertEqual(len(values), 10)
+                self.assertAlmostEqual(sum(values), parent['target_total_ms'])
+                self.assertAlmostEqual(sum(row['cycle_share'] for row in expected),
+                                       parent['target_total_ms'] / method['cycle_ms'])
+                self.assertNotEqual(values, [row['source_ms'] for row in expected])
+                if role == 'main':
+                    self.assertNotIn(0, parent['reference_layers'])
             text = ' '.join(map(str, cells.values()))
             self.assertIn('主0', text)
             self.assertTrue(any(word in text for word in ('不参与', '排除', '不作参考', '仅展示')))
@@ -1204,18 +1274,17 @@ class LayerMeanRendererTests(unittest.TestCase):
         for attention, title in zip(('CSA', 'HCA'), MAIN_DRILLDOWN_TITLES):
             for invalid in ('missing_stage', 'partial', 'missing_wall', 'nonclosing'):
                 report = full_layer_drilldown_report()
-                diagnostic = report['cases'][0]['measurements'][0]['layer_diagnostics']
-                stage = next(row for row in diagnostic['stage_summary']
-                             if row['role'] == 'main' and row['attention'] == attention)
+                method = report['cases'][0]['projection']['layer_mean_methods'][0]
+                group = next(row for row in method['target_stage_breakdowns'] if row['attention'] == attention)
+                stage = group['stage_rows'][0]
                 if invalid == 'missing_stage':
-                    diagnostic['stage_summary'].remove(stage)
+                    group['stage_rows'].remove(stage)
                 elif invalid == 'partial':
-                    stage.update(status='PARTIAL', matched_windows=1, duration_ms_mean=None)
+                    group.update(status='UNAVAILABLE', reason='SYNTHETIC_PARTIAL_NATIVE_STAGE')
                 elif invalid == 'missing_wall':
-                    diagnostic['layer_summary'] = [row for row in diagnostic['layer_summary']
-                        if not (row['role'] == 'main' and row['attention'] == attention and row['layer'] == stage['layer'])]
+                    group.pop('target_wall_ms')
                 else:
-                    stage['duration_ms_mean'] += 1.
+                    stage['target_total_ms'] += 1.
                 with self.subTest(attention=attention, invalid=invalid):
                     out, (book, _) = self.build(report)
                     charts = self.chart_parts_by_sheet(out, book)['方法1估算']
@@ -1227,7 +1296,7 @@ class LayerMeanRendererTests(unittest.TestCase):
                     self.assertTrue(any(isinstance(value, str) and value.startswith(title) for value in cells.values()))
                     self.assertIn('未绘图', ' '.join(map(str, cells.values())))
 
-    def test_legacy_swa_only_json_keeps_three_old_expansions_and_main_unknown_placeholders(self):
+    def test_target_swa_only_contract_keeps_u_expansions_and_main_unknown_placeholders(self):
         out, (book, _) = self.build(drilldown_report())
         by_sheet = self.chart_parts_by_sheet(out, book)
         preview = out.with_suffix('.html').read_text()
@@ -1240,19 +1309,113 @@ class LayerMeanRendererTests(unittest.TestCase):
             for title in DRILLDOWN_TITLES:
                 self.assertTrue(any(self.chart_title(chart).startswith(title) for chart in by_sheet[name]))
 
-    def test_full_layer_diagnostics_take_precedence_over_legacy_swa_values(self):
+    def test_core_target_contract_takes_precedence_over_source_layer_diagnostics(self):
         report = full_layer_drilldown_report()
         for capture in report['cases'][0]['measurements']:
-            for row in capture['swa_diagnostics']['stage_summary']:
-                row.update(label='LEGACY_SWA_MUST_NOT_REPLACE_NEW_DIAGNOSTIC', duration_ms_mean=99999.)
+            for diagnostic in (capture['swa_diagnostics'], capture['layer_diagnostics']):
+                for row in diagnostic['stage_summary']:
+                    row.update(label='SOURCE_STAGE_MUST_NOT_REPLACE_CORE_TARGET', duration_ms_mean=99999.)
         out, (book, _) = self.build(report)
         charts = self.chart_parts_by_sheet(out, book)
         for name in ('方法1估算', '方法2估算'):
-            self.assertNotIn('LEGACY_SWA_MUST_NOT_REPLACE_NEW_DIAGNOSTIC', book[name][1].values())
+            self.assertNotIn('SOURCE_STAGE_MUST_NOT_REPLACE_CORE_TARGET', book[name][1].values())
             swa = next(chart for chart in charts[name] if self.chart_title(chart).startswith(DRILLDOWN_TITLES[0]))
             series = self.assert_bar_cache_matches_own_sheet(swa, book, name)
-            self.assertEqual(len(series), 3)
+            self.assertEqual(len(series), 1)
             self.assertTrue(all(value < 99999. for _, values in series for value in values))
+            self.assertEqual(series[0][1][5], 1.26 if name == '方法1估算' else 1.98)
+
+    def test_target_tables_keep_core_means_totals_percentages_and_notes(self):
+        report = full_layer_drilldown_report()
+        for method in report['cases'][0]['projection']['layer_mean_methods']:
+            for group in method['target_stage_breakdowns']:
+                group['note'] = 'CORE_GMM_UNKNOWN_DELTA_ZERO_RETAINED'
+        before = copy.deepcopy(report)
+        out, (book, _) = self.build(report)
+        ns = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        for number, method in enumerate(report['cases'][0]['projection']['layer_mean_methods'], 1):
+            sheet, cells = book['方法' + str(number) + '估算']
+            for group in method['target_stage_breakdowns']:
+                for stage in group['stage_rows']:
+                    row = next(int(cell[1:]) for cell, value in cells.items()
+                               if cell.startswith('A') and value == stage['label'])
+                    for column, field in (('D', 'source_ms'), ('E', 'target_ms'),
+                                          ('F', 'target_total_ms'), ('H', 'cycle_share')):
+                        self.assertEqual(cells[column + str(row)], stage[field])
+                    percent_cell = sheet.find('.//s:c[@r="H' + str(row) + '"]', ns)
+                    self.assertEqual(int(percent_cell.get('s')), renderer.xlsx_writer.STYLE_IDS['percent'])
+                self.assertLess(sum(stage['cycle_share'] for stage in group['stage_rows']), 1.)
+            text = ' '.join(map(str, cells.values()))
+            self.assertIn('CORE_GMM_UNKNOWN_DELTA_ZERO_RETAINED', text)
+            self.assertIn('激活与衔接不整体倍增', text)
+            self.assertIn('源实测U仅保留一次', text)
+        preview = out.with_suffix('.html').read_text()
+        self.assertIn('CORE_GMM_UNKNOWN_DELTA_ZERO_RETAINED', preview)
+        self.assertIn('目标同类全部层合计(ms/完整周期)', preview)
+        self.assertRegex(preview, r'\d+\.\d{3}%')
+        self.assertEqual(report, before)
+
+    def test_old_json_never_relabels_source_stage_diagnostics_as_target(self):
+        report = full_layer_drilldown_report()
+        for method in report['cases'][0]['projection']['layer_mean_methods']:
+            method.pop('target_stage_breakdowns')
+        out, (book, _) = self.build(report)
+        charts = self.chart_parts_by_sheet(out, book)
+        for name in ('方法1估算', '方法2估算'):
+            for title in (*MAIN_DRILLDOWN_TITLES, DRILLDOWN_TITLES[0]):
+                self.assertFalse(any(self.chart_title(chart).startswith(title) for chart in charts[name]))
+            for title in DRILLDOWN_TITLES[1:]:
+                self.assertTrue(any(self.chart_title(chart).startswith(title) for chart in charts[name]))
+            self.assertIn('请用新版核心重算', ' '.join(map(str, book[name][1].values())))
+        source_text = ' '.join(map(str, book['层与组件实测'][1].values()))
+        self.assertIn('dp7_SWA_DETAIL_1', source_text)
+
+    def test_target_contract_does_not_require_source_diagnostic_tables(self):
+        report = full_layer_drilldown_report()
+        report['cases'][0]['measurements'] = []
+        out, (book, _) = self.build(report)
+        by_sheet = self.chart_parts_by_sheet(out, book)
+        for name in ('方法1估算', '方法2估算'):
+            for title in (*MAIN_DRILLDOWN_TITLES, DRILLDOWN_TITLES[0]):
+                self.assertTrue(any(self.chart_title(chart).startswith(title) for chart in by_sheet[name]))
+            for title in DRILLDOWN_TITLES[1:]:
+                self.assertFalse(any(self.chart_title(chart).startswith(title) for chart in by_sheet[name]))
+
+    def test_target_group_identity_reference_closure_and_cycle_share_are_checked(self):
+        for invalid in ('duplicate', 'wrong_attention', 'wrong_role', 'main0', 'references', 'count',
+                        'source_parent', 'target_parent', 'total_parent', 'share', 'delta', 'negative', 'missing_value'):
+            report = full_layer_drilldown_report()
+            case = report['cases'][0]
+            method = case['projection']['layer_mean_methods'][0]
+            group = method['target_stage_breakdowns'][0]
+            if invalid == 'duplicate':
+                method['target_stage_breakdowns'].append(copy.deepcopy(group))
+            elif invalid == 'wrong_attention':
+                group['attention'] = 'HCA'
+            elif invalid == 'wrong_role':
+                group['role'] = 'draft'
+            elif invalid == 'main0':
+                group['reference_layers'] = [0, 2, 4, 6]
+            elif invalid == 'references':
+                group['reference_layers'] = [1, 3, 5]
+            elif invalid == 'count':
+                group['target_layers'] += 1
+            elif invalid in ('source_parent', 'target_parent', 'total_parent'):
+                group[{'source_parent': 'source_wall_ms', 'target_parent': 'target_wall_ms',
+                       'total_parent': 'target_total_ms'}[invalid]] += .25
+            elif invalid == 'share':
+                group['stage_rows'][0]['cycle_share'] += .01
+            elif invalid == 'delta':
+                group['stage_rows'][0]['delta_ms'] += .25
+            elif invalid == 'negative':
+                group['stage_rows'][0]['target_ms'] = -.25
+            else:
+                group['stage_rows'][0]['target_total_ms'] = None
+            with self.subTest(invalid=invalid):
+                rendered = renderer._method_expansion_data(case, method)
+                self.assertIsNone(rendered[0]['series'])
+                self.assertIsNotNone(rendered[2]['series'])
+                self.assertIn('未绘图', rendered[0]['note'])
 
     def test_optional_input_anchors_and_dynamic_metadata_counts_use_observed_stage_order(self):
         report = drilldown_report()
@@ -1272,6 +1435,9 @@ class LayerMeanRendererTests(unittest.TestCase):
             diagnostic['substage_summary'].reverse()
             capture['swa_diagnostics']['stage_summary'].reverse()
             capture['swa_diagnostics']['layer_summary'].reverse()
+        for method in report['cases'][0]['projection']['layer_mean_methods']:
+            for group in method['target_stage_breakdowns']:
+                group['stage_rows'].reverse()
         out, (book, _) = self.build(report)
         by_sheet = self.chart_parts_by_sheet(out, book)
         for name, rank in (('方法1估算', 'dp7'), ('方法2估算', 'dp3')):
@@ -1283,10 +1449,10 @@ class LayerMeanRendererTests(unittest.TestCase):
                 self.assertEqual(len(series[0][1]), count)
             swa = next(chart for chart in by_sheet[name] if self.chart_title(chart).startswith(DRILLDOWN_TITLES[0]))
             series = self.assert_bar_cache_matches_own_sheet(swa, book, name)
-            self.assertEqual(len(series), 3)
+            self.assertEqual(len(series), 1)
             self.assertEqual(series[0][0], [rank + '_SWA_DETAIL_' + str(order) for order in range(1, 11)])
-            self.assertLess(series[0][1][0], series[1][1][0])
-            self.assertLess(series[1][1][0], series[2][1][0])
+            self.assertEqual(series[0][1][0], .06 if rank == 'dp7' else .18)
+            self.assertLess(series[0][1][0], series[0][1][1])
 
     def test_default_renderer_filename_overview_and_titles_use_product_name(self):
         source = self.root / 'core.json'

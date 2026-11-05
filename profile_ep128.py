@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261105.1.layer_stage_charts"
+PROFILE_VERSION = "20261105.2.target_layer_stages"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -2885,6 +2885,118 @@ def _lm_native_layer(tasks, starts, layer, model, ep, require_compute=True):
 
 
 
+_LM_TARGET_STAGE_KEYS = ("attention_prepare", "attention", "attention_output", "attention_post",
+                         "moe_prepare", "dispatch", "experts", "combine", "ffn_output", "ffn_post")
+
+
+def _lm_source_layer_stages(layer, tasks, starts, native):
+    """Optional stage evidence, without changing the parent layer estimator."""
+    entry = {"layer": layer["layer"], "status": "UNAVAILABLE", "reason": None,
+             "note": None, "stage_rows": []}
+    try:
+        left, right = _lm_exact_ns(layer["start_ns"]), _lm_exact_ns(layer["end_ns"])
+        inside = tasks[bisect.bisect_left(starts, left):bisect.bisect_left(starts, right)]
+        stages = layer_stage_plan(layer, inside)
+        if (len(stages) != len(_LM_TARGET_STAGE_KEYS)
+                or tuple(row["stage_key"] for row in stages) != _LM_TARGET_STAGE_KEYS
+                or any(row["status"] != "MATCHED" for row in stages)):
+            raise ValueError("; ".join(row.get("reason") or "ten native stage anchors unavailable" for row in stages
+                                       if row.get("status") != "MATCHED") or "ten native stages unavailable")
+        cursor = left
+        for row in stages:
+            a, b = _lm_exact_ns(row["start_ns"]), _lm_exact_ns(row["end_ns"])
+            if a != cursor or b < a or row["duration_ns"] != b - a:
+                raise ValueError("reference stage intervals are not an exclusive continuous partition")
+            cursor = b
+        if cursor != right or sum(row["duration_ns"] for row in stages) != right - left:
+            raise ValueError("reference ten stages do not close to the source layer wall")
+        experts = stages[_LM_TARGET_STAGE_KEYS.index("experts")]
+        expert_left, expert_right = _lm_exact_ns(experts["start_ns"]), _lm_exact_ns(experts["end_ns"])
+        named = [task for task in inside if _lm_gmm(task)]
+        if any(task.start_ns < expert_left or task.end_ns > expert_right for task in named):
+            raise ValueError("reference routed GMM is outside the experts substage")
+        routed = native["routed_compute_ms"]
+        if routed is not None:
+            observed = _lm_union_ms((task.start_ns, task.end_ns) for task in named)
+            if (not math.isclose(observed, routed, rel_tol=1e-12, abs_tol=1e-8)
+                    or routed > experts["duration_ms"] + 1e-8):
+                raise ValueError("reference routed GMM union conflicts with the experts substage")
+        else:
+            entry["note"] = ("源 routed_compute_ms 未识别，保持未知；仅在父估算允许的 TopK 不变条件下沿用零计算增量，"
+                             "不把未知 GMM 耗时补零。")
+        entry.update(status="MATCHED", stage_rows=[{"stage_key": row["stage_key"],
+            "stage_order": row["stage_order"], "label": row["label"], "source_ms": row["duration_ms"]} for row in stages])
+    except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+        entry["reason"] = str(error)
+    return entry
+
+
+def _lm_target_stage_breakdowns(classes, groups, cycle_ms, *, rounds=1, layer_samples=False):
+    """Explain the existing target class means; never recompute cycle totals.
+
+    A single round first averages its reference layers.  Rank results then
+    average those round means, using the exact same retained rounds as the
+    parent estimator.  Only native D/C/GMM deltas change the ten source spans.
+    """
+    output = []
+    for parent in classes:
+        role, attention = parent["role"], parent["attention"]
+        references = list(parent["reference_layers"])
+        count = parent["target_layers"]
+        entry = {"role": role, "attention": attention, "status": "UNAVAILABLE", "reason": None,
+                 "note": "细分是父层估算的展开，已包含于目标周期；不得再次加到周期、TPOT 或吞吐。",
+                 "reference_layers": references, "target_layers": count, "rounds": rounds,
+                 "source_wall_ms": parent["wall_ms"], "target_wall_ms": parent["target_wall_ms"],
+                 "target_total_ms": count * parent["target_wall_ms"], "stage_rows": []}
+        try:
+            samples = groups.get((role, attention), [])
+            if layer_samples:
+                if [row.get("layer") for row in samples] != references:
+                    raise ValueError("native stage references are missing or disagree with parent reference_layers")
+            elif len(samples) != rounds or any(row.get("reference_layers") != references for row in samples):
+                raise ValueError("stage rounds/reference layers disagree with the retained parent estimate")
+            if not samples or any(row.get("status") != "MATCHED" for row in samples):
+                reasons = [row.get("reason") or "reference stage evidence unavailable" for row in samples
+                           if row.get("status") != "MATCHED"]
+                raise ValueError("; ".join(dict.fromkeys(reasons)) or "reference stage evidence unavailable")
+            for sample in samples:
+                if tuple(row["stage_key"] for row in sample["stage_rows"]) != _LM_TARGET_STAGE_KEYS:
+                    raise ValueError("reference stage keys/order do not match the ten-stage definition")
+            delta_fields = {"dispatch": "dispatch_delta_ms", "combine": "combine_delta_ms",
+                            "experts": "routed_compute_delta_ms"}
+            rows = []
+            for index, key in enumerate(_LM_TARGET_STAGE_KEYS):
+                source_ms = statistics.fmean(_lm_number(sample["stage_rows"][index]["source_ms"], "source stage")
+                                             for sample in samples)
+                delta = parent[delta_fields[key]] if key in delta_fields else 0.
+                target_ms = source_ms + delta
+                if source_ms < 0 or not math.isfinite(target_ms) or target_ms < 0:
+                    raise ValueError("source or target stage duration is invalid")
+                total = count * target_ms
+                rows.append({"stage_key": key, "stage_order": index + 1,
+                             "label": samples[0]["stage_rows"][index]["label"],
+                             "source_ms": source_ms, "delta_ms": delta, "target_ms": target_ms,
+                             "target_total_ms": total, "cycle_share": total / cycle_ms})
+            for field, expected in (("source_ms", parent["wall_ms"]), ("target_ms", parent["target_wall_ms"]),
+                                    ("target_total_ms", entry["target_total_ms"])):
+                if not math.isclose(math.fsum(row[field] for row in rows), expected, rel_tol=1e-12, abs_tol=1e-8):
+                    raise ValueError("ten target stages do not close to parent " + field)
+            if any(not 0 <= row["cycle_share"] <= 1 for row in rows):
+                raise ValueError("target stage cycle share is outside the parent cycle")
+            notes = list(dict.fromkeys(sample["note"].replace(entry["note"], "").strip()
+                                      for sample in samples if sample.get("note")))
+            notes = [note for note in notes if note]
+            entry.update(status="MATCHED", stage_rows=rows)
+            if notes:
+                entry["note"] += " " + " ".join(notes)
+        except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+            entry["reason"] = str(error)
+            entry["note"] += " 子段不可用时仍保留父层估算总量，不将未知子段补零。"
+        output.append(entry)
+    return output
+
+
+
 def _lm_source_round(cycle, tasks, starts, model, case, source_schedule, excluded, compute_required):
     start, end = _lm_exact_ns(cycle["start_ns"]), _lm_exact_ns(cycle["end_ns"])
     if end <= start:
@@ -2907,6 +3019,7 @@ def _lm_source_round(cycle, tasks, starts, model, case, source_schedule, exclude
             raise ValueError("source HC wall disagrees with exact timestamps")
         previous = right
     roles, class_values, evidence = {}, collections.defaultdict(list), []
+    class_stage_values = collections.defaultdict(list)
     for role in ("main", "draft"):
         selected = [layer for layer in layers if layer["role"] == role]
         if not selected:
@@ -2930,6 +3043,7 @@ def _lm_source_round(cycle, tasks, starts, model, case, source_schedule, exclude
                 continue
             values, proof = _lm_native_layer(tasks, starts, layer, model, case["base_ep"], compute_required[role])
             class_values[(role, layer["attention"])].append((layer["layer"], values))
+            class_stage_values[(role, layer["attention"])].append(_lm_source_layer_stages(layer, tasks, starts, values))
             evidence.append({"round_id": cycle.get("round_id"), **proof})
     span_sum = math.fsum(value["source_chain_ms"] for value in roles.values())
     residual = duration - span_sum
@@ -2948,7 +3062,7 @@ def _lm_source_round(cycle, tasks, starts, model, case, source_schedule, exclude
                  "scope": "all original source layer walls and same-role gaps plus cross-role/tail residual, each once; layer0 exclusion changes references only"}
     return {"round_id": cycle.get("round_id"), "source_cycle_ms": duration,
             "roles": roles, "class_values": class_values, "source_partition": partition,
-            "compute_evidence": evidence}
+            "compute_evidence": evidence, "class_stage_values": class_stage_values}
 
 
 
@@ -2994,12 +3108,12 @@ def _lm_source_summary(prepared):
             rounds.append({"round_id": source["round_id"], "source_cycle_ms": source["source_cycle_ms"],
                            "cycle_ms": None, "class_means": classes,
                            "role_details": [{"role": role, **values} for role, values in source["roles"].items()],
-                           "source_partition": source["source_partition"]})
+                           "source_partition": source["source_partition"], "target_stage_breakdowns": []})
         output.append({"rank": rank, "rounds": rounds, "cycle_ms": None,
                        "source_cycle_ms": statistics.fmean(row["source_cycle_ms"] for row in rounds),
                        "class_means": _lm_average_records(rounds, "class_means", ("role", "attention")),
                        "role_details": _lm_average_records(rounds, "role_details", ("role",)),
-                       "source_partition": _lm_partition_mean(rounds)})
+                       "source_partition": _lm_partition_mean(rounds), "target_stage_breakdowns": []})
     return output
 
 
@@ -3079,7 +3193,9 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
             rounds.append({"round_id": source["round_id"], "source_cycle_ms": source["source_cycle_ms"],
                            "cycle_ms": cycle, "class_means": classes, "role_details": roles,
                            "source_partition": source["source_partition"], "breakdown": breakdown,
-                           "detail_rows": details})
+                           "detail_rows": details,
+                           "target_stage_breakdowns": _lm_target_stage_breakdowns(classes,
+                               source.get("class_stage_values", {}), cycle, layer_samples=True)})
             all_evidence.extend({"rank": rank, **proof} for proof in source["compute_evidence"])
         rank_details = _lm_average_records(rounds, "detail_rows", ("role", "attention", "component"))
         for row in rank_details:
@@ -3093,6 +3209,12 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
                          "role_details": _lm_average_records(rounds, "role_details", ("role",)),
                          "source_partition": _lm_partition_mean(rounds),
                          "breakdown": _lm_average_records(rounds, "breakdown", ("key",))})
+        stage_groups = collections.defaultdict(list)
+        for source_round in rounds:
+            for row in source_round["target_stage_breakdowns"]:
+                stage_groups[(row["role"], row["attention"])].append(row)
+        per_rank[-1]["target_stage_breakdowns"] = _lm_target_stage_breakdowns(
+            per_rank[-1]["class_means"], stage_groups, per_rank[-1]["cycle_ms"], rounds=len(rounds))
     if not per_rank:
         raise ValueError("no source ranks/rounds for layer-mean estimation")
     selected = max(per_rank, key=lambda row: row["cycle_ms"])
@@ -3126,6 +3248,7 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
             "source_cycle_ms": selected["source_cycle_ms"], "selected_rank": selected["rank"],
             "aggregation": "max_of_per_rank_mean_of_per_round_layer_type_mean_estimates",
             "per_rank": per_rank, "class_means": selected["class_means"], "role_details": selected["role_details"],
+            "target_stage_breakdowns": selected["target_stage_breakdowns"],
             "source_partition": selected["source_partition"], "breakdown": selected["breakdown"],
             "detail_rows": all_details, "compute_evidence": all_evidence, "communication": communication, "comm_model": communication,
             "compute_coverage": {"reference_layer_calls": len(all_evidence),
@@ -3245,7 +3368,7 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
                           "class_means": source_summary[0]["class_means"] if source_summary else [],
                           "role_details": source_summary[0]["role_details"] if source_summary else [],
                           "source_partition": source_summary[0]["source_partition"] if source_summary else {},
-                          "breakdown": [], "detail_rows": [], "compute_evidence": [],
+                          "breakdown": [], "detail_rows": [], "compute_evidence": [], "target_stage_breakdowns": [],
                           "communication": comm, "comm_model": comm}
             methods.append(method)
         result["projection"]["layer_mean_methods"] = methods

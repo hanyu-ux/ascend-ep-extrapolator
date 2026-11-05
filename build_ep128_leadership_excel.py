@@ -18,7 +18,7 @@ import traceback
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261105.1.method_stage_charts"
+RENDERER_VERSION = "20261105.2.target_layer_stages"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -864,8 +864,11 @@ def _method_residual_section(sheet, row, case, method):
 METHOD_STAGE_TITLES = ("SWA层内阶段展开", "下一主模型KV与输入准备 · 阶段展开",
                        "下一主metadata及输入映射准备 · 阶段展开")
 MAIN_STAGE_TITLES = ("CSA层内阶段展开", "HCA层内阶段展开")
-METHOD_STAGE_SCOPE = ("仅展示本方法所选rank的源实测细分；CSA/HCA按主层、SWA按草稿层分别列示，不重新平均，"
-                      "不套用目标通信倍率。子阶段已含在原层或U中，不额外计入完整周期或TPOT。")
+METHOD_STAGE_SCOPE = ("CSA/HCA/SWA展示核心提供的目标估算；两项U子阶段保持源实测、完整周期只保留一次。"
+                      "全部子项已含在完整周期中，不额外计入完整周期或TPOT。")
+TARGET_STAGE_HEADERS = ["细分阶段（已含）", "源单层均值(ms)", "目标单层均值(ms)",
+                        "目标同类全部层合计(ms/完整周期)", "占完整周期", "状态 / 说明"]
+TARGET_STAGE_SPANS = ((1, 3), (4, 4), (5, 5), (6, 7), (8, 8), (9, 12))
 SWA_STAGE_KEYS = ("attention_prepare", "attention", "attention_output", "attention_post", "moe_prepare",
                   "dispatch", "experts", "combine", "ffn_output", "ffn_post")
 
@@ -887,69 +890,87 @@ def _empty_expansion(title, reason):
                 series=None, note=reason)
 
 
-def _layer_expansion_data(case, diagnostic, role, attention, title):
-    role_label = "草稿层" if role == "draft" else "主层"
-    if not isinstance(diagnostic, dict):
-        return _empty_expansion(title, "核心缺少" + attention + "层内诊断；请用新版统计脚本重算原始采样。")
-    parents = [item for item in diagnostic.get("layer_summary") or []
+def _target_layer_expansion_data(method, role, attention, title):
+    """Validate and display core target values; never estimate from diagnostics."""
+    result = dict(title=title + " · 目标估算", headers=TARGET_STAGE_HEADERS, spans=TARGET_STAGE_SPANS,
+                  rows=[["核心未提供可核对的目标细分", NA, NA, NA, NA, "UNAVAILABLE"]],
+                  series=None, percent_columns=(4,),
+                  axis_title="目标同类全部层耗时(ms/完整周期)；已含在完整周期中",
+                  scope="本方法所选rank的目标估算；图示同类全部目标层的每周期成本。占比以含其他类型、衔接和U的完整周期为分母，单类占比不要求合计100%。")
+    groups = method.get("target_stage_breakdowns")
+    if not isinstance(groups, list):
+        result["note"] = "核心JSON缺少target_stage_breakdowns；请用新版核心重算。源层诊断仅在层与组件实测展示，不能代替目标估算绘图。"
+        return result
+    groups = [item for item in groups if isinstance(item, dict)
+              and item.get("role") == role and item.get("attention") == attention]
+    if len(groups) != 1:
+        result["note"] = attention + "缺少唯一目标阶段分组，未绘图；请用新版核心重算。"
+        return result
+    group, problems = groups[0], []
+    if group.get("status") != "MATCHED":
+        problems.append("核心目标阶段状态=" + _text(group.get("status")))
+    if group.get("reason"):
+        problems.append(_text(group["reason"]))
+    if not _layer_mean_publishable(method) or method.get("selected_rank") is None:
+        problems.append("本方法目标结果或选中rank不可发布")
+    references, count, rounds = group.get("reference_layers"), group.get("target_layers"), group.get("rounds")
+    valid_references = (isinstance(references, list) and bool(references)
+                        and all(type(layer) is int and layer >= 0 for layer in references)
+                        and len(set(references)) == len(references) and (role != "main" or 0 not in references))
+    if not valid_references or type(count) is not int or count <= 0 or type(rounds) is not int or rounds <= 0:
+        problems.append("参考层、目标层数或保留轮次无效；主0不得参与目标参考")
+    classes = [item for item in method.get("class_means") or []
                if item.get("role") == role and item.get("attention") == attention]
-    stages = [item for item in diagnostic.get("stage_summary") or []
-              if item.get("role") == role and item.get("attention") == attention]
-    layers = sorted({item["layer"] for item in parents + stages
-                     if type(item.get("layer")) is int and item["layer"] >= 0})
-    if not layers or len(layers) > 10:
-        return _empty_expansion(title, "核心未提供可展示的" + attention + "层清单；原始诊断见层与组件实测。")
-    problems, by_layer, totals = [], {}, []
-    configured = (case.get("config") or {}).get("draft_layers") if role == "draft" else None
-    if configured is not None and (type(configured) is not int or layers != list(range(configured))):
-        problems.append(role_label + "清单与配置不一致")
-    if len(parents) != len(layers) or any(item.get("layer") not in layers for item in parents + stages):
-        problems.append(role_label + "统计重复或层号无效")
-    sample_counts = set()
-    for layer in layers:
-        matches = [item for item in parents if item.get("layer") == layer]
-        parent = matches[0] if len(matches) == 1 else {}
-        rows = sorted((item for item in stages if item.get("layer") == layer),
-                      key=lambda item: item.get("stage_order") if type(item.get("stage_order")) is int else -1)
-        rounds = parent.get("rounds")
-        ordered = ([item.get("stage_order") for item in rows] == list(range(1, 11))
-                   and tuple(item.get("stage_key") for item in rows) == SWA_STAGE_KEYS)
-        complete = ordered and all(_matched_stage(item, rounds) for item in rows)
-        wall = parent.get("wall_ms_mean")
-        if type(rounds) is int:
-            sample_counts.add(rounds)
-        if not complete or not _number(wall) or wall < 0 or not math.isclose(
-                math.fsum(item["duration_ms_mean"] for item in rows) if complete else -1,
-                wall if _number(wall) else -2, rel_tol=1e-9, abs_tol=1e-8):
-            problems.append(role_label + str(layer) + "的10阶段未全部匹配或未与层跨度闭合")
-        by_layer[layer] = (rounds, {key: [item for item in rows if item.get("stage_key") == key]
-                                   for key in SWA_STAGE_KEYS})
-        totals.append(role_label + str(layer) + "=" + _text(wall) + " ms/层")
-    if len(sample_counts) != 1:
-        problems.append("各" + role_label + "保留轮次不一致")
-    records = []
-    for key in SWA_STAGE_KEYS:
-        values, states, label = [], [], key
-        for layer in layers:
-            rounds, mapping = by_layer[layer]
-            matches = mapping[key]
-            item = matches[0] if len(matches) == 1 else {}
-            label = item.get("label") or label
-            values.append(item["duration_ms_mean"] if len(matches) == 1 and _matched_stage(item, rounds) else NA)
-            states.append("层" + str(layer) + "：" + _stage_match_text(item))
-        records.append([label, *values, "\n".join(states)])
-    headers = [attention + "内部阶段（已含）", *[role_label + str(layer) + "(ms/层)" for layer in layers], "匹配轮次 / 状态"]
-    note = "源层跨度：" + "；".join(totals) + "。"
-    if role == "main":
-        note += "主0保留展示但不参与外推参考；第1阶段还包含本类型的压缩/索引准备（如适用）。"
+    matching = classes[0] if len(classes) == 1 else {}
+    if (len(classes) != 1 or matching.get("reference_layers") != references
+            or matching.get("target_layers") != count):
+        problems.append("目标阶段分组与本方法选中rank的同类参考不一致")
+    stages = sorted((item for item in group.get("stage_rows") or [] if isinstance(item, dict)),
+                    key=lambda item: item.get("stage_order") if type(item.get("stage_order")) is int else -1)
+    ordered = ([item.get("stage_order") for item in stages] == list(range(1, 11))
+               and tuple(item.get("stage_key") for item in stages) == SWA_STAGE_KEYS)
+    if not ordered:
+        problems.append("目标10阶段标识或顺序不完整/重复")
+    cycle = method.get("cycle_ms")
+    valid_cycle = _number(cycle) and cycle > 0
+    fields = ("source_ms", "delta_ms", "target_ms", "target_total_ms", "cycle_share")
+    complete = ordered and all(all(_number(item.get(field)) for field in fields)
+                               and min(item["source_ms"], item["target_ms"], item["target_total_ms"], item["cycle_share"]) >= 0
+                               and item["cycle_share"] <= 1 for item in stages)
+    if not complete or not valid_cycle:
+        problems.append("目标阶段数值或完整周期不可用")
+    close = lambda a, b: _number(a) and _number(b) and math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-8)
+    if complete and valid_cycle:
+        if (not close(math.fsum(item["source_ms"] for item in stages), group.get("source_wall_ms"))
+                or not close(math.fsum(item["target_ms"] for item in stages), group.get("target_wall_ms"))
+                or not close(math.fsum(item["target_total_ms"] for item in stages), group.get("target_total_ms"))):
+            problems.append("目标10阶段未与源单层、目标单层或同类全部层父项闭合")
+        if not close(group.get("source_wall_ms"), matching.get("wall_ms")) or not close(group.get("target_wall_ms"), matching.get("target_wall_ms")):
+            problems.append("目标阶段父项与本方法同类单层均值不一致")
+        parent_total = group.get("target_total_ms")
+        if (type(count) is int and count > 0 and not all(close(item["target_total_ms"], item["target_ms"] * count) for item in stages)
+                or not all(close(item["target_ms"], item["source_ms"] + item["delta_ms"]) for item in stages)
+                or not all(close(item["cycle_share"], item["target_total_ms"] / cycle) for item in stages)
+                or not _number(parent_total) or not close(math.fsum(item["cycle_share"] for item in stages), parent_total / cycle)
+                or parent_total > cycle + 1e-8):
+            problems.append("目标阶段合计或完整周期占比与父项不一致")
+    state = "MATCHED" if not problems else "UNAVAILABLE；" + "；".join(dict.fromkeys(problems))
+    if stages:
+        result["rows"] = [[item.get("label") or item.get("stage_key") or "未命名阶段",
+                           *[item.get(field) if _number(item.get(field)) else NA
+                             for field in ("source_ms", "target_ms", "target_total_ms", "cycle_share")],
+                           state + "；增量=" + _text(item.get("delta_ms")) + " ms/单层"] for item in stages]
+    result["note"] = ("参考层=" + _text(references) + "；目标层数=" + _text(count) + "；保留轮次=" + _text(rounds)
+                      + "；源单层跨度=" + _text(group.get("source_wall_ms")) + " ms；目标单层跨度="
+                      + _text(group.get("target_wall_ms")) + " ms；目标同类全部层=" + _text(group.get("target_total_ms")) + " ms/完整周期。"
+                      + ("主0排除外推参考；逐源层诊断保留在层与组件实测。" if role == "main" else "草稿同类目标层数由核心提供。")
+                      + "Dispatch/Combine增量分别落在对应阶段；专家只追加路由GMM增量，激活与衔接不整体倍增；其他阶段保持核心给定值。"
+                      + ("核心说明：" + _text(group["note"]) if group.get("note") else ""))
     if problems:
-        note += "未绘图：" + "；".join(dict.fromkeys(problems)) + "。"
-    label_end = min(6, 11 - len(layers))
-    return dict(title=title, headers=headers, rows=records,
-                spans=((1, label_end), *[(label_end + 1 + index, label_end + 1 + index) for index in range(len(layers))],
-                       (label_end + 1 + len(layers), 12)),
-                series=None if problems else [(index + 1, [row[index + 1] for row in records])
-                                              for index in range(len(layers))], note=note)
+        result["note"] += "未绘图：" + "；".join(dict.fromkeys(problems)) + "。"
+    else:
+        result["series"] = [(3, [item["target_total_ms"] for item in stages])]
+    return result
 
 
 def _u_expansion_data(diagnostic, parent_key, title):
@@ -986,42 +1007,45 @@ def _u_expansion_data(diagnostic, parent_key, title):
     records = [[item.get("label") or item.get("stage_key") or "未命名阶段",
                 item["duration_ms_mean"] if _matched_stage(item, rounds) else NA, _stage_match_text(item)]
                for item in children]
-    note = "源父阶段跨度=" + _text(parent.get("duration_ms_mean")) + " ms/HC周期。"
+    note = "源父阶段跨度=" + _text(parent.get("duration_ms_mean")) + " ms/HC周期；源实测U仅保留一次，不按目标层数放大，不使用通信或专家倍率。"
     if problems:
         note += "未绘图：" + "；".join(problems) + "。"
     return dict(title=title, headers=["细分阶段（已含）", "跨度均值(ms/HC周期)", "匹配轮次 / 状态"],
                 spans=((1, 6), (7, 9), (10, 12)), rows=records,
-                series=None if problems else [(1, [row[1] for row in records])], note=note)
+                series=None if problems else [(1, [row[1] for row in records])], note=note,
+                scope="仅本方法所选rank的源实测U细分，完整周期只保留一次，不外推。",
+                axis_title="源实测U阶段(ms/完整周期)；U仅保留一次")
 
 
 def _method_expansion_data(case, method):
     """Read the selected capture only; never re-estimate or choose a rank."""
+    target_groups = [_target_layer_expansion_data(method, "main", "CSA", MAIN_STAGE_TITLES[0]),
+                     _target_layer_expansion_data(method, "main", "HCA", MAIN_STAGE_TITLES[1]),
+                     _target_layer_expansion_data(method, "draft", "SWA", METHOD_STAGE_TITLES[0])]
     selected = method.get("selected_rank")
     captures = [capture for capture in case.get("measurements") or [] if capture.get("rank") == selected]
     if selected is None or len(captures) != 1:
         reason = "本方法未选中rank。" if selected is None else "所选rank缺少唯一对应的采样诊断；请重跑基础统计。"
-        return [_empty_expansion(title, reason) for title in MAIN_STAGE_TITLES + METHOD_STAGE_TITLES]
+        return target_groups + [_empty_expansion(title, reason) for title in METHOD_STAGE_TITLES[1:]]
     capture = captures[0]
     residual = capture.get("step_residuals")
     if isinstance(residual, dict) and residual.get("rank", selected) != selected:
         residual = None
-    layers = capture.get("layer_diagnostics")
-    swa = layers if isinstance(layers, dict) else capture.get("swa_diagnostics")
-    return [_layer_expansion_data(case, layers, "main", "CSA", MAIN_STAGE_TITLES[0]),
-            _layer_expansion_data(case, layers, "main", "HCA", MAIN_STAGE_TITLES[1]),
-            _layer_expansion_data(case, swa, "draft", "SWA", METHOD_STAGE_TITLES[0]),
-            _u_expansion_data(residual, "main_inputs", METHOD_STAGE_TITLES[1]),
+    return [*target_groups, _u_expansion_data(residual, "main_inputs", METHOD_STAGE_TITLES[1]),
             _u_expansion_data(residual, "main_metadata", METHOD_STAGE_TITLES[2])]
 
 
 def _method_stage_expansions(sheet, row, case, method):
     for group in _method_expansion_data(case, method):
         row = _note(sheet, row, group["title"] + " · " + _rank_note(method))
-        row = _note(sheet, row, METHOD_STAGE_SCOPE + group["note"], warning=group["series"] is None)
+        row = _note(sheet, row, group.get("scope", METHOD_STAGE_SCOPE) + group["note"], warning=group["series"] is None)
         header, written = row, []
         row = _table(sheet, row, group["headers"], group["rows"], spans=group["spans"], record_rows=written)
         for actual, record in zip(written, group["rows"]):
             sheet.row_height(actual, max(35, 16 * str(record[-1]).count("\n") + 35))
+            for column in group.get("percent_columns", ()):
+                if _number(record[column]):
+                    sheet.write(actual, group["spans"][column][0], record[column], "percent")
         if not group["series"]:
             continue
         if written != list(range(written[0], written[0] + len(group["rows"]))):
@@ -1039,7 +1063,8 @@ def _method_stage_expansions(sheet, row, case, method):
         sheet.add_bar_chart(group["title"] + " · " + _layer_mean_name(method),
             categories=[record[0] for record in group["rows"]], series=series,
             categories_ref=reference + cell_reference(written[0], 1, True) + ":" + cell_reference(written[-1], 1, True),
-            anchor=(row, 1, row + height, 12), stacked=False, x_axis_title="源阶段耗时(ms)；已含在原层或U中")
+            anchor=(row, 1, row + height, 12), stacked=False,
+            x_axis_title=group.get("axis_title", "源实测阶段耗时(ms)；已含在原层或U中"))
         row += height + 2
     return row
 
@@ -1372,18 +1397,22 @@ def _method_stage_expansions_html(case, method):
     esc = lambda value: html.escape(_text(value), quote=True)
     parts = []
     for group in _method_expansion_data(case, method):
+        display_rows = [[format(value, '.3%') if column in group.get("percent_columns", ()) and _number(value) else value
+                         for column, value in enumerate(record)] for record in group["rows"]]
         parts.append('<section class="method-stage-expansion"><h4>' + esc(group["title"]) +
-                     ' · ' + esc(_rank_note(method)) + '</h4><p>' + esc(METHOD_STAGE_SCOPE + group["note"]) +
-                     '</p>' + _html_table(group["headers"], group["rows"]))
+                     ' · ' + esc(_rank_note(method)) + '</h4><p>' + esc(group.get("scope", METHOD_STAGE_SCOPE) + group["note"]) +
+                     '</p>' + _html_table(group["headers"], display_rows))
         if group["series"]:
             maximum = max(value for _, values in group["series"] for value in values) or 1
-            parts.append('<div class="u-bars" role="img" aria-label="' + esc(group["title"] + '；源阶段耗时，单位毫秒') + '">')
+            parts.append('<div class="u-bars" role="img" aria-label="' + esc(group["title"] + '；' + group.get("axis_title", '源实测阶段耗时，单位毫秒')) + '">')
             for index, (column, values) in enumerate(group["series"]):
                 color = ("168B8D", "4F90C6", "D59440", "7668AA", "5BA28A")[index % 5]
                 for record, value in zip(group["rows"], values):
                     parts.append('<div class="u-bar"><span>' + esc(record[0] + ' · ' + group["headers"][column]) +
                         '</span><span class="u-track"><i style="background:#' + color + ';width:' +
-                        str(100 * value / maximum) + '%"></i></span><span>' + format(value, '.6f') + ' ms</span></div>')
+                        str(100 * value / maximum) + '%"></i></span><span>' + format(value, '.6f') + ' ms'
+                        + (' · ' + format(record[4], '.3%') if group.get("percent_columns") and _number(record[4]) else '')
+                        + '</span></div>')
             parts.append('</div>')
         parts.append('</section>')
     return ''.join(parts)
