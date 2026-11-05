@@ -4,13 +4,14 @@
 
 使用 Python 3.10 或更新版本。核心统计、Excel 写入和 HTML 导出均只依赖标准库，不需要安装 requirements，也不需要在运行统计的机器上安装 PyTorch、CANN 或连接 NPU。
 
-日常使用只需要根目录的三个运行脚本和配置文件，并准备自己的采样数据；三个脚本应保持在同一目录：
+日常使用需要根目录的三个运行脚本和配置文件；使用方法2时，还须保留随仓提供的 `data/communication-reference.csv`。另行准备自己的采样数据，三个脚本应保持在同一目录：
 
 ```text
 profile_ep128.py
 build_ep128_leadership_excel.py
 ep128_xlsx_writer.py
 profile_ep128_cases.example.json
+data/communication-reference.csv
 ```
 
 `tests/` 是维护代码时运行的回归测试，`tools/` 是可选检查工具，`docs/` 保存说明与 PPT，`examples/` 保存合成数据示例。它们均不参与默认估算流程。
@@ -43,7 +44,7 @@ profile_ep128_cases.example.json
 }
 ```
 
-这只演示两项输入，实际数量应与本次源采样相符。所有相对路径均相对于 cases JSON 所在目录。使用 `inputs` 时移除该 case 原来的 `path`，避免同时指定两种输入方式。
+这只演示两项输入，实际数量应与本次源采样相符。JSON 中的相对路径（包括 `communication_reference`）均相对于 cases JSON 所在目录。命令行 `--comm-reference` 的相对路径则相对于运行命令时的工作目录。使用 `inputs` 时移除该 case 原来的 `path`，避免同时指定两种输入方式。
 
 同次、同 rank 的 `trace_view.json` 可放在 CSV 相邻目录，或在对应 input 中配置 `trace_path`。缺 trace 时保留设备统计和缺失状态；不要借用其他轮次或其他 rank 的 trace。
 
@@ -73,7 +74,7 @@ Windows 可以使用 `py -3 -u` 替换 `python -u`。日志会显示进度、所
 
 ## 4. 方法2的真实通信参考
 
-默认模板指向 `data/communication-reference.csv`；也可以在运行时覆盖：
+原始历史通信参考表已随仓提供为 [`data/communication-reference.csv`](../data/communication-reference.csv)，默认模板已指向它。将配置副本放在仓库根目录时，无需另行准备此表；若将配置移到其他目录，应调整 JSON 中的相对路径或使用绝对路径。从仓库根目录运行时，也可以用命令行显式指定：
 
 ```bash
 python -u profile_ep128.py cases.local.json --comm-reference data/communication-reference.csv --out ep128_report --excel
@@ -81,7 +82,9 @@ python -u profile_ep128.py cases.local.json --comm-reference data/communication-
 
 方法2目前核对的外推范围是 EP16 → EP128，历史表需要同 BS 下 EP32、EP64、EP128 的 send、return 数值。可另附 total 列，存在时须与 send + return 一致。
 
-仓库中的 `examples/communication-reference.synthetic.csv` 是全新合成数据，数值仅用于格式演示与回归测试。它不包含原历史实测表，不应与真实采样混用来形成性能结论。
+随仓原表包含 BS `1、2、4、8、16、32、48、64、96、128、192、256`，脚本按 case 的 BS 精确匹配，不自动插值。使用前应核对历史表与当前采样的可比性；需要替换时，通过 JSON 的 `communication_reference` 或命令行 `--comm-reference` 指定经过核对的参考表。
+
+`examples/communication-reference.synthetic.csv` 是另一份全新合成数据，数值仅用于格式演示与回归测试。它不能替代 `data/communication-reference.csv`，不应与真实采样混用来形成性能结论。
 
 没有真实表、BS 不匹配或拟合无效时，保留方法2不可用的原因，方法1仍可计算；不要用任意倍率补齐结果。
 
