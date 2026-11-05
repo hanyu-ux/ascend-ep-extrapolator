@@ -26,18 +26,6 @@
       "imported_version": "20261104.1.line_charts",
       "imported_sha256": "210a6e7056cd23bdc491d200cf141c39f33c8f473c5d67176279f4a64bd1ede9",
       "matches_imported_source": true
-    },
-    "profile_host.py": {
-      "version": "20261105.2.subnanosecond_trace",
-      "sha256": "3c10a3a7bf48728256670c5f03253e5111eb578e939fec528561182dd82e912d",
-      "added_at": "2026-11-05",
-      "scope": "Model-independent measured Host trace analysis; no extrapolation"
-    },
-    "host_profile_report.py": {
-      "version": "20261105.2.subnanosecond_trace",
-      "sha256": "8de1ee1a10119bb8f4c6a174df4950b67293b6a47752fce1388207d445479e2b",
-      "added_at": "2026-11-05",
-      "scope": "Model-independent measured Host trace analysis; no extrapolation"
     }
   },
   "presentations": [
@@ -69,19 +57,16 @@
     "The original machine-specific test import fallback was removed.",
     "Regression tests were grouped under tests/ and optional standalone checks under tools/; runtime scripts and presentation assets are unchanged.",
     "SWA and U diagnostic drill-downs add evidence only; original source/target cycle, TPOT and rank-selection formulas are unchanged. Repository iterations use branches and pull requests with offline regression checks.",
-    "Main CSA/HCA and draft SWA retain per-layer ten-stage evidence; both method sheets display five independent source-stage tables and native editable horizontal charts after the U composition. Core estimates and rank selection are unchanged; legacy SWA outputs remain available.",
-    "Independent trace-only Host analysis accepts main-only models without HC or draft assumptions. It reports validated same-track inclusive/self wall, runtime and queue evidence, per-device task coverage, conservative source links and bounded-detail HTML/CSV/JSON/XLSX; model and hardware declarations remain unverified without customer captures.",
-    "Finite fractional-nanosecond trace events are preserved using Decimal absolute endpoints rounded separately to nearest integer ns with ROUND_HALF_EVEN. Quantization counts and endpoint errors are disclosed; negative and nonfinite durations remain invalid and explicit windows remain exact ns."
+    "Main CSA/HCA and draft SWA retain per-layer ten-stage evidence; both method sheets display five independent source-stage tables and native editable horizontal charts after the U composition. Core estimates and rank selection are unchanged; legacy SWA outputs remain available."
   ],
   "validation": {
-    "discovered_tests": 315,
-    "passed": 305,
+    "discovered_tests": 254,
+    "passed": 244,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,
       "optional_openpyxl_in_standard_library_only_mode": 2
-    },
-    "host_synthetic_tests": 61
+    }
   },
   "reference_inputs": {
     "data/communication-reference.csv": {
