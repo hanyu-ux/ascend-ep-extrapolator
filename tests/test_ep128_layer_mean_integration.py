@@ -291,5 +291,143 @@ class SWADrilldownTests(unittest.TestCase):
             self.assertTrue(all(row["status"] == "MATCHED" for row in other))
 
 
+class AllLayerDrilldownTests(unittest.TestCase):
+    """General diagnostic boundaries are observations, never extra model cost."""
+
+    def fixture(self, directory):
+        from test_ep128_v2_measure import fixture, MODEL, CASE
+
+        def changes(rows, records):
+            for row, record in zip(rows, records):
+                if row['Name'] != 'Attention':
+                    continue
+                owner = record['owners'][0]
+                if owner['role'] == 'draft':
+                    kind, duration = 'SparseAttnSharedkv', '3'
+                elif MODEL['compress_ratios'][owner['layer']] == 4:
+                    kind, duration = 'SparseFlashAttention', '4'
+                else:
+                    kind, duration = 'MixedQuantSparseFlashMla', '5'
+                row.update(Name='aclnn' + kind + '_' + kind, Type=kind, **{'Duration(us)': duration})
+
+        capture, _ = fixture(directory, changes=changes)
+        return capture, core.measure_capture(capture, MODEL, CASE)
+
+    def test_generic_diagnostics_close_each_main_and_draft_layer_without_cross_role_means(self):
+        with tempfile.TemporaryDirectory() as temp:
+            capture, measured = self.fixture(Path(temp))
+            before = copy.deepcopy(measured)
+            diagnostic = core.layer_analyze_capture(capture, measured, temp)
+            self.assertEqual(measured, before)
+            self.assertEqual(diagnostic['status'], 'MATCHED')
+            self.assertEqual(len(diagnostic['layer_summary']), 11)
+            self.assertEqual(len(diagnostic['stage_summary']), 110)
+            for parent in diagnostic['layer_summary']:
+                stages = [row for row in diagnostic['stage_summary']
+                          if (row['role'], row['attention'], row['layer']) ==
+                             (parent['role'], parent['attention'], parent['layer'])]
+                self.assertEqual([row['stage_order'] for row in stages], list(range(1, 11)))
+                self.assertEqual(len({row['stage_key'] for row in stages}), 10)
+                self.assertTrue(all(row['status'] == 'MATCHED' for row in stages))
+                self.assertTrue(all(row['rounds'] == row['matched_windows'] == len(measured['rounds'])
+                                    for row in stages))
+                self.assertAlmostEqual(sum(row['duration_ms_mean'] for row in stages), parent['wall_ms_mean'])
+                self.assertEqual(parent['reference_eligible'], parent['role'] != 'main' or parent['layer'] != 0)
+                attention = next(row for row in stages if row['stage_key'] == 'attention')
+                self.assertAlmostEqual(attention['duration_ms_mean'], {'CSA': .004, 'HCA': .005, 'SWA': .003}[parent['attention']])
+            with Path(diagnostic['stages_csv']).open() as stream:
+                exported = list(csv.DictReader(stream))
+            self.assertEqual(len(exported), 110 * len(measured['rounds']))
+            self.assertEqual({row['role'] for row in exported}, {'main', 'draft'})
+            self.assertEqual({row['attention'] for row in exported}, {'CSA', 'HCA', 'SWA'})
+            report = {'cases': [dict(name='SYNTHETIC_ALL_LAYER_DRILLDOWN',
+                                     source={}, projection={'methods': []},
+                                     measurements=[dict(rank=capture['rank'], layer_diagnostics=diagnostic)])]}
+            summary_rows = list(core.iter_report_rows(report, 'layer_stage_summary'))
+            self.assertEqual(len(summary_rows), 110)
+            self.assertEqual({row['rank'] for row in summary_rows}, {capture['rank']})
+            self.assertEqual({row['attention'] for row in summary_rows}, {'CSA', 'HCA', 'SWA'})
+
+    def test_generic_stage_plan_uses_native_attention_and_preserves_continuous_layer_bounds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            capture, measured = self.fixture(Path(temp))
+            cycle = measured['rounds'][0]
+            for role, attention in (('main', 'CSA'), ('main', 'HCA'), ('draft', 'SWA')):
+                layer = next(row for row in cycle['layers'] if row['role'] == role and row['attention'] == attention)
+                stages = core.layer_stage_plan(layer, capture['tasks'])
+                self.assertEqual(len(stages), 10)
+                self.assertEqual(int(stages[0]['start_ns']), int(layer['start_ns']))
+                self.assertEqual(int(stages[-1]['end_ns']), int(layer['end_ns']))
+                self.assertTrue(all(left['end_ns'] == right['start_ns'] for left, right in zip(stages, stages[1:])))
+                self.assertEqual(sum(row['duration_ns'] for row in stages), int(layer['end_ns']) - int(layer['start_ns']))
+                self.assertTrue(all(row['status'] == 'MATCHED' for row in stages))
+                self.assertIn('Q/KV', stages[0]['label'])
+                if attention in ('CSA', 'HCA'):
+                    self.assertIn('压缩', stages[0]['label'])
+                if attention == 'CSA':
+                    self.assertIn('索引', stages[0]['label'])
+
+    def test_optional_indexer_and_metadata_do_not_replace_or_duplicate_the_native_attention_anchor(self):
+        with tempfile.TemporaryDirectory() as temp:
+            capture, measured = self.fixture(Path(temp))
+            layer = next(row for row in measured['rounds'][0]['layers']
+                         if row['role'] == 'main' and row['attention'] == 'CSA')
+            tasks = [task for task in capture['tasks'] if task.op_type != 'LightningIndexer']
+            attention = next(task for task in tasks
+                             if int(layer['start_ns']) <= task.start_ns < int(layer['end_ns'])
+                             and task.op_type == 'SparseFlashAttention')
+            metadata = copy.deepcopy(attention)
+            metadata.name = 'aclnnSparseFlashAttentionMetadata_SparseFlashAttentionMetadata'
+            metadata.op_type = 'SparseFlashAttentionMetadata'
+            metadata.start_ns, metadata.end_ns = attention.start_ns - 1000, attention.start_ns
+            stages = core.layer_stage_plan(layer, [*tasks, metadata])
+            self.assertEqual(len(stages), 10)
+            self.assertTrue(all(row['status'] == 'MATCHED' for row in stages))
+            body = next(row for row in stages if row['stage_key'] == 'attention')
+            self.assertEqual(int(body['start_ns']), attention.start_ns)
+            self.assertEqual(int(body['end_ns']), attention.end_ns)
+            # Two actual attention kernels are ambiguous; preserve the layer,
+            # rather than picking whichever one happened to occur first.
+            stages = core.layer_stage_plan(layer, [*tasks, copy.deepcopy(attention)])
+            self.assertEqual(len(stages), 1)
+            self.assertEqual(stages[0]['status'], 'UNRESOLVED')
+            self.assertEqual(stages[0]['duration_ns'], int(layer['end_ns']) - int(layer['start_ns']))
+
+    def test_partial_main_layer_preserves_unknown_means_and_other_classes_remain_complete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            capture, measured = self.fixture(Path(temp))
+            layer = next(row for row in measured['rounds'][0]['layers']
+                         if row['role'] == 'main' and row['attention'] == 'CSA')
+            task = next(task for task in capture['tasks']
+                        if int(layer['start_ns']) <= task.start_ns < int(layer['end_ns'])
+                        and task.op_type == 'SparseFlashAttention')
+            task.name, task.op_type = 'UnknownAttention', 'UnknownAttention'
+            diagnostic = core.layer_analyze_capture(capture, measured, temp)
+            self.assertEqual(diagnostic['status'], 'PARTIAL')
+            partial = [row for row in diagnostic['stage_summary']
+                       if row['role'] == 'main' and row['layer'] == layer['layer']]
+            self.assertTrue(partial)
+            self.assertTrue(all(row['duration_ms_mean'] is None for row in partial))
+            self.assertTrue(any(row['status'] == 'PARTIAL' for row in partial))
+            other = [row for row in diagnostic['stage_summary']
+                     if row['role'] != 'main' or row['layer'] != layer['layer']]
+            self.assertEqual(len(other), 100)
+            self.assertTrue(all(row['status'] == 'MATCHED' for row in other))
+            self.assertTrue(all(row['wall_ms_mean'] > 0 for row in diagnostic['layer_summary']))
+
+    def test_one_pass_compatibility_keeps_legacy_swa_summary_draft_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            capture, measured = self.fixture(Path(temp))
+            generic, legacy = core.layer_analyze_capture(capture, measured, temp, with_swa_compat=True)
+            standalone = core.swa_analyze_capture(capture, measured, Path(temp) / 'legacy')
+            self.assertEqual(len(generic['stage_summary']), 110)
+            self.assertEqual(len(legacy['stage_summary']), 30)
+            self.assertTrue(all(row['role'] == 'draft' and row['attention'] == 'SWA'
+                                for row in legacy['stage_summary']))
+            self.assertEqual(legacy['stage_summary'], standalone['stage_summary'])
+            self.assertEqual(legacy['layer_summary'], standalone['layer_summary'])
+            self.assertEqual(len(legacy['layer_summary']), 11)
+
+
 if __name__ == "__main__":
     unittest.main()

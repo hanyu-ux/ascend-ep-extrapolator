@@ -116,6 +116,18 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 
 不同 BS 的折线按数值排序。非 BS 条件不同会分组；重复 BS 不合并，缺值断线，单点组只显示表格。总览开头列出全部采样组合，日志中可核对实际读入的 JSON。
 
+### 方法页中的阶段展开
+
+“方法1估算”和“方法2估算”两个 sheet 中，每个 case 的“轮次剩余区间耗时构成”图下，依次展示五组独立表格和原生可编辑横向柱状图：
+
+1. 主模型 CSA 层内 10 阶段，按层分别列示。
+2. 主模型 HCA 层内 10 阶段，按层分别列示。
+3. 草稿模型 SWA 层内 10 阶段，按层分别列示，不混合各层求平均。
+4. 下一主模型 KV 与输入准备子阶段。
+5. 下一主 metadata 及输入映射准备子阶段。
+
+这些表图只使用当前方法 `selected_rank` 对应的源采样实测，不套用外推倍率；两种方法可能选择不同 rank，不能借用其他 rank 的诊断。主0仍展示，但不参加外推参考均值。阶段展开不改变目标周期或 TPOT，也不另外计入成本。诊断缺失、子阶段不完整或不能匹配所选 rank 时，保留不可用原因，未知值不补 0。旧 JSON 缺少细分证据时，需要用新版统计脚本重新处理采样，仅重绘 Excel 不能补出证据。
+
 ### U15 与输入、metadata 子阶段
 
 `step_residual_stages.csv` 继续保留原来的 U1 8 段、U2 7 段父阶段；`step_residual_substages.csv` 和每 rank 阶段明细保存 `level=1` 子阶段，`parent_stage_key` 指向父段。原有逐位置 Markov 子阶段继续保留。
@@ -140,13 +152,13 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 
 **U 子阶段只展开父阶段，所有子段含在原来的 U 中。** 不能把父段和子段重复相加，不能将 U 中的工作移入层区间后宣称周期已经缩短。
 
-### SWA 10 段与同 rank 对照
+### CSA、HCA、SWA 10 段与同 rank 对照
 
-`swa_stage_summary.csv` 给出每 case、每 rank、每草稿层的汇总；每 rank 的 `*-swa-stages.csv` 保留逐轮 stage 边界与状态，位于 `step_residual_details/` 相应 case/rank 的证据目录。Excel/HTML 从报告 JSON 展示同一份诊断；旧 JSON 没有这些证据时保持不可用，不补造结果。
+报告 JSON 的 `measurements[].layer_diagnostics` 保存 CSA、HCA、SWA 的层内阶段诊断；`layer_stage_summary.csv` 给出每 case、每 rank、每层的汇总，`*-layer-stages.csv` 保留逐轮 stage 边界与状态，位于 `step_residual_details/` 相应 case/rank 的证据目录。原有 `swa_stage_summary.csv`、`*-swa-stages.csv` 和 SWA 诊断字段继续保留兼容。旧 JSON 若只有 SWA 证据，只展示可用的 SWA，主模型 CSA/HCA 保持不可用，不补造结果。
 
 | stage key | 含义 |
 | --- | --- |
-| `attention_prepare` | Attention HCPre、Q/KV 投影与 cache 准备 |
+| `attention_prepare` | Attention HCPre、Q/KV 投影与 cache 准备；主模型 CSA/HCA 还含压缩或索引准备 |
 | `attention` | Attention 内核 |
 | `attention_output` | Attention 输出投影与整理 |
 | `attention_post` | Attention HCPost 与层内衔接 |

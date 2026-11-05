@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261104.1.swa_u_drilldown"
+PROFILE_VERSION = "20261105.1.layer_stage_charts"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -1069,21 +1069,26 @@ def analyze_case(case, model, target, base, reference_rows=None):
             with (nullcontext(residual_dir) if residual_dir is not None else
                   tempfile.TemporaryDirectory(prefix='ep128-residual-')) as detail_dir:
                 try:
-                    measured['swa_diagnostics'] = swa_analyze_capture(capture, measured, detail_dir)
+                    measured['layer_diagnostics'], measured['swa_diagnostics'] = layer_analyze_capture(
+                        capture, measured, detail_dir, with_swa_compat=True)
                 except (OSError, ValueError, TypeError, ArithmeticError) as error:
-                    measured['swa_diagnostics'] = {'status': 'ERROR', 'reason': str(error),
-                                                  'layer_summary': [], 'stage_summary': [], 'stages_csv': None}
+                    for field in ('layer_diagnostics', 'swa_diagnostics'):
+                        measured[field] = {'status': 'ERROR', 'reason': str(error),
+                                           'layer_summary': [], 'stage_summary': [], 'stages_csv': None}
                 measured['step_residuals'] = residual_analyze_capture(
                     capture, measured, detail_dir, trace_path=trace_path, case=case,
                     progress=lambda message: print('    ' + message, flush=True))
-            if residual_dir is None:
-                for field in ('device_tasks_csv', 'host_events_csv', 'stages_csv', 'source_links_csv'):
-                    measured['step_residuals'][field] = None
-                measured['swa_diagnostics']['stages_csv'] = None
         except (OSError, ValueError, TypeError, ArithmeticError) as error:
             measured['step_residuals'] = {'status': 'ERROR', 'windows': [], 'summary': [],
                                           'trace': {'status': 'ERROR', 'reason': str(error)}}
             measured['warnings'].append('HC_RESIDUAL_DIAGNOSTIC_FAILED: ' + str(error))
+        finally:
+            if residual_dir is None:
+                for field in ('device_tasks_csv', 'host_events_csv', 'stages_csv', 'source_links_csv'):
+                    measured['step_residuals'][field] = None
+                for field in ('layer_diagnostics', 'swa_diagnostics'):
+                    if isinstance(measured.get(field), dict):
+                        measured[field]['stages_csv'] = None
         measurements.append(measured)
         captures.append({key: capture.get(key) for key in ('rank', 'path', 'sha256', 'device_id', 'duplicate_rows')})
         if not source_errors:
@@ -2457,8 +2462,14 @@ def residual_stage_summary(stages, windows, level):
     return sorted(result, key=lambda row: (row["window_key"], row["stage_order"]))
 
 
-def swa_stage_plan(layer, tasks):
-    """Ten exclusive device-anchor spans inside a draft SWA HC layer wall."""
+def layer_stage_plan(layer, tasks):
+    """Ten exclusive anchor spans for main CSA/HCA and draft SWA HC layers.
+
+    Compression and indexer work, when present, remains within attention
+    preparation. Neither an indexer nor a compression kernel is a required
+    anchor: the observed attention and two HC pairs define this partition.
+    """
+    attention_type = str(layer.get("attention") or "Attention")
     left, right = int(layer["start_ns"]), int(layer["end_ns"])
     inside = sorted((task for task in tasks if left <= task.start_ns < right and task.end_ns > task.start_ns),
                     key=lambda task: (task.start_ns, task.end_ns, task.row_index))
@@ -2477,19 +2488,21 @@ def swa_stage_plan(layer, tasks):
         pre = [task for task in inside if A_PRE.search(task.name) or A_PRE.search(task.op_type)]
         post = [task for task in inside if A_POST.search(task.name) or A_POST.search(task.op_type)]
         if len(pre) != 2 or len(post) != 2:
-            raise ValueError("SWA requires two ordered HCPre/HCPost pairs")
+            raise ValueError(attention_type + " requires two ordered HCPre/HCPost pairs")
         attention = unique(re.compile(r"(?<![A-Za-z])(?:SparseAttnSharedkv|MixedQuantSparseFlashMla|SparseFlashAttention)(?![A-Za-z])", re.I))
         dispatch, combine = unique(A_DISPATCH), unique(A_COMBINE)
         chain = [pre[0], attention, post[0], pre[1], dispatch, combine, post[1]]
         if pre[0].start_ns != left or post[1].end_ns != right or any(
                 a.end_ns > b.start_ns for a, b in zip(chain, chain[1:])):
-            raise ValueError("SWA anchors overlap, are reversed or disagree with the HC layer boundary")
+            raise ValueError(attention_type + " anchors overlap, are reversed or disagree with the HC layer boundary")
         stamps = [left, attention.start_ns, attention.end_ns, post[0].start_ns, pre[1].start_ns,
                   dispatch.start_ns, dispatch.end_ns, combine.start_ns, combine.end_ns, post[1].start_ns, right]
         anchors = [point(pre[0]), point(attention), point(attention, True), point(post[0]), point(pre[1]),
                    point(dispatch), point(dispatch, True), point(combine), point(combine, True), point(post[1]), point(post[1], True)]
-        labels = [("attention_prepare", "SWA HCPre与Q/KV准备"), ("attention", "SWA attention本体"),
-                  ("attention_output", "SWA输出投影与拷贝"), ("attention_post", "Attention HCPost与衔接"),
+        prepare = {"CSA": "CSA HCPre与Q/KV、压缩/索引准备",
+                   "HCA": "HCA HCPre与Q/KV、压缩准备"}.get(attention_type, attention_type + " HCPre与Q/KV准备")
+        labels = [("attention_prepare", prepare), ("attention", attention_type + " attention本体"),
+                  ("attention_output", attention_type + "输出投影与拷贝"), ("attention_post", "Attention HCPost与衔接"),
                   ("moe_prepare", "FFN HCPre与MoE路由准备"), ("dispatch", "MoE Dispatch"),
                   ("experts", "专家计算与Dispatch/Combine衔接"), ("combine", "MoE Combine"),
                   ("ffn_output", "共享专家与FFN归并"), ("ffn_post", "FFN HCPost收尾")]
@@ -2497,17 +2510,27 @@ def swa_stage_plan(layer, tasks):
                  "start_ns": str(stamps[number]), "end_ns": str(stamps[number + 1]),
                  "duration_ns": stamps[number + 1] - stamps[number], "duration_ms": (stamps[number + 1] - stamps[number]) / 1e6,
                  "start_anchor": anchors[number], "end_anchor": anchors[number + 1],
-                 "boundary_basis": "设备锚点连续跨度；含段内间隙，已包含于SWA层，不额外计入周期或TPOT"}
+                 "boundary_basis": "设备锚点连续跨度；含段内间隙，已包含于" + attention_type + "层，不额外计入周期或TPOT"}
                 for number, (key, label) in enumerate(labels)]
     except ValueError as error:
-        return [{"stage_key": "unresolved", "label": "SWA细分未识别（保留层实测总跨度）", "stage_order": 1,
+        return [{"stage_key": "unresolved", "label": attention_type + "细分未识别（保留层实测总跨度）", "stage_order": 1,
                  "status": "UNRESOLVED", "reason": str(error), "start_ns": str(left), "end_ns": str(right),
                  "duration_ns": right - left, "duration_ms": (right - left) / 1e6,
                  "start_anchor": None, "end_anchor": None, "boundary_basis": "原始HC层边界；未猜测缺失语义锚点"}]
 
 
-def swa_analyze_capture(capture, measured, detail_dir):
-    """Report SWA substructure and same-rank layer comparisons without re-estimating."""
+def swa_stage_plan(layer, tasks):
+    """Compatibility entry point for the original draft SWA partition."""
+    return layer_stage_plan({**layer, "attention": "SWA"}, tasks)
+
+
+def layer_analyze_capture(capture, measured, detail_dir, *, with_swa_compat=False):
+    """Measure every main CSA/HCA and draft SWA layer without re-estimating.
+
+    The optional compatibility mode returns ``(all_layers, draft_swa)`` and
+    writes both detail CSVs from the same measured rows. The CLI uses this mode
+    so legacy consumers retain their SWA output without a second analysis.
+    """
     index = ATimeIndex(capture["tasks"])
     groups, stages, stage_groups = collections.defaultdict(list), [], collections.defaultdict(list)
     for cycle in measured["rounds"]:
@@ -2516,17 +2539,17 @@ def swa_analyze_capture(capture, measured, detail_dir):
             tasks = index.overlapping(left, right)
             metrics = diagnostic_metrics(tasks, left, right)
             groups[(layer["role"], layer["layer"], layer["attention"])].append({"wall_ms": (right - left) / 1e6, **metrics})
-            if layer["role"] != "draft" or layer["attention"] != "SWA":
+            if (layer["role"], layer["attention"]) not in (("main", "CSA"), ("main", "HCA"), ("draft", "SWA")):
                 continue
-            rows = swa_stage_plan(layer, tasks)
+            rows = layer_stage_plan(layer, tasks)
             if sum(row["duration_ns"] for row in rows) != right - left:
-                raise ValueError("SWA substages do not close to the original layer interval")
+                raise ValueError("Layer substages do not close to the original layer interval")
             for row in rows:
                 a, b = int(row["start_ns"]), int(row["end_ns"])
-                row.update(round_id=cycle["round_id"], role=layer["role"], layer=layer["layer"], attention="SWA",
+                row.update(round_id=cycle["round_id"], role=layer["role"], layer=layer["layer"], attention=layer["attention"],
                            **diagnostic_metrics(index.overlapping(a, b), a, b))
                 stages.append(row)
-                stage_groups[(layer["layer"], row["stage_key"])].append(row)
+                stage_groups[(layer["role"], layer["layer"], layer["attention"], row["stage_key"])].append(row)
     layer_summary = []
     for (role, layer, attention), rows in groups.items():
         item = {"role": role, "layer": layer, "attention": attention, "rounds": len(rows),
@@ -2538,7 +2561,7 @@ def swa_analyze_capture(capture, measured, detail_dir):
             item[field + "_mean"] = statistics.fmean(values) if all(value is not None for value in values) else None
         layer_summary.append(item)
     summary = []
-    for (layer, key), rows in stage_groups.items():
+    for (role, layer, attention_type, key), rows in stage_groups.items():
         complete = len(rows) == len(measured["rounds"]) and all(row["status"] == "MATCHED" for row in rows)
         item = {field: rows[0][field] for field in ("role", "layer", "attention", "stage_key", "label", "stage_order")}
         item.update(rounds=len(measured["rounds"]), matched_windows=sum(row["status"] == "MATCHED" for row in rows),
@@ -2553,13 +2576,29 @@ def swa_analyze_capture(capture, measured, detail_dir):
     rank, source = str(capture["rank"]), str(capture.get("path", ""))
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", rank).strip("._")[:60] or "rank"
     suffix = hashlib.sha256((rank + "\0" + source).encode()).hexdigest()[:10]
-    destination = Path(detail_dir) / (safe + "-" + suffix + "-swa-stages.csv")
+    destination = Path(detail_dir) / (safe + "-" + suffix + "-layer-stages.csv")
     destination.parent.mkdir(parents=True, exist_ok=True)
     write_csv(destination, [{"rank": rank, **row} for row in stages])
-    return {"status": "MATCHED" if summary and all(row["status"] == "MATCHED" for row in summary) else "PARTIAL",
-            "scope": "源采样同rank逐层HCPre→末HCPost；SWA子段已含于原层，wait和kernel_sum非互斥成本；不同token桶不可等同工作量",
+    diagnostic = {"status": "MATCHED" if summary and all(row["status"] == "MATCHED" for row in summary) else "PARTIAL",
+            "scope": "源采样同rank逐层HCPre→末HCPost；CSA/HCA/SWA子段已含于原层，wait和kernel_sum非互斥成本；不同token桶不可等同工作量",
             "stages_csv": str(destination), "layer_summary": layer_summary,
-            "stage_summary": sorted(summary, key=lambda row: (row["layer"], row["stage_order"]))}
+            "stage_summary": sorted(summary, key=lambda row: (row["role"], row["layer"], row["attention"], row["stage_order"]))}
+    if not with_swa_compat:
+        return diagnostic
+    swa_summary = [row for row in diagnostic["stage_summary"] if row["role"] == "draft" and row["attention"] == "SWA"]
+    swa_destination = Path(detail_dir) / (safe + "-" + suffix + "-swa-stages.csv")
+    write_csv(swa_destination, [{"rank": rank, **row} for row in stages
+                                if row["role"] == "draft" and row["attention"] == "SWA"])
+    swa = {"status": "MATCHED" if swa_summary and all(row["status"] == "MATCHED" for row in swa_summary) else "PARTIAL",
+           "scope": "源采样同rank逐层HCPre→末HCPost；SWA子段已含于原层，wait和kernel_sum非互斥成本；不同token桶不可等同工作量",
+           "stages_csv": str(swa_destination), "layer_summary": layer_summary, "stage_summary": swa_summary}
+    return diagnostic, swa
+
+
+def swa_analyze_capture(capture, measured, detail_dir):
+    """Compatibility report retaining only draft SWA stage rows and CSV."""
+    _, swa = layer_analyze_capture(capture, measured, detail_dir, with_swa_compat=True)
+    return swa
 
 
 def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, progress=None, case=None):
@@ -3276,9 +3315,9 @@ def iter_report_rows(report, kind):
             yield from ({'case': name, **item} for item in source['per_rank'])
         elif kind == 'components':
             yield from ({'case': name, **item} for item in source.get('class_stats', []))
-        elif kind == 'swa_stage_summary':
+        elif kind in ('layer_stage_summary', 'swa_stage_summary'):
             for capture in case.get('measurements', []):
-                diagnostic = capture.get('swa_diagnostics') or {}
+                diagnostic = capture.get('layer_diagnostics' if kind == 'layer_stage_summary' else 'swa_diagnostics') or {}
                 yield from ({'case': name, 'rank': capture['rank'], **item}
                             for item in diagnostic.get('stage_summary', []))
         elif kind in ('step_residual_windows', 'step_residual_summary', 'step_residual_sources',
@@ -3391,6 +3430,8 @@ def export_report(report, out, reference_rows, progress=None):
                   'step_residual_stages', 'step_residual_substages']
     if any('swa_diagnostics' in capture for case in report['cases'] for capture in case.get('measurements', [])):
         kinds += ['swa_stage_summary']
+    if any('layer_diagnostics' in capture for case in report['cases'] for capture in case.get('measurements', [])):
+        kinds += ['layer_stage_summary']
     for kind in kinds:
         write(kind + '.csv', lambda path, kind=kind:
               write_csv(path, lambda: iter_report_rows(report, kind), progress=progress))
