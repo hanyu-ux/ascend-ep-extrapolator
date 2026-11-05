@@ -4,7 +4,7 @@
 
 当前实现针对已核对的 **DSpark：源模型 8 个主层 + 3 个草稿层、每轮一次草稿 forward**。示例场景为 EP16 → EP128、主模型 8 → 61 层、草稿仍为 3 层。这是一套带明确假设的工程估算工具；输出不是目标 EP128 的实测性能，也不适用于任意模型和采样结构。
 
-**日常使用只需要根目录这4个程序/配置文件**，另行准备自己的采样数据和通信参考表。`tests/` 用于维护回归测试，`tools/` 是可选检查工具，均不参与默认估算流程。
+**日常使用需要根目录这4个程序/配置文件；使用方法2时，还须保留随仓提供的 `data/communication-reference.csv`**。另行准备自己的采样数据。`tests/` 用于维护回归测试，`tools/` 是可选检查工具，均不参与默认估算流程。
 
 ```text
 ascend-ep-extrapolator/
@@ -13,6 +13,7 @@ ascend-ep-extrapolator/
 ├── ep128_xlsx_writer.py              # XLSX 写入器
 ├── profile_ep128_cases.example.json  # 配置模板
 ├── README.md
+├── data/communication-reference.csv  # 方法2原始历史通信参考表
 ├── tests/                           # 回归测试
 ├── tools/                           # 可选检查工具
 ├── docs/                            # 详细说明、版本记录与 PPT
@@ -29,6 +30,7 @@ ascend-ep-extrapolator/
 | `build_ep128_leadership_excel.py` | 从核心报告生成 Excel 与配套 HTML，不重新估算 |
 | `ep128_xlsx_writer.py` | 标准库 XLSX 写入器，支持可编辑的原生条形图和折线图 |
 | `profile_ep128_cases.example.json` | 源/目标模型、拓扑、BS、草稿长度和有效输出长度的配置模板 |
+| `data/communication-reference.csv` | 方法2使用的原始历史通信参考表，模板已默认指向此文件 |
 | `examples/communication-reference.synthetic.csv` | **合成通信参考表**，仅演示格式和计算流程，不是历史硬件实测 |
 | `tests/test_ep128*.py` | 维护代码时检查统计、公式、展示和文件格式，不是运行时依赖 |
 | `tools/validate_ep128_capture.py` | 可选：独立核对原始采样和导出账本 |
@@ -48,10 +50,11 @@ ascend-ep-extrapolator/
    python -c "from shutil import copyfile; copyfile('profile_ep128_cases.example.json', 'cases.local.json')"
    ```
 
-2. 编辑 `cases.local.json`：把示例输入路径替换为自己的采样目录，并核对模型、拓扑和输出 token 口径。模板将通信表指向 `data/communication-reference.csv`，请放入可比较的真实历史参考表；缺表时方法2不可用，方法1仍可运行。仓库的合成表仅用于测试和格式演示。 示例数据路径可以采用以下结构；本仓库不提供原始采样：
+2. 编辑 `cases.local.json`：把示例输入路径替换为自己的采样目录，并核对模型、拓扑和输出 token 口径。模板将通信表指向随仓提供的 `data/communication-reference.csv`，配置副本仍放在仓库根目录时，无需另行复制通信表；使用前应核对历史表与本次场景的可比性。仓库的合成表仅用于测试和格式演示。示例数据路径可以采用以下结构；本仓库不提供原始采样：
 
    ```text
    data/
+     communication-reference.csv                  # 随仓提供，方法2使用
      bs8_s7/
        dp0/ASCEND_PROFILER_OUTPUT/kernel_details.csv
        dp0/ASCEND_PROFILER_OUTPUT/trace_view.json    # 可选，须为同次同 rank
@@ -73,7 +76,7 @@ ascend-ep-extrapolator/
    }
    ```
 
-   上面只演示两个输入；实际应列出本次采样的全局 rank。相对输入路径相对于 **cases JSON 所在目录**。如需显式指定 trace，可在对应 `inputs` 项增加 `trace_path`。
+   上面只演示两个输入；实际应列出本次采样的全局 rank。JSON 中的相对路径（包括 `communication_reference`）相对于 **cases JSON 所在目录**；命令行 `--comm-reference` 的相对路径相对于 **运行命令时的工作目录**。将配置移到其他目录时，应同步调整路径。如需显式指定 trace，可在对应 `inputs` 项增加 `trace_path`。
 
 3. 先核对输入清单，再运行统计：
 
@@ -164,15 +167,15 @@ W目标 = W源 + ΔDispatch + ΔCombine + Δ路由GMM
 
 方法2当前仅支持 EP16 → EP128。按匹配 BS 的 EP32/64/128 历史值，在 `log2(EP/32)` 轴做三点 OLS，再取“EP128 原参考值 / 拟合外推 EP16 值”作为通信比值。负载形状倍率为 `(K目标×H目标)/(K源×H源)`；示例 H 相同时简化为 TopK 倍率。
 
-方法2需要单独提供原始通信参考表，可由 `communication_reference` 或 `--comm-reference` 指定。表头为：
+方法2所用的原始历史通信参考表已随仓提供：[`data/communication-reference.csv`](data/communication-reference.csv)，模板通过 `communication_reference` 默认引用。表中包含 BS `1、2、4、8、16、32、48、64、96、128、192、256`；其他 BS 不会自动插值匹配。也可通过 `communication_reference` 或 `--comm-reference` 改用经过核对的其他参考表。随仓表头为：
 
 ```csv
-bs,ep32_send,ep64_send,ep128_send,ep32_return,ep64_return,ep128_return
+bs,ep32_send,ep32_return,ep32_total,ep64_send,ep64_return,ep64_total,ep128_send,ep128_return,ep128_total
 ```
 
 表中 `send` 对应 Dispatch，`return` 对应 Combine；同一 BS 必须唯一，值必须为正，且应保持可比较的共同单位。不要填写虚构参考值来解锁结果。没有表、BS 不匹配或拟合无效时，方法2显示 `UNAVAILABLE`，方法1仍可运行。
 
-仓库中的 [`communication-reference.synthetic.csv`](examples/communication-reference.synthetic.csv) 是明确标注的合成示例，不能作为真实通信参考或性能依据。将它与真实采样混用，得到的方法2数值也没有真实性能含义。使用自己的表时，例如：
+仓库中的 [`communication-reference.synthetic.csv`](examples/communication-reference.synthetic.csv) 是另行生成的合成示例，不能替代上述真实参考表或作为性能依据。将它与真实采样混用，得到的方法2数值也没有真实性能含义。从仓库根目录显式指定随仓参考表，例如：
 
 ```bash
 python -u profile_ep128.py cases.local.json --comm-reference data/communication-reference.csv --out ep128_report --excel
@@ -237,7 +240,7 @@ PPT 使用可编辑形状和文字，展示源8+3周期、层区间边界、层�
 
 后续脚本迭代统一使用 **新分支 → 提 PR → 验证 → 合并 PR**。PR 说明脚本功能、统计口径和软件回归结果；验证通过后按仓库所有者授权直接合并。运行时性能优化还须在本地完成正确性与设备 A/B 验证，详细采样证据和优化分析不上传。
 
-远端只维护脚本、测试、通用使用说明和既有 PPT 归档。详细 profiling 分析、实测数据与优化方案保存在本地，不提交到仓库或 PR 正文。
+远端维护脚本、测试、通用使用说明、既有 PPT 归档，以及经仓库所有者明确授权的 `data/communication-reference.csv`。详细 profiling 分析、其他原始实测数据与优化方案保存在本地，不提交到仓库或 PR 正文。
 
 日常统计无需执行测试。维护代码时，在仓库根目录运行：
 

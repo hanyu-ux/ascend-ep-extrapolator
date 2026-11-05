@@ -15,8 +15,11 @@ htmlcov/
 *.local.json
 cases.local*.json
 
+# Only the required historical communication table is versioned under data/.
+/data/*
+!/data/communication-reference.csv
+
 # Raw profiling data and generated reports
-data/
 raw/
 profiles/
 ep128_report/

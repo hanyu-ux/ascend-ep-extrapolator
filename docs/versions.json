@@ -51,8 +51,8 @@
     }
   ],
   "portability_changes": [
-    "Example capture and real communication-reference paths are repository-relative placeholders.",
-    "Tests use a newly generated synthetic communication table; no historical measured values were copied.",
+    "Example capture paths remain repository-relative placeholders; the method2 reference path resolves to the bundled data/communication-reference.csv.",
+    "Regression fixtures use the synthetic communication table; the original historical input is archived separately under data/.",
     "Tests requiring private capture fixtures are skipped when those fixtures are absent.",
     "The original machine-specific test import fallback was removed.",
     "Regression tests were grouped under tests/ and optional standalone checks under tools/; runtime scripts and presentation assets are unchanged.",
@@ -65,6 +65,29 @@
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,
       "optional_openpyxl_in_standard_library_only_mode": 2
+    }
+  },
+  "reference_inputs": {
+    "data/communication-reference.csv": {
+      "kind": "original_historical_communication_reference",
+      "source": "ep_comm_reference_20261028/raw.csv",
+      "sha256": "641647ae528dc449c5218793121bed38517ca72fa2ee398a1f11cd75e4f4c109",
+      "bytes": 803,
+      "bs": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        48,
+        64,
+        96,
+        128,
+        192,
+        256
+      ],
+      "added_at": "2026-11-05"
     }
   }
 }
