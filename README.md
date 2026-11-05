@@ -42,7 +42,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-外推程序与展示程序应放在同一目录。当前版本：外推统计 `20261105.1.layer_stage_charts`、Excel 生成器 `20261105.1.method_stage_charts`、写入器 `20261104.1.line_charts`；独立 Host 统计 `20261105.1.generic_host`。
+外推程序与展示程序应放在同一目录。当前版本：外推统计 `20261105.1.layer_stage_charts`、Excel 生成器 `20261105.1.method_stage_charts`、写入器 `20261104.1.line_charts`；独立 Host 统计 `20261105.2.subnanosecond_trace`。
 
 ## 只分析实测 Host 耗时
 

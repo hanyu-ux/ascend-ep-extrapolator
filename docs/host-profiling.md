@@ -31,6 +31,8 @@ python profile_host.py /path/to/trace_view.json \
 
 输入 `ts`/`dur` 默认按微秒解析。只有确认导出时间单位不同才使用 `--time-unit ns` 或 `--time-unit ms`；修改这个选项不会改变窗口参数的微秒单位。
 
+输入时间先用 Decimal 读取。合法亚纳秒时间不会丢弃：起点及原始起点加时长得到的终点，分别按 `ROUND_HALF_EVEN` 量化至最近整数纳秒；每个端点误差至多 0.5 ns，单次时长误差至多 1 ns。量化数量及实际最大端点误差保留在 `source.time_quantization`，同时展示诊断；这不表示采样具有纳秒级物理准确度。负时长、非有限数值和越界时间仍视为非法。显式窗口参数要求精确到整数纳秒。
+
 工具按事件类别和进程信息识别 Host/设备。自定义 trace 缺少这些标记时，可明确指定进程 PID；每个选项可重复使用。PID 必须来自该 trace 的 `pid` 字段，不是按进程名字猜测的系统 PID。
 
 ```bash
