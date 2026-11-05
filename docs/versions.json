@@ -15,7 +15,7 @@
     },
     "build_ep128_leadership_excel.py": {
       "version": "20261105.2.target_layer_stages",
-      "sha256": "3f92d00e6210e5cdd23dccb717e971b36351e37456fea16d7877dfaab044d317",
+      "sha256": "a1150feda9c8a00983a6351ca33ad2841ed742d03155d8ba782483d02d19e875",
       "imported_version": "20261104.2.bs_inventory",
       "imported_sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
       "matches_imported_source": false
@@ -60,8 +60,8 @@
     "Main CSA/HCA and draft SWA retain per-layer source evidence. Both method sheets now show core-provided target ten-stage estimates, target same-type all-layer totals and complete-cycle shares; only Dispatch, Combine and routed-GMM deltas modify source spans. The two U drill-downs remain measured and retained once. Parent cycle, TPOT, throughput and rank-selection formulas are unchanged; missing stage evidence only disables the affected target drill-down."
   ],
   "validation": {
-    "discovered_tests": 271,
-    "passed": 261,
+    "discovered_tests": 272,
+    "passed": 262,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,

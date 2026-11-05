@@ -1417,6 +1417,20 @@ class LayerMeanRendererTests(unittest.TestCase):
                 self.assertIsNotNone(rendered[2]['series'])
                 self.assertIn('未绘图', rendered[0]['note'])
 
+    def test_explicit_core_reference_layers_are_displayed_without_renderer_exclusions(self):
+        report = full_layer_drilldown_report()
+        case = report['cases'][0]
+        case['config']['exclude_target_layers'] = []
+        method = case['projection']['layer_mean_methods'][0]
+        parent = next(row for row in method['class_means'] if row['attention'] == 'HCA')
+        group = next(row for row in method['target_stage_breakdowns'] if row['attention'] == 'HCA')
+        parent['reference_layers'] = group['reference_layers'] = [0, 1, 3, 5, 7]
+        rendered = renderer._method_expansion_data(case, method)[1]
+        self.assertIsNotNone(rendered['series'])
+        self.assertIn('[0,1,3,5,7]', rendered['note'])
+        self.assertNotIn('主0排除', rendered['note'])
+        self.assertEqual(rendered['series'][0][1], [row['target_total_ms'] for row in group['stage_rows']])
+
     def test_optional_input_anchors_and_dynamic_metadata_counts_use_observed_stage_order(self):
         report = drilldown_report()
         for capture in report['cases'][0]['measurements']:

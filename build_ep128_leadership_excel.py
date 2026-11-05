@@ -916,9 +916,9 @@ def _target_layer_expansion_data(method, role, attention, title):
     references, count, rounds = group.get("reference_layers"), group.get("target_layers"), group.get("rounds")
     valid_references = (isinstance(references, list) and bool(references)
                         and all(type(layer) is int and layer >= 0 for layer in references)
-                        and len(set(references)) == len(references) and (role != "main" or 0 not in references))
+                        and len(set(references)) == len(references))
     if not valid_references or type(count) is not int or count <= 0 or type(rounds) is not int or rounds <= 0:
-        problems.append("参考层、目标层数或保留轮次无效；主0不得参与目标参考")
+        problems.append("参考层、目标层数或保留轮次无效")
     classes = [item for item in method.get("class_means") or []
                if item.get("role") == role and item.get("attention") == attention]
     matching = classes[0] if len(classes) == 1 else {}
@@ -963,7 +963,7 @@ def _target_layer_expansion_data(method, role, attention, title):
     result["note"] = ("参考层=" + _text(references) + "；目标层数=" + _text(count) + "；保留轮次=" + _text(rounds)
                       + "；源单层跨度=" + _text(group.get("source_wall_ms")) + " ms；目标单层跨度="
                       + _text(group.get("target_wall_ms")) + " ms；目标同类全部层=" + _text(group.get("target_total_ms")) + " ms/完整周期。"
-                      + ("主0排除外推参考；逐源层诊断保留在层与组件实测。" if role == "main" else "草稿同类目标层数由核心提供。")
+                      + ("主模型参考层由核心给定，实际层号见清单；逐源层诊断保留在层与组件实测。" if role == "main" else "草稿同类目标层数由核心提供。")
                       + "Dispatch/Combine增量分别落在对应阶段；专家只追加路由GMM增量，激活与衔接不整体倍增；其他阶段保持核心给定值。"
                       + ("核心说明：" + _text(group["note"]) if group.get("note") else ""))
     if problems:
