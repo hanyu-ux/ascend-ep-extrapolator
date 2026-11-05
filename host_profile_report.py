@@ -13,6 +13,18 @@ from pathlib import Path
 PREVIEW_ROWS = 50
 UNAVAILABLE = "未采集 / 不可用"
 
+LEDGER_TABLES = {
+    "time_ledger": ("time_ledger.csv", [
+        "capture_label", "device_pid", "start_ns", "end_ns", "total_ns", "total_ms", "closed",
+        "closure_error_ns", "key", "label", "duration_ns", "duration_ms", "share", "segment_count"]),
+    "time_ledger_details": ("time_ledger_details.csv", [
+        "capture_label", "device_pid", "start_ns", "end_ns", "total_ns", "total_ms", "parent_key",
+        "key", "label", "components", "duration_ns", "duration_ms", "share", "segment_count"]),
+    "time_ledger_coverage": ("time_ledger_coverage.csv", [
+        "capture_label", "device_pid", "start_ns", "end_ns", "total_ns", "total_ms",
+        "key", "label", "duration_ns", "duration_ms", "share"]),
+}
+
 # Stable CSV field names also make these exports usable outside the workbook.
 TABLES = {
     "threads": ("threads.csv", "Host 线程轨道", [
@@ -197,6 +209,119 @@ def _chart_html(rows, topic="线程内热点"):
     return "".join(parts)
 
 
+def _ledger_name(ledger):
+    pid = ledger.get("device_pid")
+    name = "仅 Host 采样" if pid is None else "设备 PID " + str(pid)
+    return str(ledger["capture_label"]) + " · " + name if ledger.get("capture_label") else name
+
+
+def _share(value):
+    return format(value * 100, ".3f") + "%" if _number(value) else UNAVAILABLE
+
+
+def _component_labels(ledger, row):
+    if row.get("preview_remaining_count"):
+        return "已识别组合的合计；完整组合逐项见 CSV"
+    labels = {item["key"]: item.get("label", item["key"])
+              for item in ledger.get("classifications", []) if "key" in item}
+    return " + ".join(labels.get(key, key) for key in row.get("components", []))
+
+
+def _ledger_overlap_preview(ledger):
+    """Keep truncated previews reconciled to each overlap parent using exact ns."""
+    overlaps = [row for row in ledger.get("details", [])
+                if row.get("parent_key") in ("device_overlap", "host_overlap")]
+    ordered = sorted(overlaps, key=lambda row: row.get("duration_ns", 0), reverse=True)
+    shown = ordered[:PREVIEW_ROWS]
+    remaining = ordered[PREVIEW_ROWS:]
+    labels = {row.get("key"): row.get("label", row.get("key")) for row in ledger.get("breakdown", [])}
+    for parent in ("device_overlap", "host_overlap"):
+        children = [row for row in remaining if row.get("parent_key") == parent]
+        if not children:
+            continue
+        duration = sum(row["duration_ns"] for row in children)
+        counts = [row.get("segment_count") for row in children]
+        count = sum(counts) if all(type(value) is int for value in counts) else None
+        shown.append({"key": parent + "_preview_remaining", "parent_key": parent,
+                      "label": str(labels.get(parent, parent)) + " · 其余" + str(len(children))
+                               + "种已识别重叠组合（完整见 CSV）",
+                      "components": [], "duration_ns": duration, "duration_ms": duration / 1_000_000,
+                      "share": duration / ledger["total_ns"] if ledger.get("total_ns", 0) > 0 else 0,
+                      "segment_count": count, "preview_remaining_count": len(children)})
+    return len(overlaps), min(PREVIEW_ROWS, len(overlaps)), shown
+
+
+def _ledger_rows(report, section):
+    """Flatten a complete ledger section without applying preview limits."""
+    for ledger in report.get("time_ledgers", []):
+        context = {field: ledger.get(field) for field in
+                   ("capture_label", "device_pid", "start_ns", "end_ns", "total_ns", "total_ms", "closed", "closure_error_ns")}
+        for row in ledger.get(section, []):
+            yield dict(context, **row)
+
+
+def _ledger_table_html(rows, *, components=False, ledger=None):
+    parts = ['<div class="table-scroll"><table><thead><tr><th>时间归属</th>']
+    if components:
+        parts.append("<th>同时存在的类别</th>")
+    parts.append("<th>耗时（ms）</th><th>占完整窗口</th><th>区间数</th><th>耗时（ns，精确账本）</th></tr></thead><tbody>")
+    for row in rows:
+        parts.append("<tr><td>" + _escape(row.get("label", row.get("key"))) + "</td>")
+        if components:
+            parts.append("<td>" + _escape(_component_labels(ledger or {}, row)) + "</td>")
+        parts.append("<td>" + _escape(row.get("duration_ms")) + "</td><td>"
+                     + _escape(_share(row.get("share"))) + "</td><td>"
+                     + _escape(row.get("segment_count")) + "</td><td>"
+                     + _escape(row.get("duration_ns")) + "</td></tr>")
+    parts.append("</tbody></table></div>")
+    return "".join(parts)
+
+
+def _ledger_html(report):
+    """Render closed whole-window ledgers; reused by local multi-capture views."""
+    ledgers = report.get("time_ledgers", [])
+    if not ledgers:
+        return ""
+    parts = ['<section id="time-ledger"><h2>主时间账本：互斥、完整覆盖</h2>',
+             "<p>以下主表各段互斥，相加等于完整分析窗口。同一时刻先计设备记录；设备没有记录时才计 Host 可见调用，双方均无记录则计未观测区间。",
+             "不同设备 PID 各自拥有一份完整窗口，不能跨设备相加。类别来自事件名称与类型，尚未识别的业务含义保留为其他类。</p>",
+             "<p>同一时刻存在多个设备类别时单列“设备多类别重叠”；没有设备记录但多个 Host 类别重叠时也单列。",
+             "单类别设备行只计没有其他设备类别重叠的区间；该类别在重叠段内的时间已计入重叠父项，不在单类别行重复计入。",
+             "下方的组合明细只展开这些父项，不能再次加到主表。Host 调用可含等待，设备记录可含等待任务；这些占比不是 CPU 或 NPU 利用率。</p>"]
+    for index, ledger in enumerate(ledgers, 1):
+        parts.append('<h3 id="time-ledger-' + str(index) + '">' + _escape(_ledger_name(ledger)) + "</h3><p>窗口："
+                     + _escape(ledger.get("start_ns")) + " → " + _escape(ledger.get("end_ns"))
+                     + " ns；总时间 <strong>" + _escape(ledger.get("total_ms"))
+                     + " ms</strong>（" + _escape(ledger.get("total_ns")) + " ns）。闭合："
+                     + _escape(ledger.get("closed")) + "；闭合误差 "
+                     + _escape(ledger.get("closure_error_ns")) + " ns。</p>")
+        rows = ledger.get("breakdown", [])
+        parts.append(_ledger_table_html(rows))
+        parts.append('<div class="ledger-bars" aria-label="占完整分析窗口的互斥耗时">')
+        for row in rows:
+            width = min(100, max(0, row["share"] * 100)) if _number(row.get("share")) else 0
+            parts.append('<div class="bar-row"><span class="bar-label">' + _escape(row.get("label", row.get("key")))
+                         + '</span><div class="bar-track"><div class="bar" style="width:'
+                         + format(width, ".6f") + '%"></div></div><span>'
+                         + _escape(row.get("duration_ms")) + " ms · "
+                         + _escape(_share(row.get("share"))) + "</span></div>")
+        parts.append("</div><h4>记录覆盖状态（辅助视角）</h4><p>这张表也覆盖同一窗口，表示两侧记录是否同时存在；与主表是同一段时间的不同视角，不能合并相加。</p>")
+        parts.append('<div class="table-scroll"><table><thead><tr><th>状态</th><th>耗时（ms）</th><th>占完整窗口</th></tr></thead><tbody>')
+        for row in ledger.get("coverage_states", []):
+            parts.append("<tr><td>" + _escape(row.get("label", row.get("key")))
+                         + "</td><td>" + _escape(row.get("duration_ms")) + "</td><td>"
+                         + _escape(_share(row.get("share"))) + "</td></tr>")
+        parts.append("</tbody></table></div>")
+        overlap_count, preview_count, shown = _ledger_overlap_preview(ledger)
+        if overlap_count:
+            parts.append("<details><summary>展开并行与重叠组合明细（" + str(preview_count) + " / "
+                         + str(overlap_count) + " 项）</summary><p>各组合彼此互斥，是主表重叠父项的子集；占比仍以完整窗口为分母。超出预览的组合按父项分别合计为“其余已识别组合”，因此可见行仍与父项对账。完整明细见 time_ledger_details.csv / JSON。</p>")
+            parts.append(_ledger_table_html(shown, components=True, ledger=ledger))
+            parts.append("</details>")
+    parts.append("</section>")
+    return "".join(parts)
+
+
 def _summary_rows(report):
     summary = report.get("summary", {})
     scope = report.get("scope", {})
@@ -246,6 +371,7 @@ BASE_SEMANTICS = [
     "设备无记录区间只表示本次 trace 未记录该设备任务，不证明设备空闲；与 Host 重叠不证明由 Host 导致。",
     "同步 API 可能正在等待设备；AICPU 属于设备侧，不能合并到服务器 Host CPU 计算中。",
     "未采集或不可关联项保留为空 / 不可用。没有步骤标注时，整个采样范围不代表一个请求或一轮解码。",
+    "主时间账本按同一窗口的活动类别取互斥区间：先设备、无设备记录时再 Host、双方无记录时为未观测；多类别同时存在单列重叠项。账本占比不是硬件利用率或完整业务阶段识别。",
 ]
 
 
@@ -264,12 +390,13 @@ def _render_html(report):
              '.table-scroll{overflow:auto}table{border-collapse:collapse;width:100%}'
              'th,td{border:1px solid #d2dde8;padding:8px;text-align:left;vertical-align:top;min-width:80px;overflow-wrap:anywhere}'
              'th{background:#173451;color:white}tbody tr:nth-child(even){background:#f4f7fa}'
-             '.summary td:first-child{width:38%}.bar-row{display:grid;grid-template-columns:minmax(180px,40%) 1fr 120px;gap:12px;align-items:center;margin:9px 0}'
+             '.summary td:first-child{width:38%}.bar-row{display:grid;grid-template-columns:minmax(180px,40%) 1fr 190px;gap:12px;align-items:center;margin:9px 0}'
              '.bar-label{overflow-wrap:anywhere}.bar-track{background:#edf2f7;height:18px}.bar{height:18px;background:#167d8d}'
              'a{color:#126c9b}@media(max-width:700px){main{padding:12px}.bar-row{grid-template-columns:1fr}.bar-track{height:14px}}',
              '</style></head><body><main><h1>Host 采样实测分析</h1>',
-             '<p>独立的 Host / 设备记录分析；覆盖范围与缺失证据随报告保留。</p>',
-             '<section><h2>总览</h2><table class="summary"><tbody>']
+             '<p>先看主时间账本的整体耗时构成，再查看 Host 热点；热点是辅助视角，不能再次加到账本。</p>']
+    parts.append(_ledger_html(report))
+    parts.append('<section><h2>总览</h2><table class="summary"><tbody>')
     for label, value in _summary_rows(report):
         parts.append("<tr><td>" + _escape(label) + "</td><td>" + _escape(value) + "</td></tr>")
     parts.append("</tbody></table></section><section><h2>统计口径</h2><ul>")
@@ -359,13 +486,116 @@ def _xlsx_chart(sheet, sheet_name, rows, last, topic="线程内热点"):
                         categories_ref=sheet_ref + cell_reference(start + 1, 1, True) + ":" + cell_reference(end, 1, True))
 
 
+def _write_ledger_sheets(workbook, report, sheet_name="主时间账本", details_sheet_name="并行与重叠明细"):
+    """Add exact main totals plus bounded overlap previews; keep each device separate."""
+    from ep128_xlsx_writer import cell_reference
+
+    ledgers = report.get("time_ledgers", [])
+    if not ledgers:
+        return None
+    sheet = workbook.add_sheet(sheet_name, widths=[46, 20, 16, 15, 28, 54, 4, *([17] * 8)])
+    detail = workbook.add_sheet(details_sheet_name, widths=[40, 56, 20, 16, 15, 28])
+    sheet.merge(1, 1, 1, 16, "整体耗时构成：各段互斥、完整覆盖", "title").row_height(1, 36)
+    sheet.merge(2, 1, 2, 16,
+                "每份账本以完整分析窗口为 100%；设备类别优先，无设备记录时才计 Host 调用，其余计未观测。多个设备 / 采样独立展示，不能相加。", "note").row_height(2, 34)
+    sheet.merge(3, 1, 3, 16,
+                "单类别设备行仅计无其他设备类别重叠的区间，重叠部分在另一 sheet 展开，不重复相加。Host / 设备记录均可含等待；占比不是 CPU / NPU 利用率。", "note").row_height(3, 42)
+    detail.merge(1, 1, 1, 6, "并行与重叠明细：主表父项展开", "title").row_height(1, 36)
+    detail.merge(2, 1, 2, 6,
+                 "此处组合是主时间账本重叠项的子集，不能重复加回主表；覆盖状态是同一窗口的另一视角。占比均以各自完整窗口为分母。", "note").row_height(2, 38)
+    row, detail_row = 5, 4
+    for ledger in ledgers:
+        title = _ledger_name(ledger)
+        sheet.merge(row, 1, row, 16, _excel_value(title), "section").row_height(row, 28)
+        row += 1
+        sheet.merge(row, 1, row, 16, _excel_value(
+            "窗口 " + str(ledger.get("start_ns")) + " → " + str(ledger.get("end_ns"))
+            + " ns；总时间 " + _display(ledger.get("total_ms")) + " ms（"
+            + str(ledger.get("total_ns")) + " ns）；闭合：" + _display(ledger.get("closed"))
+            + "；闭合误差 " + str(ledger.get("closure_error_ns")) + " ns。"), "note").row_height(row, 30)
+        row += 1
+        for col, label in enumerate(("时间归属", "耗时（ms）", "占完整窗口", "区间数", "精确耗时（ns）", "图表标签（含占比）"), 1):
+            sheet.write(row, col, label, "header")
+        first = row + 1
+        items = ledger.get("breakdown", [])
+        for item in items:
+            row += 1
+            label = item.get("label", item.get("key"))
+            sheet.write(row, 1, _excel_value(label), "body")
+            for col, key, style in ((2, "duration_ms", "number"), (3, "share", "percent"),
+                                    (4, "segment_count", "integer"), (5, "duration_ns", "integer")):
+                value = _excel_value(item.get(key))
+                sheet.write(row, col, value, style if _number(value) else "body")
+            sheet.write(row, 6, _excel_value(str(label) + " · " + _share(item.get("share"))), "body")
+            sheet.row_height(row, 30)
+        last = row
+        row += 1
+        sheet.write(row, 1, "完整窗口合计", "label")
+        sheet.write(row, 2, _excel_value(ledger.get("total_ms")), "total")
+        sheet.write(row, 3, 1 if ledger.get("total_ns", 0) > 0 else 0, "percent")
+        sheet.write(row, 5, _excel_value(ledger.get("total_ns")), "integer")
+        chart_end = first
+        if items and all(_number(item.get("duration_ms")) for item in items):
+            chart_end = first + max(22, len(items) + 5)
+            reference = "'" + sheet_name.replace("'", "''") + "'!"
+            sheet.add_bar_chart(_excel_value(title + "：完整窗口耗时构成"),
+                                [str(item.get("label", item.get("key"))) + " · " + _share(item.get("share")) for item in items],
+                                [{"name": "互斥区间（ms）", "values": [item["duration_ms"] for item in items],
+                                  "values_ref": reference + cell_reference(first, 2, True) + ":" + cell_reference(last, 2, True)}],
+                                (first - 1, 8, chart_end, 16), stacked=False,
+                                x_axis_title="耗时（ms）；类别标注占完整窗口比例",
+                                categories_ref=reference + cell_reference(first, 6, True) + ":" + cell_reference(last, 6, True))
+        row = max(row + 3, chart_end + 2)
+
+        detail.merge(detail_row, 1, detail_row, 6, _excel_value(title), "section").row_height(detail_row, 28)
+        detail_row += 1
+        overlap_count, preview_count, shown = _ledger_overlap_preview(ledger)
+        detail.merge(detail_row, 1, detail_row, 6,
+                     "重叠组合预览 " + str(preview_count) + " / " + str(overlap_count)
+                     + " 项；其余组合按父项分别合计，保持可见行与父项对账。完整聚合及单类别明细见 time_ledger_details.csv / JSON。", "note").row_height(detail_row, 48)
+        detail_row += 1
+        for col, label in enumerate(("主表父项 / 组合", "同时存在的类别", "耗时（ms）", "占完整窗口", "区间数", "精确耗时（ns）"), 1):
+            detail.write(detail_row, col, label, "header")
+        for item in shown:
+            detail_row += 1
+            detail.write(detail_row, 1, _excel_value(item.get("label", item.get("key"))), "body")
+            detail.write(detail_row, 2, _excel_value(_component_labels(ledger, item)), "body")
+            for col, key, style in ((3, "duration_ms", "number"), (4, "share", "percent"),
+                                    (5, "segment_count", "integer"), (6, "duration_ns", "integer")):
+                value = _excel_value(item.get(key))
+                detail.write(detail_row, col, value, style if _number(value) else "body")
+            detail.row_height(detail_row, 38)
+        if not shown:
+            detail_row += 1
+            detail.merge(detail_row, 1, detail_row, 6, "本窗口没有多类别重叠组合。", "note")
+        detail_row += 2
+        detail.merge(detail_row, 1, detail_row, 6, "记录覆盖状态（辅助视角；不能与主表相加）", "section")
+        detail_row += 1
+        for col, label in enumerate(("覆盖状态", "", "耗时（ms）", "占完整窗口", "", "精确耗时（ns）"), 1):
+            detail.write(detail_row, col, label, "header")
+        for item in ledger.get("coverage_states", []):
+            detail_row += 1
+            detail.merge(detail_row, 1, detail_row, 2, _excel_value(item.get("label", item.get("key"))), "body")
+            for col, key, style in ((3, "duration_ms", "number"), (4, "share", "percent"), (6, "duration_ns", "integer")):
+                value = _excel_value(item.get(key))
+                detail.write(detail_row, col, value, style if _number(value) else "body")
+            detail.row_height(detail_row, 30)
+        detail_row += 3
+    sheet.freeze(4, 0)
+    detail.freeze(3, 0)
+    return sheet, detail
+
+
 def _write_xlsx(report, path):
     from ep128_xlsx_writer import Workbook
 
     workbook = Workbook()
+    _write_ledger_sheets(workbook, report)
     overview = workbook.add_sheet("总览", widths=[46, 34, 24, 24, 24, 24])
     overview.merge(1, 1, 1, 6, "Host 采样实测分析", "title").row_height(1, 36)
-    overview.merge(2, 1, 2, 6, "模型和硬件来自用户声明；本报告不计算外推指标。", "note").row_height(2, 28)
+    overview.merge(2, 1, 2, 6,
+                   "整体耗时构成见“主时间账本”；热点和覆盖统计为辅助视角。模型和硬件来自用户声明，本报告不计算外推指标。"
+                   if report.get("time_ledgers") else "模型和硬件来自用户声明；本报告不计算外推指标。", "note").row_height(2, 34)
     row = 4
     for label, value in _summary_rows(report):
         overview.write(row, 1, label, "label")
@@ -442,6 +672,8 @@ def write_reports(report, out, *, excel=False):
     out = Path(out).resolve()
     filenames = ["host_profile_report.json", "host_profile_report.html"]
     filenames.extend(spec[0] for spec in TABLES.values())
+    ledger_exports = LEDGER_TABLES if report.get("time_ledgers") else {}
+    filenames.extend(spec[0] for spec in ledger_exports.values())
     if excel:
         filenames.append("host_profile_report.xlsx")
     source = report.get("source", {}).get("path")
@@ -474,6 +706,15 @@ def write_reports(report, out, *, excel=False):
                                    limits.get(singular + "_rows_total", len(rows)), len(rows)])
                 writer.writerow(values)
         artifacts[Path(filename).stem + "_csv"] = str(path)
+    sections = {"time_ledger": "breakdown", "time_ledger_details": "details", "time_ledger_coverage": "coverage_states"}
+    for key, (filename, fields) in ledger_exports.items():
+        path = out / filename
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(fields)
+            for row in _ledger_rows(report, sections[key]):
+                writer.writerow([_csv_value(row.get(field)) for field in fields])
+        artifacts[key + "_csv"] = str(path)
     html_path = out / "host_profile_report.html"
     html_path.write_text(_render_html(report), encoding="utf-8")
     artifacts["html"] = str(html_path)

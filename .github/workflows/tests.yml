@@ -30,4 +30,4 @@ jobs:
         with:
           python-version: '3.12'
       - name: Check measured Host reports on Windows
-        run: python -B -S -m unittest discover -s tests -p 'test_ep128_host_profile.py' -v
+        run: python -B -S -m unittest discover -s tests -p 'test_ep128_host*.py' -v
