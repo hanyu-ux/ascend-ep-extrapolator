@@ -299,7 +299,7 @@ def _render_html(report):
         parts.append("<tr>" + "".join("<td>" + _escape(diagnostic.get(key)) + "</td>"
                                         for key in ("code", "count", "message")) + "</tr>")
     parts.append("</tbody></table><h3>原始输入</h3><table><tbody>")
-    for key in ("path", "sha256", "bytes_read", "parser_max_buffer_chars"):
+    for key in ("path", "sha256", "bytes_read", "parser_max_buffer_chars", "time_quantization"):
         parts.append("<tr><td>" + _escape(key) + "</td><td>"
                      + _escape(report.get("source", {}).get(key)) + "</td></tr>")
     parts.append('</tbody></table><p><a href="host_profile_report.json">完整结构化报告 JSON</a></p></section></main></body></html>')
@@ -386,7 +386,7 @@ def _write_xlsx(report, path):
         overview.merge(row, 3, row, 6, _excel_value(item.get("message")), "body").row_height(row, 40)
     row += 2
     overview.merge(row, 1, row, 6, "原始输入", "section")
-    for key in ("path", "sha256", "bytes_read", "parser_max_buffer_chars"):
+    for key in ("path", "sha256", "bytes_read", "parser_max_buffer_chars", "time_quantization"):
         row += 1
         overview.write(row, 1, key, "label")
         overview.merge(row, 2, row, 6, _excel_value(report.get("source", {}).get(key)), "body").row_height(row, 40)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Model-independent, measured Host timeline analysis (standard library only).
 
-Chrome/Ascend trace timestamps are decoded as Decimal and stored as integer ns.
+Chrome/Ascend trace endpoints are decoded as Decimal and quantized to integer ns.
 Raw events spill to a temporary SQLite database; no model/draft/HC rules apply.
 """
 import argparse
@@ -10,7 +10,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict
 from contextlib import closing
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from functools import lru_cache
 import heapq
 import json
@@ -23,12 +23,13 @@ import tempfile
 from profile_ep128 import residual_args, residual_iter_trace_events
 
 
-HOST_VERSION = "20261105.1.generic_host"
+HOST_VERSION = "20261105.2.subnanosecond_trace"
 DETAIL_LIMIT = 1000
 HOST_KINDS = ("cpu", "python", "annotation", "runtime", "sync", "copy", "enqueue", "dequeue")
 CPU_KINDS = ("cpu", "python", "annotation")
 SEMANTICS = [
     "本报告仅统计所选 trace 中可见的实测区间，不执行层数、EP 或 token 外推。",
+    "trace 起止时间以 Decimal 读取，再分别按 ROUND_HALF_EVEN 量化至整数纳秒；每个端点误差至多 0.5 ns，单次时长误差至多 1 ns，量化数量在诊断中保留。",
     "Host inclusive 是调用跨度；self 是同一 pid/tid 轨道内扣除嵌套子调用后的跨度，均非 OS 实际运行时间。",
     "调用跨度可包含等待、抢占和同步；无系统调度采样时，CPU 忙时与利用率不可用。",
     "线程轨道覆盖合计不是物理线程 CPU 工作量：CANN 与 Python 可能使用不同合成 pid 表示同一 OS 线程。",
@@ -41,16 +42,24 @@ SEMANTICS = [
 ]
 
 
-def _ns(value, factor=1000):
+def _scaled_ns(value, factor=1000):
     if isinstance(value, bool) or value is None:
         raise ValueError("timestamp/duration must be a finite number")
     try:
         number = Decimal(str(value)) * factor
-        if not number.is_finite() or number != number.to_integral_value() or abs(number) >= 2 ** 63:
-            raise ValueError("timestamp/duration is nonfinite, sub-ns or outside int64")
-        return int(number)
+        if not number.is_finite() or abs(number) >= 2 ** 63:
+            raise ValueError("timestamp/duration is nonfinite or outside int64")
+        return number
     except InvalidOperation as error:
         raise ValueError("invalid timestamp/duration") from error
+
+
+def _ns(value, factor=1000):
+    """Explicit CLI windows retain strict, exact integer-ns coordinates."""
+    number = _scaled_ns(value, factor)
+    if number != number.to_integral_value():
+        raise ValueError("explicit timestamp has sub-ns precision")
+    return int(number)
 
 
 def _identity(value):
@@ -166,6 +175,7 @@ def _ingest(db, path, factor, diagnostics, progress):
     """)
     processes, threads, scan, phases = {}, {}, {}, Counter()
     batch, edge_batch, flow_batch = [], [], []
+    max_rounding_error = Decimal(0)
 
     def flush():
         db.executemany("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
@@ -190,18 +200,29 @@ def _ingest(db, path, factor, diagnostics, progress):
         try:
             if not pid or not tid:
                 raise ValueError("pid/tid missing")
-            start = _ns(event.get("ts"), factor)
-            duration = _ns(event.get("dur"), factor) if phase == "X" else 0
-            if duration < 0 or abs(start + duration) >= 2 ** 63:
+            raw_start = _scaled_ns(event.get("ts"), factor)
+            raw_duration = _scaled_ns(event.get("dur"), factor) if phase == "X" else Decimal(0)
+            raw_end = raw_start + raw_duration
+            # Validate the raw duration before rounding: a negative fraction
+            # must not become a legitimate zero-duration event.
+            if raw_duration < 0 or abs(raw_end) >= 2 ** 63:
                 raise ValueError("invalid duration/end")
+            start = int(raw_start.to_integral_value(rounding=ROUND_HALF_EVEN))
+            end = int(raw_end.to_integral_value(rounding=ROUND_HALF_EVEN))
+            if abs(start) >= 2 ** 63 or abs(end) >= 2 ** 63:
+                raise ValueError("rounded timestamp outside int64")
         except (ValueError, ArithmeticError):
             diagnostics["INVALID_EVENT"] += 1
             continue
+        error = max(abs(raw_start - start), abs(raw_end - end))
+        if error:
+            diagnostics["SUB_NS_QUANTIZATION"] += 1
+            max_rounding_error = max(max_rounding_error, error)
         conn = _connection(args.get("connectionid"))
         corr = _connection(args.get("correlationid"))
         task = str(args.get("tasktype", ""))
         if phase == "X":
-            batch.append((number, pid, tid, name, cat, start, start + duration, None, conn, corr, task, None, None))
+            batch.append((number, pid, tid, name, cat, start, end, None, conn, corr, task, None, None))
         elif phase in ("B", "E"):
             edge_batch.append((number, pid, tid, name, cat, start, phase, conn, corr, task))
         else:
@@ -239,6 +260,9 @@ def _ingest(db, path, factor, diagnostics, progress):
     diagnostics["UNMATCHED_BEGIN"] += len(pending)
     flush()
     scan["phase_counts"] = dict(phases)
+    scan["time_quantization"] = {"unit": "ns", "rounding": "ROUND_HALF_EVEN",
+        "quantized_events": diagnostics["SUB_NS_QUANTIZATION"],
+        "max_endpoint_rounding_error_ns": float(max_rounding_error)}
     scan["unsupported_phase_events"] = sum(count for ph, count in phases.items()
         if ph not in ("M", "X", "B", "E", "s", "f", "t"))
     diagnostics["UNSUPPORTED_PHASE"] += scan["unsupported_phase_events"]
@@ -654,6 +678,7 @@ def analyze_trace(path, *, start_us=None, end_us=None, host_pids=None, device_pi
 
 
 _DIAGNOSTICS = {
+    "SUB_NS_QUANTIZATION": "合法亚纳秒事件已按最近整数纳秒保留；每个端点量化误差至多 0.5 ns，单次时长误差至多 1 ns，未作为非法事件丢弃。",
     "INVALID_EVENT": "跳过缺失 pid/tid、非有限或非法时间的事件。",
     "UNMATCHED_BEGIN": "B 事件缺少 E，未伪造结束时间。", "UNMATCHED_END": "E 事件缺少 B，未伪造开始时间。",
     "MISMATCHED_BEGIN_END": "B/E 名称或类别不匹配，未纳入调用统计。",

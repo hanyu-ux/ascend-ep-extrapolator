@@ -265,6 +265,113 @@ class HostProfileTests(unittest.TestCase):
         self.assertEqual(int(report["scope"]["end_ns"]), 1793591950793583621)
         self.assertAlmostEqual(self.hotspot(report, "one_ns")["inclusive_sum_ms"], .000001)
 
+    def test_subnanosecond_kernel_durations_remain_measured_and_close_device_gaps(self):
+        report = self.analyze([event("host_window", 0, 1000),
+                               event("kernel_a", 10, 123.4565, pid=100, category="kernel"),
+                               event("kernel_b", 300, 234.56725, pid=100, category="kernel")])
+        self.assertEqual(report["summary"]["device_events"], 2)
+        device = report["devices"][0]
+        self.assertEqual(device["calls"], 2)
+        # Synthetic endpoints independently give 123456 ns and 234567 ns.
+        self.assertAlmostEqual(device["recorded_sum_ms"], .358023)
+        self.assertAlmostEqual(device["recorded_union_ms"], .358023)
+        self.assertAlmostEqual(device["no_recorded_ms"], .641977)
+        self.assertAlmostEqual(sum(row["duration_ms"] for row in report["gaps"]), .641977)
+        self.assertAlmostEqual(device["recorded_union_ms"] + device["no_recorded_ms"], 1)
+        self.assertFalse(any(row["code"] == "INVALID_EVENT" for row in report["diagnostics"]))
+        quantization = report["source"]["time_quantization"]
+        self.assertEqual(quantization["unit"], "ns")
+        self.assertEqual(quantization["rounding"], "ROUND_HALF_EVEN")
+        self.assertEqual(quantization["quantized_events"], 2)
+        self.assertEqual(quantization["max_endpoint_rounding_error_ns"], .5)
+        self.assertTrue(any(row["code"] == "SUB_NS_QUANTIZATION" and row["count"] == 2
+                            for row in report["diagnostics"]))
+
+    def test_fractional_duration_with_epoch_timestamp_preserves_decimal_absolute_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "precise.json"
+            path.write_text('{"traceEvents":[{"ph":"X","pid":1,"tid":1,"cat":"cpu_op",'
+                            '"name":"work","ts":1750000000000000.690,"dur":123.4565}]}',
+                            encoding="utf-8")
+            report = host.analyze_trace(path)
+        self.assertEqual(int(report["scope"]["start_ns"]), 1750000000000000690)
+        self.assertEqual(int(report["scope"]["end_ns"]), 1750000000000124146)
+        self.assertAlmostEqual(self.hotspot(report, "work")["inclusive_sum_ms"], .123456)
+        self.assertEqual(report["source"]["time_quantization"]["quantized_events"], 1)
+
+    def test_rounds_absolute_end_instead_of_adding_rounded_duration_to_rounded_start(self):
+        report = self.analyze([event("work", 10.0004, 1.0004)])
+        # 10000.4 -> 10000, but (10000.4 + 1000.4) -> 11001.
+        self.assertEqual(int(report["scope"]["start_ns"]), 10000)
+        self.assertEqual(int(report["scope"]["end_ns"]), 11001)
+        self.assertAlmostEqual(self.hotspot(report, "work")["inclusive_sum_ms"], .001001)
+        self.assertAlmostEqual(report["source"]["time_quantization"]["max_endpoint_rounding_error_ns"], .4)
+
+    def test_subnanosecond_ties_use_half_even_for_both_absolute_endpoints(self):
+        for start, expected_start, expected_end in ((10.0005, 10000, 11000),
+                                                     (10.0015, 10002, 11002)):
+            with self.subTest(start=start):
+                report = self.analyze([event("work", start, 1)])
+                self.assertEqual(int(report["scope"]["start_ns"]), expected_start)
+                self.assertEqual(int(report["scope"]["end_ns"]), expected_end)
+                self.assertAlmostEqual(self.hotspot(report, "work")["inclusive_sum_ms"], .001)
+                self.assertEqual(report["source"]["time_quantization"]["max_endpoint_rounding_error_ns"], .5)
+
+    def test_quantization_counts_timed_events_outside_the_selected_window_and_all_supported_phases(self):
+        report = self.analyze([metadata(1, "python"), event("window", 0, 20),
+                               event("outside", 100.00025, 10),
+                               event("kernel", 10.00025, 1, pid=100, tid=1, category="kernel"),
+                               flow("s", 1.00025, pid=1, tid=10),
+                               flow("f", 10.00025, pid=100, tid=1),
+                               dict(ph="B", ts=200.00025, pid=1, tid=20,
+                                    cat="cpu_op", name="outside_pair"),
+                               dict(ph="E", ts=210.00025, pid=1, tid=20)],
+                              start_us=0, end_us=20)
+        self.assertEqual(report["summary"]["host_events"], 1)
+        self.assertEqual(report["summary"]["device_events"], 1)
+        self.assertEqual(report["source"]["time_quantization"]["quantized_events"], 6)
+        self.assertEqual(report["source"]["time_quantization"]["max_endpoint_rounding_error_ns"], .25)
+        self.assertTrue(any(row["code"] == "SUB_NS_QUANTIZATION" and row["count"] == 6
+                            for row in report["diagnostics"]))
+
+    def test_negative_subnanosecond_duration_and_nonfinite_values_are_still_invalid(self):
+        report = self.analyze([event("good", 0, 100),
+                               event("negative_fraction", 10, -.00025),
+                               event("nonfinite_duration", 10, "NaN"),
+                               event("nonfinite_timestamp", "Infinity", 1)])
+        self.assertEqual(report["summary"]["host_events"], 1)
+        self.assertEqual([row["name"] for row in report["hotspots"]], ["good"])
+        self.assertTrue(any(row["code"] == "INVALID_EVENT" and row["count"] == 3
+                            for row in report["diagnostics"]))
+
+    def test_explicit_window_endpoints_still_require_integral_nanoseconds(self):
+        for start, end in ((10.00025, 20), (0, 20.00025)):
+            with self.subTest(start=start, end=end), self.assertRaises(ValueError):
+                self.analyze([event("work", 0, 100.00025)], start_us=start, end_us=end)
+
+    def test_fractional_explicit_flow_endpoints_can_resolve_the_measured_cpu_origin(self):
+        report = self.analyze([event("prepare", 0, 30),
+                               event("kernel", 50.00025, 20, pid=100, tid=1, category="kernel"),
+                               flow("s", 10.00025, pid=1, tid=10),
+                               flow("f", 50.0004, pid=100, tid=1)])
+        self.assertEqual(report["summary"]["device_events"], 1)
+        link = report["links"][0]
+        self.assertIn(link["status"], ("LINKED", "CPU_ONLY"))
+        self.assertEqual(link["cpu_name"], "prepare")
+        self.assertEqual(report["source"]["time_quantization"]["quantized_events"], 3)
+
+    def test_fractional_begin_end_pairs_preserve_self_time_closure(self):
+        report = self.analyze([dict(ph="B", ts=.0004, pid=1, tid=10,
+                                    cat="cpu_op", name="outer"),
+                               event("inner", 2, 3.0005),
+                               dict(ph="E", ts=10.0006, pid=1, tid=10)])
+        self.assertEqual(report["summary"]["host_events"], 2)
+        self.assertAlmostEqual(self.hotspot(report, "outer")["inclusive_sum_ms"], .010001)
+        self.assertAlmostEqual(self.hotspot(report, "outer")["self_sum_ms"], .007001)
+        self.assertAlmostEqual(self.hotspot(report, "inner")["self_sum_ms"], .003)
+        self.assertAlmostEqual(report["summary"]["host_self_sum_ms"], .010001)
+        self.assertEqual(report["source"]["time_quantization"]["quantized_events"], 3)
+
     def test_malformed_events_are_diagnosed_and_not_counted_as_zero(self):
         report = self.analyze([event("good", 0, 100), event("bad_ts", "oops", 10),
                                event("negative_duration", 0, -1), event("bool_ts", True, 5)])
