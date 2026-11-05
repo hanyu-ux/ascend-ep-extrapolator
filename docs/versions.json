@@ -26,6 +26,18 @@
       "imported_version": "20261104.1.line_charts",
       "imported_sha256": "210a6e7056cd23bdc491d200cf141c39f33c8f473c5d67176279f4a64bd1ede9",
       "matches_imported_source": true
+    },
+    "profile_host.py": {
+      "version": "20261105.1.generic_host",
+      "sha256": "8089c473f0c1fc20987577480261e257778f6a951c4c9fbb10731aa9003b29e9",
+      "added_at": "2026-11-05",
+      "scope": "Model-independent measured Host trace analysis; no extrapolation"
+    },
+    "host_profile_report.py": {
+      "version": "20261105.1.generic_host",
+      "sha256": "77d0658ea0f2b5a1ab044024d82b56d912b85d3e0dc5c937b39d15366d2202b9",
+      "added_at": "2026-11-05",
+      "scope": "Model-independent measured Host trace analysis; no extrapolation"
     }
   },
   "presentations": [
@@ -57,16 +69,18 @@
     "The original machine-specific test import fallback was removed.",
     "Regression tests were grouped under tests/ and optional standalone checks under tools/; runtime scripts and presentation assets are unchanged.",
     "SWA and U diagnostic drill-downs add evidence only; original source/target cycle, TPOT and rank-selection formulas are unchanged. Repository iterations use branches and pull requests with offline regression checks.",
-    "Main CSA/HCA and draft SWA retain per-layer ten-stage evidence; both method sheets display five independent source-stage tables and native editable horizontal charts after the U composition. Core estimates and rank selection are unchanged; legacy SWA outputs remain available."
+    "Main CSA/HCA and draft SWA retain per-layer ten-stage evidence; both method sheets display five independent source-stage tables and native editable horizontal charts after the U composition. Core estimates and rank selection are unchanged; legacy SWA outputs remain available.",
+    "Independent trace-only Host analysis accepts main-only models without HC or draft assumptions. It reports validated same-track inclusive/self wall, runtime and queue evidence, per-device task coverage, conservative source links and bounded-detail HTML/CSV/JSON/XLSX; model and hardware declarations remain unverified without customer captures."
   ],
   "validation": {
-    "discovered_tests": 254,
-    "passed": 244,
+    "discovered_tests": 306,
+    "passed": 296,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,
       "optional_openpyxl_in_standard_library_only_mode": 2
-    }
+    },
+    "host_synthetic_tests": 52
   },
   "reference_inputs": {
     "data/communication-reference.csv": {
