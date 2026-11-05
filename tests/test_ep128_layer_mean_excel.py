@@ -44,6 +44,70 @@ def residual_report():
     return report
 
 
+DRILLDOWN_TITLES = ('SWA层内阶段展开', '下一主模型KV与输入准备 · 阶段展开',
+                    '下一主metadata及输入映射准备 · 阶段展开')
+MAIN_DRILLDOWN_TITLES = ('CSA层内阶段展开', 'HCA层内阶段展开')
+SWA_STAGE_KEYS = ('attention_prepare', 'attention', 'attention_output', 'attention_post',
+                  'moe_prepare', 'dispatch', 'experts', 'combine', 'ffn_output', 'ffn_post')
+
+
+def drilldown_report():
+    """Two independently measured ranks, with three unequal SWA layer means."""
+    report = residual_report()
+    for capture in report['cases'][0]['measurements']:
+        rank = capture['rank']
+        scale = 1. if rank == 'dp7' else 3.
+        diagnostic = capture['step_residuals']
+        for old, parent_key, count in (('draft_to_nextmain_5', 'main_inputs', 7),
+                                       ('draft_to_nextmain_6', 'main_metadata', 3)):
+            parent = next(row for row in diagnostic['stage_summary'] if row['stage_key'] == old)
+            parent['stage_key'] = parent_key
+            divisor = count * (count + 1) / 2
+            for order in range(1, count + 1):
+                diagnostic['substage_summary'].append(dict(window_key='draft_to_nextmain',
+                    stage_key=parent_key + '_' + str(order), stage_order=parent['stage_order'] * 1000 + order,
+                    label=rank + '_' + parent_key + '_DETAIL_' + str(order),
+                    level=1, parent_stage_key=parent_key, rounds=2, matched_windows=2,
+                    duration_ms_mean=parent['duration_ms_mean'] * order / divisor,
+                    status='MATCHED', boundary_basis='SYNTHETIC_NATIVE_ANCHORS'))
+        layer_summary, stage_summary = [], []
+        for layer in range(3):
+            values = [scale * (layer + 1) * (order + 1) / 100 for order in range(10)]
+            layer_summary.append(dict(role='draft', attention='SWA', layer=layer, rounds=2,
+                                      wall_ms_mean=sum(values), reference_eligible=True))
+            for order, (stage_key, value) in enumerate(zip(SWA_STAGE_KEYS, values), 1):
+                stage_summary.append(dict(role='draft', attention='SWA', layer=layer,
+                    stage_key=stage_key, stage_order=order, label=rank + '_SWA_DETAIL_' + str(order),
+                    rounds=2, matched_windows=2, duration_ms_mean=value,
+                    status='MATCHED', reason=None))
+        capture['swa_diagnostics'] = dict(status='MATCHED', layer_summary=layer_summary,
+                                           stage_summary=stage_summary)
+    return report
+
+
+def full_layer_drilldown_report():
+    """Main CSA/HCA plus draft SWA, all per-layer means kept independently."""
+    report = drilldown_report()
+    for capture in report['cases'][0]['measurements']:
+        diagnostic = copy.deepcopy(capture['swa_diagnostics'])
+        rank = capture['rank']
+        rank_scale = 1. if rank == 'dp7' else 3.
+        for attention, layers, multiplier in (('CSA', (2, 4, 6), 5.),
+                                               ('HCA', (0, 1, 3, 5, 7), 11.)):
+            for layer in layers:
+                values = [rank_scale * multiplier * (layer + 1) * (order + 1) / 100
+                          for order in range(10)]
+                diagnostic['layer_summary'].append(dict(role='main', attention=attention,
+                    layer=layer, rounds=2, wall_ms_mean=sum(values), reference_eligible=layer != 0))
+                for order, (key, value) in enumerate(zip(SWA_STAGE_KEYS, values), 1):
+                    diagnostic['stage_summary'].append(dict(role='main', attention=attention,
+                        layer=layer, stage_key=key, stage_order=order,
+                        label=rank + '_' + attention + '_DETAIL_' + str(order), rounds=2,
+                        matched_windows=2, duration_ms_mean=value, status='MATCHED', reason=None))
+        capture['layer_diagnostics'] = diagnostic
+    return report
+
+
 def bs_trend_report():
     """Unsorted BS and changing selected ranks; values are synthetic core output."""
     report = layer_mean_fixture()
@@ -133,6 +197,34 @@ class LayerMeanRendererTests(unittest.TestCase):
         sheet, first_col, first, last_col, last = match.groups()
         self.assertEqual(first_col, last_col)
         return [book[sheet][1].get(first_col + str(row)) for row in range(int(first), int(last) + 1)]
+
+    def chart_title(self, chart):
+        return ''.join(chart.find('{*}chart/{*}title').itertext())
+
+    def assert_bar_cache_matches_own_sheet(self, chart, book, sheet_name):
+        ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        self.assertEqual(chart.find('.//c:barDir', ns).get('val'), 'bar')
+        self.assertEqual(chart.find('.//c:grouping', ns).get('val'), 'clustered')
+        result = []
+        for series in chart.findall('.//c:barChart/c:ser', ns):
+            labels = series.find('c:cat/c:strRef', ns)
+            values = series.find('c:val/c:numRef', ns)
+            self.assertIsNotNone(labels)
+            self.assertIsNotNone(values)
+            label_ref = labels.findtext('c:f', namespaces=ns)
+            value_ref = values.findtext('c:f', namespaces=ns)
+            self.assertTrue(label_ref.startswith("'" + sheet_name + "'!"), label_ref)
+            self.assertTrue(value_ref.startswith("'" + sheet_name + "'!"), value_ref)
+            cached_labels = [point.findtext('c:v', namespaces=ns)
+                             for point in labels.findall('c:strCache/c:pt', ns)]
+            cached_values = [float(point.findtext('c:v', namespaces=ns))
+                             for point in values.findall('c:numCache/c:pt', ns)]
+            self.assertEqual(cached_labels, self.chart_reference_cells(book, label_ref))
+            self.assertEqual(cached_values, self.chart_reference_cells(book, value_ref))
+            self.assertEqual(int(values.find('c:numCache/c:ptCount', ns).get('val')), len(cached_values))
+            result.append((cached_labels, cached_values))
+        self.assertTrue(result)
+        return result
 
     def assert_line_cache_matches_sheet(self, chart, book, expected_bs):
         ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
@@ -863,6 +955,338 @@ class LayerMeanRendererTests(unittest.TestCase):
         self.assertIsNone(items)
         self.assertNotIn('class="u-bar"', renderer._method_residual_html(case, method))
         self.assertNotIn('请重跑基础统计', note)
+
+    def test_method_drilldown_tables_and_horizontal_charts_use_each_selected_rank(self):
+        report = drilldown_report()
+        out, (book, _) = self.build(report)
+        by_sheet = self.chart_parts_by_sheet(out, book)
+        case = report['cases'][0]
+        for index, method in enumerate(case['projection']['layer_mean_methods'], 1):
+            name = '方法' + str(index) + '估算'
+            capture = next(row for row in case['measurements'] if row['rank'] == method['selected_rank'])
+            other_rank = 'dp3' if capture['rank'] == 'dp7' else 'dp7'
+            cells = book[name][1]
+            title_rows = []
+            for title in DRILLDOWN_TITLES:
+                matches = [int(re.search(r'\d+', cell).group()) for cell, value in cells.items()
+                           if isinstance(value, str) and value.startswith(title)]
+                self.assertEqual(len(matches), 1, (name, title))
+                title_rows.append(matches[0])
+            u_row = next(int(re.search(r'\d+', cell).group()) for cell, value in cells.items()
+                         if isinstance(value, str) and value.startswith('轮次剩余区间耗时构成'))
+            rank_row = next(int(re.search(r'\d+', cell).group()) for cell, value in cells.items()
+                            if value == '采样rank')
+            self.assertEqual([u_row, *title_rows, rank_row], sorted([u_row, *title_rows, rank_row]))
+            charts = [chart for chart in by_sheet[name]
+                      if any(self.chart_title(chart).startswith(title) for title in DRILLDOWN_TITLES)]
+            self.assertEqual(len(charts), 3)
+            self.assertEqual([next(title for title in DRILLDOWN_TITLES if self.chart_title(chart).startswith(title))
+                              for chart in charts], list(DRILLDOWN_TITLES))
+            for chart in charts:
+                self.assertIn(renderer._layer_mean_name(method), self.chart_title(chart))
+                self.assert_bar_cache_matches_own_sheet(chart, book, name)
+            swa = self.assert_bar_cache_matches_own_sheet(charts[0], book, name)
+            self.assertEqual(len(swa), 3)
+            for layer, (labels, values) in enumerate(swa):
+                expected = sorted((row for row in capture['swa_diagnostics']['stage_summary']
+                                   if row['layer'] == layer), key=lambda row: row['stage_order'])
+                self.assertEqual(labels, [row['label'] for row in expected])
+                self.assertEqual(values, [row['duration_ms_mean'] for row in expected])
+                self.assertEqual(len(values), 10)
+                self.assertAlmostEqual(sum(values), capture['swa_diagnostics']['layer_summary'][layer]['wall_ms_mean'])
+            for chart, parent_key in zip(charts[1:], ('main_inputs', 'main_metadata')):
+                series = self.assert_bar_cache_matches_own_sheet(chart, book, name)
+                self.assertEqual(len(series), 1)
+                expected = sorted((row for row in capture['step_residuals']['substage_summary']
+                                   if row['parent_stage_key'] == parent_key), key=lambda row: row['stage_order'])
+                self.assertEqual(series[0][0], [row['label'] for row in expected])
+                self.assertEqual(series[0][1], [row['duration_ms_mean'] for row in expected])
+            self.assertFalse(any(other_rank + '_SWA_DETAIL_' in str(value)
+                                 or other_rank + '_main_inputs_DETAIL_' in str(value)
+                                 or other_rank + '_main_metadata_DETAIL_' in str(value)
+                                 for value in cells.values()))
+            # Expanded observations are not added to the core's already closed totals.
+            card_row = next(int(cell[1:]) for cell, value in cells.items()
+                            if cell.startswith('A') and value == '完整周期 · ms')
+            self.assertEqual(cells['A' + str(card_row + 1)], method['cycle_ms'])
+            self.assertEqual(cells['E' + str(card_row + 1)], method['tpot_ms'])
+
+    def test_method_drilldown_drawing_anchors_leave_each_next_table_uncovered(self):
+        out, (book, _) = self.build(drilldown_report())
+        ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart',
+              'xdr': 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing',
+              'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+        with ZipFile(out) as archive:
+            for sheet_name in ('方法1估算', '方法2估算'):
+                sheet_index = list(book).index(sheet_name) + 1
+                drawing = ET.fromstring(archive.read('xl/drawings/drawing' + str(sheet_index) + '.xml'))
+                rels = ET.fromstring(archive.read('xl/drawings/_rels/drawing' + str(sheet_index) + '.xml.rels'))
+                links = {node.get('Id'): posixpath.normpath(posixpath.join('xl/drawings', node.get('Target')))
+                         for node in rels}
+                anchors = []
+                for anchor in drawing.findall('xdr:twoCellAnchor', ns):
+                    chart_id = anchor.find('.//c:chart', ns).get('{' + ns['r'] + '}id')
+                    title = self.chart_title(ET.fromstring(archive.read(links[chart_id])))
+                    if title.startswith('轮次剩余区间耗时构成') or any(
+                            title.startswith(prefix) for prefix in DRILLDOWN_TITLES):
+                        anchors.append((title, int(anchor.findtext('xdr:from/xdr:row', namespaces=ns)) + 1,
+                                        int(anchor.findtext('xdr:to/xdr:row', namespaces=ns)) + 1))
+                self.assertEqual(len(anchors), 4)
+                for previous, following in zip(anchors, anchors[1:]):
+                    self.assertLess(previous[2], following[1])
+                cells = book[sheet_name][1]
+                for (_, _, end), next_title in zip(anchors, (*DRILLDOWN_TITLES, '采样rank')):
+                    next_row = next(int(re.search(r'\d+', cell).group()) for cell, value in cells.items()
+                                    if isinstance(value, str) and value.startswith(next_title))
+                    self.assertLessEqual(end, next_row)
+
+    def test_method_drilldowns_missing_rank_duplicate_capture_and_old_json_keep_placeholders(self):
+        for missing in ('selected_rank', 'capture', 'duplicate_capture', 'old_json'):
+            report = drilldown_report()
+            case = report['cases'][0]
+            method = case['projection']['layer_mean_methods'][0]
+            if missing == 'selected_rank':
+                method.update(selected_rank=None, source_rank='dp3', status='UNAVAILABLE',
+                              reasons=['SYNTHETIC_TARGET_INPUT_MISSING'])
+            elif missing == 'capture':
+                case['measurements'].pop(0)
+            elif missing == 'duplicate_capture':
+                case['measurements'].append(copy.deepcopy(case['measurements'][0]))
+            else:
+                case['measurements'][0].pop('swa_diagnostics')
+                case['measurements'][0]['step_residuals'].pop('substage_summary')
+            with self.subTest(missing=missing):
+                out, (book, _) = self.build(report)
+                cells = book['方法1估算'][1]
+                for title in DRILLDOWN_TITLES:
+                    self.assertTrue(any(isinstance(value, str) and value.startswith(title)
+                                        for value in cells.values()), title)
+                charts = self.chart_parts_by_sheet(out, book)['方法1估算']
+                self.assertFalse(any(any(self.chart_title(chart).startswith(title) for title in DRILLDOWN_TITLES)
+                                     for chart in charts))
+                text = ' '.join(map(str, cells.values()))
+                self.assertTrue(any(word in text for word in ('缺', '不足', '未绘', '不可用', '未提供')))
+                self.assertNotIn('dp3_SWA_DETAIL_', text)
+                self.assertNotIn('dp3_main_inputs_DETAIL_', text)
+                self.assertNotIn('dp3_main_metadata_DETAIL_', text)
+
+    def test_partial_or_nonclosing_u_child_group_suppresses_only_its_chart(self):
+        for invalid in ('partial', 'count', 'missing', 'parent_sum', 'window', 'level'):
+            for parent_key, title in zip(('main_inputs', 'main_metadata'), DRILLDOWN_TITLES[1:]):
+                report = drilldown_report()
+                diagnostic = report['cases'][0]['measurements'][0]['step_residuals']
+                child = next(row for row in diagnostic['substage_summary'] if row['parent_stage_key'] == parent_key)
+                if invalid == 'partial':
+                    child.update(status='PARTIAL', matched_windows=1)
+                elif invalid == 'count':
+                    child['rounds'] = 3
+                elif invalid == 'missing':
+                    diagnostic['substage_summary'].remove(child)
+                elif invalid == 'parent_sum':
+                    child['duration_ms_mean'] += 1.
+                elif invalid == 'window':
+                    child['window_key'] = 'main_to_draft'
+                else:
+                    child['level'] = 0
+                with self.subTest(invalid=invalid, parent=parent_key):
+                    out, (book, _) = self.build(report)
+                    charts = self.chart_parts_by_sheet(out, book)['方法1估算']
+                    self.assertFalse(any(self.chart_title(chart).startswith(title) for chart in charts))
+                    other_title = DRILLDOWN_TITLES[2] if parent_key == 'main_inputs' else DRILLDOWN_TITLES[1]
+                    self.assertTrue(any(self.chart_title(chart).startswith(other_title) for chart in charts))
+                    self.assertTrue(any(isinstance(value, str) and value.startswith(title)
+                                        for value in book['方法1估算'][1].values()))
+
+    def test_incomplete_or_nonclosing_swa_layer_cannot_publish_a_ten_stage_chart(self):
+        for invalid in ('partial', 'missing_stage', 'layer_sum', 'missing_layer_wall', 'sample_count', 'order'):
+            report = drilldown_report()
+            diagnostic = report['cases'][0]['measurements'][0]['swa_diagnostics']
+            if invalid == 'partial':
+                diagnostic['stage_summary'][0].update(status='PARTIAL', matched_windows=1)
+            elif invalid == 'missing_stage':
+                diagnostic['stage_summary'].pop(0)
+            elif invalid == 'layer_sum':
+                diagnostic['layer_summary'][0]['wall_ms_mean'] += .5
+            elif invalid == 'missing_layer_wall':
+                diagnostic['layer_summary'].pop(0)
+            elif invalid == 'sample_count':
+                diagnostic['stage_summary'][0].update(rounds=1, matched_windows=1)
+            else:
+                diagnostic['stage_summary'][0]['stage_order'] = 2
+            with self.subTest(invalid=invalid):
+                out, (book, _) = self.build(report)
+                charts = self.chart_parts_by_sheet(out, book)['方法1估算']
+                self.assertFalse(any(self.chart_title(chart).startswith(DRILLDOWN_TITLES[0]) for chart in charts))
+                for title in DRILLDOWN_TITLES[1:]:
+                    self.assertTrue(any(self.chart_title(chart).startswith(title) for chart in charts))
+
+    def test_zero_duration_is_measured_and_keeps_its_bar_point_and_table_reference(self):
+        report = drilldown_report()
+        for capture in report['cases'][0]['measurements']:
+            for layer in range(3):
+                stages = [row for row in capture['swa_diagnostics']['stage_summary'] if row['layer'] == layer]
+                stages[1]['duration_ms_mean'] += stages[0]['duration_ms_mean']
+                stages[0]['duration_ms_mean'] = 0.
+            for parent_key in ('main_inputs', 'main_metadata'):
+                stages = [row for row in capture['step_residuals']['substage_summary']
+                          if row['parent_stage_key'] == parent_key]
+                stages[1]['duration_ms_mean'] += stages[0]['duration_ms_mean']
+                stages[0]['duration_ms_mean'] = 0.
+        out, (book, _) = self.build(report)
+        by_sheet = self.chart_parts_by_sheet(out, book)
+        for name in ('方法1估算', '方法2估算'):
+            charts = [chart for chart in by_sheet[name] if any(
+                self.chart_title(chart).startswith(title) for title in DRILLDOWN_TITLES)]
+            self.assertEqual(len(charts), 3)
+            for chart in charts:
+                for _, values in self.assert_bar_cache_matches_own_sheet(chart, book, name):
+                    self.assertEqual(values[0], 0.)
+                    self.assertGreater(values[1], 0.)
+
+    def test_main_csa_hca_and_draft_swa_have_five_separate_method_tables_and_charts(self):
+        report = full_layer_drilldown_report()
+        out, (book, _) = self.build(report)
+        case = report['cases'][0]
+        titles = (*MAIN_DRILLDOWN_TITLES, *DRILLDOWN_TITLES)
+        by_sheet = self.chart_parts_by_sheet(out, book)
+        for index, method in enumerate(case['projection']['layer_mean_methods'], 1):
+            name = '方法' + str(index) + '估算'
+            cells = book[name][1]
+            capture = next(item for item in case['measurements'] if item['rank'] == method['selected_rank'])
+            charts = [chart for chart in by_sheet[name] if any(self.chart_title(chart).startswith(title)
+                                                              for title in titles)]
+            self.assertEqual(len(charts), 5)
+            title_rows = []
+            for title, chart in zip(titles, charts):
+                self.assertTrue(self.chart_title(chart).startswith(title))
+                self.assertIn(renderer._layer_mean_name(method), self.chart_title(chart))
+                matches = [int(re.search(r'\d+', cell).group()) for cell, value in cells.items()
+                           if isinstance(value, str) and value.startswith(title)]
+                self.assertEqual(len(matches), 1)
+                title_rows.append(matches[0])
+            u_row = next(int(re.search(r'\d+', cell).group()) for cell, value in cells.items()
+                         if isinstance(value, str) and value.startswith('轮次剩余区间耗时构成'))
+            rank_row = next(int(re.search(r'\d+', cell).group()) for cell, value in cells.items()
+                            if value == '采样rank')
+            self.assertEqual([u_row, *title_rows, rank_row], sorted([u_row, *title_rows, rank_row]))
+            for chart, role, attention, layers in zip(charts[:3], ('main', 'main', 'draft'),
+                    ('CSA', 'HCA', 'SWA'), ((2, 4, 6), (0, 1, 3, 5, 7), (0, 1, 2))):
+                series = self.assert_bar_cache_matches_own_sheet(chart, book, name)
+                self.assertEqual(len(series), len(layers))
+                for layer, (labels, values) in zip(layers, series):
+                    expected = sorted((row for row in capture['layer_diagnostics']['stage_summary']
+                                       if row['role'] == role and row['attention'] == attention and row['layer'] == layer),
+                                      key=lambda row: row['stage_order'])
+                    self.assertEqual(labels, [row['label'] for row in expected])
+                    self.assertEqual(values, [row['duration_ms_mean'] for row in expected])
+                    self.assertEqual(len(values), 10)
+                    parent = next(row for row in capture['layer_diagnostics']['layer_summary']
+                                  if row['role'] == role and row['attention'] == attention and row['layer'] == layer)
+                    self.assertAlmostEqual(sum(values), parent['wall_ms_mean'])
+            text = ' '.join(map(str, cells.values()))
+            self.assertIn('主0', text)
+            self.assertTrue(any(word in text for word in ('不参与', '排除', '不作参考', '仅展示')))
+            other_rank = 'dp3' if capture['rank'] == 'dp7' else 'dp7'
+            for attention in ('CSA', 'HCA', 'SWA'):
+                self.assertNotIn(other_rank + '_' + attention + '_DETAIL_', text)
+            # The rendering extension keeps every result card at the core value.
+            card_row = next(int(cell[1:]) for cell, value in cells.items()
+                            if cell.startswith('A') and value == '完整周期 · ms')
+            self.assertEqual(cells['A' + str(card_row + 1)], method['cycle_ms'])
+            self.assertEqual(cells['E' + str(card_row + 1)], method['tpot_ms'])
+            self.assertEqual(cells['I' + str(card_row + 1)], method['per_device_tokens_s'])
+        preview = out.with_suffix('.html').read_text()
+        for title in titles:
+            self.assertEqual(preview.count('<h4>' + title), 2, title)
+        self.assertEqual(preview.count('class="method-stage-expansion"'), 10)
+
+    def test_incomplete_main_attention_class_keeps_table_and_suppresses_only_its_chart(self):
+        for attention, title in zip(('CSA', 'HCA'), MAIN_DRILLDOWN_TITLES):
+            for invalid in ('missing_stage', 'partial', 'missing_wall', 'nonclosing'):
+                report = full_layer_drilldown_report()
+                diagnostic = report['cases'][0]['measurements'][0]['layer_diagnostics']
+                stage = next(row for row in diagnostic['stage_summary']
+                             if row['role'] == 'main' and row['attention'] == attention)
+                if invalid == 'missing_stage':
+                    diagnostic['stage_summary'].remove(stage)
+                elif invalid == 'partial':
+                    stage.update(status='PARTIAL', matched_windows=1, duration_ms_mean=None)
+                elif invalid == 'missing_wall':
+                    diagnostic['layer_summary'] = [row for row in diagnostic['layer_summary']
+                        if not (row['role'] == 'main' and row['attention'] == attention and row['layer'] == stage['layer'])]
+                else:
+                    stage['duration_ms_mean'] += 1.
+                with self.subTest(attention=attention, invalid=invalid):
+                    out, (book, _) = self.build(report)
+                    charts = self.chart_parts_by_sheet(out, book)['方法1估算']
+                    self.assertFalse(any(self.chart_title(chart).startswith(title) for chart in charts))
+                    other_title = MAIN_DRILLDOWN_TITLES[1] if attention == 'CSA' else MAIN_DRILLDOWN_TITLES[0]
+                    self.assertTrue(any(self.chart_title(chart).startswith(other_title) for chart in charts))
+                    self.assertTrue(any(self.chart_title(chart).startswith(DRILLDOWN_TITLES[0]) for chart in charts))
+                    cells = book['方法1估算'][1]
+                    self.assertTrue(any(isinstance(value, str) and value.startswith(title) for value in cells.values()))
+                    self.assertIn('未绘图', ' '.join(map(str, cells.values())))
+
+    def test_legacy_swa_only_json_keeps_three_old_expansions_and_main_unknown_placeholders(self):
+        out, (book, _) = self.build(drilldown_report())
+        by_sheet = self.chart_parts_by_sheet(out, book)
+        preview = out.with_suffix('.html').read_text()
+        for name in ('方法1估算', '方法2估算'):
+            for title in MAIN_DRILLDOWN_TITLES:
+                self.assertTrue(any(isinstance(value, str) and value.startswith(title)
+                                    for value in book[name][1].values()))
+                self.assertFalse(any(self.chart_title(chart).startswith(title) for chart in by_sheet[name]))
+                self.assertIn('<h4>' + title, preview)
+            for title in DRILLDOWN_TITLES:
+                self.assertTrue(any(self.chart_title(chart).startswith(title) for chart in by_sheet[name]))
+
+    def test_full_layer_diagnostics_take_precedence_over_legacy_swa_values(self):
+        report = full_layer_drilldown_report()
+        for capture in report['cases'][0]['measurements']:
+            for row in capture['swa_diagnostics']['stage_summary']:
+                row.update(label='LEGACY_SWA_MUST_NOT_REPLACE_NEW_DIAGNOSTIC', duration_ms_mean=99999.)
+        out, (book, _) = self.build(report)
+        charts = self.chart_parts_by_sheet(out, book)
+        for name in ('方法1估算', '方法2估算'):
+            self.assertNotIn('LEGACY_SWA_MUST_NOT_REPLACE_NEW_DIAGNOSTIC', book[name][1].values())
+            swa = next(chart for chart in charts[name] if self.chart_title(chart).startswith(DRILLDOWN_TITLES[0]))
+            series = self.assert_bar_cache_matches_own_sheet(swa, book, name)
+            self.assertEqual(len(series), 3)
+            self.assertTrue(all(value < 99999. for _, values in series for value in values))
+
+    def test_optional_input_anchors_and_dynamic_metadata_counts_use_observed_stage_order(self):
+        report = drilldown_report()
+        for capture in report['cases'][0]['measurements']:
+            diagnostic = capture['step_residuals']
+            for parent_key, count in (('main_inputs', 5), ('main_metadata', 7)):
+                parent = next(row for row in diagnostic['stage_summary'] if row['stage_key'] == parent_key)
+                children = [row for row in diagnostic['substage_summary'] if row['parent_stage_key'] == parent_key]
+                diagnostic['substage_summary'] = [row for row in diagnostic['substage_summary']
+                                                   if row['parent_stage_key'] != parent_key]
+                for number in range(count):
+                    diagnostic['substage_summary'].append(dict(children[0],
+                        stage_key=parent_key + '_dynamic_' + str(number),
+                        stage_order=parent['stage_order'] * 1000 + number * 2,
+                        label=capture['rank'] + '_' + parent_key + '_DYNAMIC_' + str(number),
+                        duration_ms_mean=parent['duration_ms_mean'] / count))
+            diagnostic['substage_summary'].reverse()
+            capture['swa_diagnostics']['stage_summary'].reverse()
+            capture['swa_diagnostics']['layer_summary'].reverse()
+        out, (book, _) = self.build(report)
+        by_sheet = self.chart_parts_by_sheet(out, book)
+        for name, rank in (('方法1估算', 'dp7'), ('方法2估算', 'dp3')):
+            for title, parent_key, count in zip(DRILLDOWN_TITLES[1:], ('main_inputs', 'main_metadata'), (5, 7)):
+                chart = next(chart for chart in by_sheet[name] if self.chart_title(chart).startswith(title))
+                series = self.assert_bar_cache_matches_own_sheet(chart, book, name)
+                self.assertEqual(series[0][0], [rank + '_' + parent_key + '_DYNAMIC_' + str(number)
+                                               for number in range(count)])
+                self.assertEqual(len(series[0][1]), count)
+            swa = next(chart for chart in by_sheet[name] if self.chart_title(chart).startswith(DRILLDOWN_TITLES[0]))
+            series = self.assert_bar_cache_matches_own_sheet(swa, book, name)
+            self.assertEqual(len(series), 3)
+            self.assertEqual(series[0][0], [rank + '_SWA_DETAIL_' + str(order) for order in range(1, 11)])
+            self.assertLess(series[0][1][0], series[1][1][0])
+            self.assertLess(series[1][1][0], series[2][1][0])
 
     def test_default_renderer_filename_overview_and_titles_use_product_name(self):
         source = self.root / 'core.json'

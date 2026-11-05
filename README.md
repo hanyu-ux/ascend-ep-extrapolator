@@ -201,6 +201,8 @@ TPOT（ms/token） = R / Neff
 
 本次增加下一主模型 KV/输入准备、主/草稿 metadata 的子阶段，以及每 rank、每个草稿 SWA 层的 10 段诊断。metadata 本体与前后的映射准备分开；原始 Task Type 保留 AI_CPU 等执行类型，busy 不等于 AICORE 有效算力。详见[结果读取说明](docs/usage.md#6-如何核对结果)。
 
+方法1、方法2工作表在“轮次剩余区间耗时构成”下方，分别展示 CSA、HCA、SWA 层内10段，以及下一主 KV/输入、下一主 metadata 子阶段的五组独立表格和横向柱状图。层内细分按层分列，均取各方法所选 rank 的源实测，不重新平均或追加到目标周期；主0保留展示但不作外推参考。
+
 - 当前外推直接使用同 BS、同 rank、同轮的 `U目标=U源`，不乘 EP 倍率，也不乘主层数；没有证明 EP 扩大后 U 一定不变。
 - U 包括输出处理、采样、上下文融合、KV/metadata/输入准备、主草稿切换以及其中的任务间隔，不是单一 Head、CPU 耗时或固定空闲。
 - 有同次 trace 时补充 PyTorch/CANN/queue/设备来源关联；Host 同时段覆盖不等于该阶段独有的 CPU 成本。缺 trace 不阻断设备统计。
@@ -222,7 +224,8 @@ TPOT（ms/token） = R / Neff
 | `boundary_accounting.csv` / `compute_evidence.csv` | 边界计账与路由 GMM 证据 |
 | `step_residual_stages.csv` / `step_residual_substages.csv` | U15 父阶段与 Markov、下一主输入及 metadata 子阶段汇总 |
 | `swa_stage_summary.csv` | 每 case、rank、草稿层的 SWA 10 段统计 |
-| `step_residual_details/` | 各 rank 的原始设备明细、精确阶段边界、来源链及 `*-swa-stages.csv` |
+| `layer_stage_summary.csv` | 每 case、rank、主/草稿层的 CSA/HCA/SWA 10 段统计 |
+| `step_residual_details/` | 各 rank 的原始设备明细、精确阶段边界、来源链及 `*-layer-stages.csv`、兼容的 `*-swa-stages.csv` |
 
 Excel 的 BS 折线取 `config.bs` 数值排序；其他声明条件不同则分组。重复 BS 保留原值但不合并绘线；单点组只显示表格；未知值保留空白并断线，不补0。顶部索引列出全部采样组合，避免把单独分组误认为遗漏。
 
