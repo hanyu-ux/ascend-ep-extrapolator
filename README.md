@@ -42,7 +42,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-外推程序与展示程序应放在同一目录。当前版本：外推统计 `20261105.1.layer_stage_charts`、Excel 生成器 `20261105.1.method_stage_charts`、写入器 `20261104.1.line_charts`；独立 Host 统计 `20261105.2.subnanosecond_trace`。
+外推程序与展示程序应放在同一目录。当前版本：外推统计 `20261105.1.layer_stage_charts`、Excel 生成器 `20261105.1.method_stage_charts`、写入器 `20261104.1.line_charts`；独立 Host 统计 `20261105.3.exclusive_ledger`。
 
 ## 只分析实测 Host 耗时
 
@@ -50,7 +50,9 @@ ascend-ep-extrapolator/
 python profile_host.py /path/to/trace_view.json --out outputs/step5-host --model Step5 --hardware 950 --main-only --excel
 ```
 
-无需填写外推配置。输出独立的 HTML、JSON、CSV 及可选 Excel，包括线程轨道、CPU 调用 inclusive/self、API/同步/队列、已标注步骤、设备记录覆盖及来源关联。`--main-only` 记录用户声明没有草稿模型。第一版输入为 JSON trace；没有 OS 调度采样时，CPU 实际忙时和利用率保留不可用。客户 Step5/950 尚未实测验证，详见[使用说明和统计口径](docs/host-profiling.md)。
+无需填写外推配置。报告首先展示完整分析窗口的互斥时间账本：单类设备记录、多类设备记录重叠、无设备记录时的 Host 可见调用范围，以及双侧均无记录的区间。各段只计一次，以整数纳秒校验相加等于总时间，占比使用同一窗口为分母；并行组合明细只展开父项。每个设备 PID 分别计账，不跨设备相加。
+
+线程轨道、CPU 调用 inclusive/self、API/同步/队列、已标注步骤、设备记录覆盖及来源关联作为辅助诊断保留。`--main-only` 记录用户声明没有草稿模型。输入为 JSON trace；没有 OS 调度采样时，CPU 实际忙时和利用率保留不可用，时间账本闭合也不表示所有业务阶段都已识别。详见[使用说明和统计口径](docs/host-profiling.md)。
 
 ## 快速运行
 

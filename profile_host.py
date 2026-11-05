@@ -23,7 +23,7 @@ import tempfile
 from profile_ep128 import residual_args, residual_iter_trace_events
 
 
-HOST_VERSION = "20261105.2.subnanosecond_trace"
+HOST_VERSION = "20261105.3.exclusive_ledger"
 DETAIL_LIMIT = 1000
 HOST_KINDS = ("cpu", "python", "annotation", "runtime", "sync", "copy", "enqueue", "dequeue")
 CPU_KINDS = ("cpu", "python", "annotation")
@@ -39,7 +39,210 @@ SEMANTICS = [
     "没有步骤标注时只报告采样/选定窗口；ProfilerStep 标注也不自动等于请求或生成 token。",
     "模型、芯片与无草稿设置为用户声明；未自动验证 Step5 架构、950 兼容性或优化收益。",
     "worker trace 不保证覆盖独立的调度器、分词器和 API 服务进程，也不推断缺失 Python 模块。",
+    "时间账本以同一采样/选定窗口为分母，按半开区间逐纳秒闭合；主表各项互斥，合计严格等于窗口跨度。",
+    "时间账本先区分有设备记录与无设备记录，再在各区间列出同时可见的语义类别；多类别重叠单列，不按任意优先级分给某个算子。",
+    "有设备记录期间的 Host 调用不另计入主表；Host 与设备的四种覆盖状态另表闭合，两张表不可相加。",
+    "无设备记录时的 Host 调用范围可能包含同步、通信等待和抢占，不表示 CPU 实际运行；双方均无已分类记录的时间明确保留。",
+    "设备类别由可见算子名/任务类型保守识别；普通矩阵乘不推断属于 QKV、输出投影或专家，Attention 不自动命名为 SWA。",
+    "每个设备 pid 单独建立完整窗口账本，均关联所选 Host 轨道；不同设备账本不能相加为同一采样的墙钟时间。",
 ]
+
+
+# Category names are evidence labels, not inferred model stages.  In particular,
+# ordinary GEMM cannot establish whether work belongs to QKV, O projection or an
+# expert.  Overlapping *different* categories have their own ledger bucket.
+_LEDGER_CLASSES = {
+    "device_qkv_rope_cache": "显式 QKV / RoPE / KV cache 算子记录",
+    "device_attention": "普通/融合 Attention 记录（不推断 SWA）",
+    "device_sparse_attention": "稀疏 Attention 记录",
+    "device_sparse_indexer": "稀疏索引器记录",
+    "device_indexer_metadata": "索引器/稀疏 Attention 设备元数据记录",
+    "device_moe_route": "显式 MoE 路由/分发/归并记录",
+    "device_expert_matmul": "分组矩阵乘记录（专家候选）",
+    "device_matmul": "其他矩阵乘记录（归属未确认）",
+    "device_fused_matmul_communication": "融合矩阵乘与通信记录（不可再拆）",
+    "device_norm_activation": "归一化/激活算子记录（含同名融合算子）",
+    "device_dma": "设备 DMA / memcpy / memset 记录",
+    "device_control": "设备同步/事件/通知/控制记录",
+    "device_communication": "设备通信记录",
+    "device_aicpu_other": "其他 AICPU 记录（非服务器 CPU）",
+    "device_other": "其他/未细分设备记录",
+    "host_only_communication": "无设备记录：Host 通信调用范围",
+    "host_only_sync": "无设备记录：Host 同步调用范围",
+    "host_only_copy": "无设备记录：Host 拷贝/转换调用范围",
+    "host_only_queue": "无设备记录：Host 队列调用范围",
+    "host_only_runtime": "无设备记录：运行时 API 调用范围",
+    "host_only_other": "无设备记录：其他 Host 调用范围",
+    "device_overlap": "多类设备记录重叠（另列组合）",
+    "host_overlap": "无设备记录：多类 Host 调用范围重叠",
+    "unobserved": "Host 与设备均无已分类记录",
+}
+
+
+@lru_cache(maxsize=16384)
+def _ledger_class(name, tasktype, kind):
+    """Conservative category of one already classified Host/device event."""
+    lower = name.lower()
+    compact = re.sub(r"[^a-z0-9]", "", lower)
+    task = re.sub(r"[^a-z0-9]", "", tasktype.lower())
+    if kind in ("device", "aicpu", "dma"):
+        # MC2 can expose the same fused operation as AI_CPU and communication
+        # records.  Classify its explicit name first, so those duplicate views
+        # do not fabricate a cross-category overlap.
+        if ("matmul" in compact or "gemm" in compact) and any(
+                token in compact for token in ("reducescatter", "allreduce", "allgather")):
+            return "device_fused_matmul_communication"
+        if any(token in compact for token in ("unionsparsemeta", "sparsemeta", "indexermeta",
+                                              "csaprefillupdate", "appendcurrentregion", "decodesummarylayout",
+                                              "genericblocksparseattentionmetadata")):
+            return "device_indexer_metadata"
+        if "indexer" in compact:
+            return "device_sparse_indexer"
+        if any(token in compact for token in ("sparseattention", "blocksparseattention")):
+            return "device_sparse_attention"
+        if any(token in compact for token in ("flashattention", "fainfer", "fusedinferattention",
+                                              "fusedattention", "attentionscore", "pagedattention")):
+            return "device_attention"
+        if any(token in compact for token in ("qkv", "rotary", "rope", "reshapeandcache", "kvcache")):
+            return "device_qkv_rope_cache"
+        if "moe" in compact and any(token in compact for token in
+                ("gating", "routing", "route", "dispatch", "combine", "tokenperm", "distribute")):
+            return "device_moe_route"
+        if any(token in compact for token in ("groupedmatmul", "groupedgemm", "groupgemm")) or compact.startswith("gmm"):
+            return "device_expert_matmul"
+        if "matmul" in compact or "gemm" in compact:
+            return "device_matmul"
+        if any(token in compact for token in ("rmsnorm", "layernorm", "swiglu", "gelu", "silu", "relu")):
+            return "device_norm_activation"
+        if kind == "dma" or any(token in compact + task for token in ("memcpy", "memset", "dma")):
+            return "device_dma"
+        if any(token in compact + task for token in
+               ("synchronize", "streamwait", "event", "notify", "streamswitch", "streamactive", "labelgoto", "labelset", "conditionsqe")):
+            return "device_control"
+        if "communication" in task or any(token in compact for token in
+                ("hccl", "hcom", "allreduce", "allgather", "reducescatter", "alltoall", "broadcast")) or re.search(
+                    r"(?:^|[^a-z])(?:send|recv|receive)(?:$|[^a-z])", lower):
+            return "device_communication"
+        return "device_aicpu_other" if kind == "aicpu" else "device_other"
+    if any(token in lower for token in ("gloo", "c10d", "hccl", "hcom")):
+        return "host_only_communication"
+    if kind == "sync":
+        return "host_only_sync"
+    if kind == "copy" or re.match(r"^aten::(?:copy_|to|_to_copy)(?:$|\.)", lower):
+        return "host_only_copy"
+    if kind in ("enqueue", "dequeue") or "queue" in lower:
+        return "host_only_queue"
+    return "host_only_runtime" if kind == "runtime" else "host_only_other"
+
+
+def _exclusive_time_ledgers(db, start, end, device_pids):
+    """Partition raw classified event intervals; never use capped detail rows.
+
+    An endpoint sweep maintains multiplicities, so nested or duplicated records
+    of one category cover time once.  Different concurrent categories retain
+    their exact set, rather than being assigned by an arbitrary priority.
+    """
+    total = end - start
+    if total <= 0:
+        raise ValueError("exclusive ledger requires a positive window")
+    host_sql = ",".join("?" * len(HOST_KINDS))
+    all_kinds = (*HOST_KINDS, "device", "aicpu", "dma")
+    kind_sql = ",".join("?" * len(all_kinds))
+    db.execute("CREATE INDEX IF NOT EXISTS ledger_order ON events(start,end)")
+    ledgers = []
+    for pid in device_pids or (None,):
+        primary, details, states = {}, {}, {}
+        active = {"host": Counter(), "device": Counter()}
+        endings, cursor = [], start
+        previous = {"primary": None, "details": None, "state": None}
+        state_labels = {"both": "Host 与设备均有记录", "device_only": "仅设备有记录",
+                        "host_only": "仅 Host 有记录（含等待）", "neither": "双方均无已分类记录"}
+
+        def record(container, key, duration, group, **fields):
+            row = container.setdefault(key, {"key": key, "duration_ns": 0, "segment_count": 0, **fields})
+            row["duration_ns"] += duration
+            if previous[group] != key:
+                row["segment_count"] += 1
+            previous[group] = key
+
+        def account(left, right):
+            if right <= left:
+                return
+            host_keys, device_keys = tuple(sorted(active["host"])), tuple(sorted(active["device"]))
+            if device_keys:
+                components = device_keys
+                key = device_keys[0] if len(device_keys) == 1 else "device_overlap"
+            elif host_keys:
+                components = host_keys
+                key = host_keys[0] if len(host_keys) == 1 else "host_overlap"
+            else:
+                components, key = (), "unobserved"
+            duration = right - left
+            record(primary, key, duration, "primary", label=_LEDGER_CLASSES[key])
+            detail_key = key + ("|" + "+".join(components) if components else "")
+            detail_label = " + ".join(_LEDGER_CLASSES[item] for item in components) if len(components) > 1 else _LEDGER_CLASSES[key]
+            record(details, detail_key, duration, "details", parent_key=key,
+                   label=detail_label, components=list(components))
+            state = "both" if host_keys and device_keys else "host_only" if host_keys else "device_only" if device_keys else "neither"
+            record(states, state, duration, "state", label=state_labels[state])
+
+        def advance(stamp):
+            nonlocal cursor
+            while endings and endings[0][0] <= stamp:
+                stop = endings[0][0]
+                account(cursor, stop)
+                cursor = stop
+                while endings and endings[0][0] == stop:
+                    _, side, category = heapq.heappop(endings)
+                    active[side][category] -= 1
+                    if not active[side][category]:
+                        del active[side][category]
+            account(cursor, stamp)
+            cursor = stamp
+
+        sql = ("SELECT name,tasktype,kind,start,end FROM events WHERE kind IN (" + kind_sql + ") "
+               "AND end>? AND start<? AND (kind IN (" + host_sql + ") OR pid=?) ORDER BY start,end,id")
+        args = (*all_kinds, start, end, *HOST_KINDS, pid)
+        for name, tasktype, kind, left, right in db.execute(sql, args):
+            left, right = max(start, left), min(end, right)
+            if right <= left:
+                continue
+            advance(left)
+            side = "host" if kind in HOST_KINDS else "device"
+            category = _ledger_class(name, tasktype, kind)
+            active[side][category] += 1
+            heapq.heappush(endings, (right, side, category))
+        advance(end)
+        if endings or active["host"] or active["device"]:
+            raise ValueError("exclusive ledger has unfinished active intervals")
+
+        parent_sums = Counter()
+        for row in details.values():
+            parent_sums[row["parent_key"]] += row["duration_ns"]
+        errors = [sum(rows["duration_ns"] for rows in source.values()) - total
+                  for source in (primary, details, states)]
+        errors.extend(parent_sums[key] - row["duration_ns"] for key, row in primary.items())
+        if any(errors):
+            raise ValueError("exclusive timeline ledger failed exact integer-ns closure: " + repr(errors))
+
+        def output(rows):
+            return [{**row, "duration_ms": row["duration_ns"] / 1e6,
+                     "share": row["duration_ns"] / total} for row in rows]
+
+        state_rows = [states.get(key, {"key": key, "label": label, "duration_ns": 0, "segment_count": 0})
+                      for key, label in state_labels.items()]
+        ledgers.append({"device_pid": pid, "start_ns": start, "end_ns": end,
+            "total_ns": total, "total_ms": total / 1e6, "closed": True, "closure_error_ns": 0,
+            "breakdown": output(sorted(primary.values(), key=lambda row: (-row["duration_ns"], row["key"]))),
+            "details": output(sorted(details.values(), key=lambda row: (row["parent_key"], -row["duration_ns"], row["key"]))),
+            "coverage_states": output(state_rows),
+            "classifications": [{"key": key, "label": label,
+                "side": "device" if key.startswith("device_") else "host" if key.startswith("host_") else "unknown"}
+                for key, label in _LEDGER_CLASSES.items()],
+            "semantics": ["所有占比均除以同一完整窗口，主表/明细/四态表分别闭合，三者不可相加。",
+                "同类别并行/重复记录合并覆盖；不同类别并行单列组合，不推断资源忙时或业务因果。",
+                "无设备记录的 Host 调用跨度不等于 CPU 实际运行，未观测时间不等于硬件空闲。"]})
+    return ledgers
 
 
 def _scaled_ns(value, factor=1000):
@@ -624,8 +827,21 @@ def analyze_trace(path, *, start_us=None, end_us=None, host_pids=None, device_pi
             coverages = {"host": coverage(HOST_KINDS), "sync": coverage(("sync",)), "copy": coverage(("copy",)),
                          "api": coverage(("runtime", "sync", "copy"))}
             devices, gaps, gap_total = _device_accounting(db, start, end, processes, coverages, bool(threads))
-            links, source_counts, link_total = _source_links(db, start, end, progress)
             device_cover = coverage(("device", "aicpu", "dma"), devices[0]["pid"]) if len(devices) == 1 else None
+            if progress:
+                progress("建立互斥完整时间账本（保留重叠与未观测区间）")
+            time_ledgers = _exclusive_time_ledgers(db, start, end, [row["pid"] for row in devices])
+            host_union_ns = coverages["host"][2][-1]
+            for ledger in time_ledgers:
+                state_ns = {row["key"]: row["duration_ns"] for row in ledger["coverage_states"]}
+                if state_ns["both"] + state_ns["host_only"] != host_union_ns:
+                    raise ValueError("exclusive ledger Host union differs from existing coverage")
+                recorded_union_ns = ((device_cover if device_cover is not None else
+                    coverage(("device", "aicpu", "dma"), ledger["device_pid"]))[2][-1]
+                    if ledger["device_pid"] is not None else 0)
+                if state_ns["both"] + state_ns["device_only"] != recorded_union_ns:
+                    raise ValueError("exclusive ledger device union differs from existing coverage")
+            links, source_counts, link_total = _source_links(db, start, end, progress)
             steps = []
             for identity, pid, tid, name, left, right in db.execute("SELECT id,pid,tid,name,start,end FROM events WHERE kind='annotation' AND end>? AND start<? ORDER BY start,id", (start, end)):
                 if not re.match(r"^(?:ProfilerStep|Iteration)#\d+(?:\b|$)", name):
@@ -670,6 +886,7 @@ def analyze_trace(path, *, start_us=None, end_us=None, host_pids=None, device_pi
                 "threads": threads, "hotspots": hotspots,
                 "apis": [row for row in hotspots if row["kind"] not in CPU_KINDS],
                 "steps": steps, "devices": devices, "gaps": gaps, "links": links,
+                "time_ledgers": time_ledgers,
                 "coverage": coverage_status,
                 "detail_limits": {"gaps": DETAIL_LIMIT, "links": DETAIL_LIMIT, "gap_rows_total": gap_total, "link_rows_total": link_total,
                     "gaps_truncated": gap_total > DETAIL_LIMIT, "links_truncated": link_total > DETAIL_LIMIT},
