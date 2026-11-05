@@ -4,13 +4,17 @@
 
 当前实现针对已核对的 **DSpark：源模型 8 个主层 + 3 个草稿层、每轮一次草稿 forward**。示例场景为 EP16 → EP128、主模型 8 → 61 层、草稿仍为 3 层。这是一套带明确假设的工程估算工具；输出不是目标 EP128 的实测性能，也不适用于任意模型和采样结构。
 
-**日常使用需要根目录这4个程序/配置文件；使用方法2时，还须保留随仓提供的 `data/communication-reference.csv`**。另行准备自己的采样数据。`tests/` 用于维护回归测试，`tools/` 是可选检查工具，均不参与默认估算流程。
+**外推流程需要根目录的3个原有程序和配置模板；使用方法2时，还须保留随仓提供的 `data/communication-reference.csv`**。另行准备自己的采样数据。`tests/` 用于维护回归测试，`tools/` 是可选检查工具，均不参与默认估算流程。
+
+已有 profiling、只看实测耗时和 CPU 侧调用时，使用独立入口 **[`profile_host.py`](profile_host.py)**。它不要求草稿模型、HC 标记或目标 EP，适合先检查 Step5 等新模型的可见 Host 开销；具体模型与芯片兼容性仍需实际采样核对。
 
 ```text
 ascend-ep-extrapolator/
 ├── profile_ep128.py                  # 核心统计与外推
 ├── build_ep128_leadership_excel.py   # Excel / HTML 展示
 ├── ep128_xlsx_writer.py              # XLSX 写入器
+├── profile_host.py                   # 独立的通用 Host 实测统计
+├── host_profile_report.py            # Host 报告导出
 ├── profile_ep128_cases.example.json  # 配置模板
 ├── README.md
 ├── data/communication-reference.csv  # 方法2原始历史通信参考表
@@ -38,7 +42,15 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-三个运行脚本应放在同一目录。当前版本：统计 `20261104.1.swa_u_drilldown`、Excel 生成器 `20261104.3.swa_u_drilldown`、写入器 `20261104.1.line_charts`。
+外推程序与展示程序应放在同一目录。当前版本：外推统计 `20261105.1.layer_stage_charts`、Excel 生成器 `20261105.1.method_stage_charts`、写入器 `20261104.1.line_charts`；独立 Host 统计 `20261105.1.generic_host`。
+
+## 只分析实测 Host 耗时
+
+```bash
+python profile_host.py /path/to/trace_view.json --out outputs/step5-host --model Step5 --hardware 950 --main-only --excel
+```
+
+无需填写外推配置。输出独立的 HTML、JSON、CSV 及可选 Excel，包括线程轨道、CPU 调用 inclusive/self、API/同步/队列、已标注步骤、设备记录覆盖及来源关联。`--main-only` 记录用户声明没有草稿模型。第一版输入为 JSON trace；没有 OS 调度采样时，CPU 实际忙时和利用率保留不可用。客户 Step5/950 尚未实测验证，详见[使用说明和统计口径](docs/host-profiling.md)。
 
 ## 快速运行
 
