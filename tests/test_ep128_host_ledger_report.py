@@ -60,14 +60,14 @@ class HostLedgerExportTests(unittest.TestCase):
                 self.assertEqual({row["start_ns"] for row in selected}, {str(10 ** 18)})
                 self.assertEqual({row["closure_error_ns"] for row in selected}, {"0"})
             self.assertEqual({row["capture_label"] for row in rows}, {"", "capture B"})
-            restored = json.loads(Path(paths["json"]).read_text())
+            restored = json.loads(Path(paths["json"]).read_text(encoding="utf-8"))
             self.assertEqual(restored["time_ledgers"], report["time_ledgers"])
 
     def test_html_primary_precedes_hotspots_and_labels_auxiliary_overlap(self):
         report = sample_report()
         with tempfile.TemporaryDirectory() as directory:
             paths = write_reports(report, directory)
-            page = Path(paths["html"]).read_text()
+            page = Path(paths["html"]).read_text(encoding="utf-8")
         self.assertLess(page.index('id="time-ledger"'), page.index("线程内热点 self"))
         self.assertIn('id="time-ledger-1"', page)
         self.assertIn("30 ms · 30.000%", page)
@@ -89,7 +89,7 @@ class HostLedgerExportTests(unittest.TestCase):
             paths = write_reports(report, directory, excel=True)
             with Path(paths["time_ledger_details_csv"]).open(encoding="utf-8-sig", newline="") as handle:
                 self.assertEqual(len(list(csv.DictReader(handle))), PREVIEW_ROWS + 7)
-            page = Path(paths["html"]).read_text()
+            page = Path(paths["html"]).read_text(encoding="utf-8")
             self.assertIn("50 / 57 项", page)
             self.assertNotIn("组合 56</td>", page)
             self.assertIn("其余7种已识别重叠组合", page)
@@ -133,7 +133,7 @@ class HostLedgerExportTests(unittest.TestCase):
             self.assertEqual(sum(values), totals[parent])
         with tempfile.TemporaryDirectory() as directory:
             paths = write_reports(report, directory, excel=True)
-            self.assertEqual(Path(paths["html"]).read_text().count("其余5种已识别重叠组合"), 2)
+            self.assertEqual(Path(paths["html"]).read_text(encoding="utf-8").count("其余5种已识别重叠组合"), 2)
             with Path(paths["time_ledger_details_csv"]).open(encoding="utf-8-sig", newline="") as handle:
                 exported = list(csv.DictReader(handle))
                 self.assertEqual(len(exported), 60)
@@ -164,7 +164,7 @@ class HostLedgerExportTests(unittest.TestCase):
         ledger.update(total_ns=57_000_000, total_ms=57, end_ns=ledger["start_ns"] + 57_000_000)
         with tempfile.TemporaryDirectory() as directory:
             paths = write_reports(report, directory, excel=True)
-            self.assertIn("主项 56", Path(paths["html"]).read_text())
+            self.assertIn("主项 56", Path(paths["html"]).read_text(encoding="utf-8"))
             with ZipFile(paths["xlsx"]) as archive:
                 ns = {"c": "http://schemas.openxmlformats.org/drawingml/2006/chart"}
                 chart = ET.fromstring(archive.read("xl/charts/chart1.xml"))
@@ -180,7 +180,7 @@ class HostLedgerExportTests(unittest.TestCase):
             report["source"] = {"path": str(source)}
             with self.assertRaisesRegex(ValueError, "overwrite the source"):
                 write_reports(report, directory)
-            self.assertEqual(source.read_text(), "original source")
+            self.assertEqual(source.read_text(encoding="utf-8"), "original source")
             self.assertFalse((Path(directory) / "host_profile_report.json").exists())
 
     def test_xlsx_has_primary_chart_with_share_labels_and_original_sheets(self):
@@ -215,7 +215,7 @@ class HostLedgerExportTests(unittest.TestCase):
         report["time_ledgers"][0]["breakdown"][0]["label"] = "<script>bad()</script>"
         with tempfile.TemporaryDirectory() as directory:
             paths = write_reports(report, directory)
-            page = Path(paths["html"]).read_text()
+            page = Path(paths["html"]).read_text(encoding="utf-8")
             self.assertNotIn("<script>", page)
             self.assertIn("&lt;script&gt;", page)
             with Path(paths["time_ledger_csv"]).open(encoding="utf-8-sig", newline="") as handle:
