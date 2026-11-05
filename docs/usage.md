@@ -120,13 +120,17 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 
 “方法1估算”和“方法2估算”两个 sheet 中，每个 case 的“轮次剩余区间耗时构成”图下，依次展示五组独立表格和原生可编辑横向柱状图：
 
-1. 主模型 CSA 层内 10 阶段，按层分别列示。
-2. 主模型 HCA 层内 10 阶段，按层分别列示。
-3. 草稿模型 SWA 层内 10 阶段，按层分别列示，不混合各层求平均。
+1. 主模型 CSA 的目标层内 10 阶段估算。
+2. 主模型 HCA 的目标层内 10 阶段估算。
+3. 草稿模型 SWA 的目标层内 10 阶段估算。
 4. 下一主模型 KV 与输入准备子阶段。
 5. 下一主 metadata 及输入映射准备子阶段。
 
-这些表图只使用当前方法 `selected_rank` 对应的源采样实测，不套用外推倍率；两种方法可能选择不同 rank，不能借用其他 rank 的诊断。主0仍展示，但不参加外推参考均值。阶段展开不改变目标周期或 TPOT，也不另外计入成本。诊断缺失、子阶段不完整或不能匹配所选 rank 时，保留不可用原因，未知值不补 0。旧 JSON 缺少细分证据时，需要用新版统计脚本重新处理采样，仅重绘 Excel 不能补出证据。
+前三组使用当前方法 `selected_rank`、保留轮次和原估算相同的参考层：先在每轮内取同类型参考层均值，再按保留轮次取均值，默认主0不参加参考。表格同时给出源单层均值、目标单层均值、目标同类全部层合计以及占完整目标周期的比例；主图采用目标同类全部层合计，便于比较目标模型的耗时构成。两种方法独立使用各自的通信倍率和所选 rank，不混用其他 rank 的诊断。
+
+Dispatch 阶段只追加核心的 Dispatch 增量，Combine 阶段只追加 Combine 增量；“专家计算及衔接”整段只追加其中路由 GMM 的增量，激活及衔接时间不整体乘倍率。其他阶段沿用源参考均值。目标 10 段之和必须等于目标单层耗时，乘同类型目标层数后等于该类型层区间合计；这些费用已经包含在完整周期内，不再次追加。占周期比例的分母包含其他类型层、层间衔接和 U，因此单个类型的比例之和通常小于 100%。
+
+后两组 U 子阶段仍按该方法所选 rank 的源实测展示，作为保留一次的 U 的展开，不套目标层数。源采样的逐层 CSA/HCA/SWA 诊断继续保存在“层与组件实测”和“时间账本”中。缺锚点、子阶段不完整或与父层不能闭合时，只把对应类型的目标细分标为不可用，父目标估算仍保留；未知值不补 0。旧 JSON 缺少 `target_stage_breakdowns` 时须用新版核心重新处理采样，仅重绘不能生成目标阶段估算。
 
 ### U15 与输入、metadata 子阶段
 
@@ -154,7 +158,7 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 
 ### CSA、HCA、SWA 10 段与同 rank 对照
 
-报告 JSON 的 `measurements[].layer_diagnostics` 保存 CSA、HCA、SWA 的层内阶段诊断；`layer_stage_summary.csv` 给出每 case、每 rank、每层的汇总，`*-layer-stages.csv` 保留逐轮 stage 边界与状态，位于 `step_residual_details/` 相应 case/rank 的证据目录。原有 `swa_stage_summary.csv`、`*-swa-stages.csv` 和 SWA 诊断字段继续保留兼容。旧 JSON 若只有 SWA 证据，只展示可用的 SWA，主模型 CSA/HCA 保持不可用，不补造结果。
+报告 JSON 的 `measurements[].layer_diagnostics` 保存 CSA、HCA、SWA 的源层内阶段诊断；`layer_stage_summary.csv` 给出每 case、每 rank、每层的汇总，`*-layer-stages.csv` 保留逐轮 stage 边界与状态，位于 `step_residual_details/` 相应 case/rank 的证据目录。原有 `swa_stage_summary.csv`、`*-swa-stages.csv` 和 SWA 诊断字段继续保留兼容。源诊断读取旧 JSON 时，若只有 SWA 证据，就只展示可用的 SWA，主模型 CSA/HCA 保持不可用；方法页的目标阶段图另需新版核心提供 `target_stage_breakdowns`，不从这些源诊断反推。
 
 | stage key | 含义 |
 | --- | --- |
