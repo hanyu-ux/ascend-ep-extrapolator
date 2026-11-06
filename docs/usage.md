@@ -136,6 +136,10 @@ Dispatch 阶段只追加核心的 Dispatch 增量，Combine 阶段只追加 Comb
 
 `step_residual_stages.csv` 继续保留原来的 U1 8 段、U2 7 段父阶段；`step_residual_substages.csv` 和每 rank 阶段明细保存 `level=1` 子阶段，`parent_stage_key` 指向父段。原有逐位置 Markov 子阶段继续保留。
 
+全部匹配时，“轮次剩余区间耗时构成”仍展示15阶段。若某个窗口全部轮次均为 `UNRESOLVED`，但单一未识别记录的轮次数、累计纳秒与窗口总量一致，则用该“未识别整窗”总耗时与另一侧已匹配父阶段共同展示；例如一个整窗加7段时，图中是8项，明确标注部分识别。每项互斥且总和须同时等于两窗口总量、诊断 U 和本方法所选 rank 的 U；不完整或矛盾的证据仍不能绘图。不把未识别窗口猜成8个阶段，不将未知值补零，也不把 Markov 等子段重复加入父项。
+
+“missing final hidden-width Norm before vocabulary projection”表示未能建立最终 Norm 到词表投影的边界，不证明模型没有 Norm。Norm 可以先处理全部或填充 token，再通过 Index/Gather 抽取投影所需行。脚本仅接受形状和时序完整的已知抽行链；否则继续显示未知，并附投影激活形状及可见 Norm 候选，便于核对原始 CSV。
+
 下一主模型 `main_inputs` 可细分为：
 
 | 子阶段 | 原生任务锚点 | 缺失处理 |
