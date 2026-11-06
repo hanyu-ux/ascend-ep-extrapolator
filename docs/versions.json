@@ -7,15 +7,15 @@
   },
   "components": {
     "profile_ep128.py": {
-      "version": "20261106.2.kv_epilog_evidence",
-      "sha256": "df54b3595a44419b864b84629f3ad344a7b0d670309c851f93e3c0da54433e77",
+      "version": "20261106.3.mixed_spec_cases",
+      "sha256": "832e27c9022efa758c8aab7636051577454e350680771209284fbc4e910f7a04",
       "imported_version": "20261103.12.native_stages",
       "imported_sha256": "035f0c6312354ca0937361f1ab301452ed61c68239845b2c0c76f08653f9d7f7",
       "matches_imported_source": false
     },
     "build_ep128_leadership_excel.py": {
-      "version": "20261106.1.u_stage_evidence",
-      "sha256": "4375ad4010da4d6421d185c686f953eae05f18cfba3f911135d8c07eb191749f",
+      "version": "20261106.2.mixed_spec_cases",
+      "sha256": "f8a905befabc3bd22721d6b210560942997ecff3bcff4c26f5ba0ba7b5efd578",
       "imported_version": "20261104.2.bs_inventory",
       "imported_sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
       "matches_imported_source": false
@@ -59,11 +59,12 @@
     "SWA and U diagnostic drill-downs add evidence only; original source/target cycle, TPOT and rank-selection formulas are unchanged. Repository iterations use branches and pull requests with offline regression checks.",
     "Main CSA/HCA and draft SWA retain per-layer source evidence. Both method sheets now show core-provided target ten-stage estimates, target same-type all-layer totals and complete-cycle shares; only Dispatch, Combine and routed-GMM deltas modify source spans. The two U drill-downs remain measured and retained once. Parent cycle, TPOT, throughput and rank-selection formulas are unchanged; missing stage evidence only disables the affected target drill-down.",
     "U charts can combine a verified all-round UNRESOLVED whole window with matched stages while preserving measured totals, counts, reasons and explicit partial-identification labels. Final Norm recognition accepts only a single explicit Index/Gather row-selection shape chain; ambiguous or insufficient evidence remains unresolved with bounded shape diagnostics. Core cycle, TPOT, throughput and target-layer estimates are unchanged.",
-    "Context-KV stages accept a shared positive num_context prefix of padded fused features while preserving hidden, projection, payload, slots and in-place cache checks. Packed UINT8 aliases compare by semantic dtype; bounded summary examples retain full per-round failure details in the stages CSV. Original cycle and extrapolation formulas are unchanged."
+    "Context-KV stages accept a shared positive num_context prefix of padded fused features while preserving hidden, projection, payload, slots and in-place cache checks. Packed UINT8 aliases compare by semantic dtype; bounded summary examples retain full per-round failure details in the stages CSV. Original cycle and extrapolation formulas are unchanged.",
+    "Independent cases can mix speculative-token counts and synthetic output lengths under an explicit mean accepted-draft fraction. Normalize num_speculative_tokens as the draft_tokens alias per configuration layer; case output policies override inherited fixed lengths and declared rates must agree with Neff=1+S*r. The template uses 60% instead of fixed Neff5.2. CSV, Excel and HTML display per-case parameters; existing timing formulas and BS grouping are unchanged."
   ],
   "validation": {
-    "discovered_tests": 288,
-    "passed": 278,
+    "discovered_tests": 298,
+    "passed": 288,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,

@@ -18,7 +18,7 @@ import traceback
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261106.1.u_stage_evidence"
+RENDERER_VERSION = "20261106.2.mixed_spec_cases"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -319,6 +319,49 @@ BS_INDEX_HEADERS = ["配置BS\n（每DP请求数）", "BS对比组", "采样组�
 BS_INDEX_SPANS = ((1, 1), (2, 3), (4, 6), (7, 12))
 BS_COMPARISON_SCOPE = ("按报告已声明的非BS条件及观测rank集合分组；横轴取config.bs，按数值升序、等距展示档位。"
     "每个点沿用该BS、该方法核心选中的rank，rank可随BS改变；缺少结果留空并断线，不补0或插值。")
+CASE_PARAMETERS_TITLE = "采样配置对照"
+CASE_PARAMETERS_HEADERS = ["采样组合", "配置BS", "草稿S\n（num_speculative_tokens）", "Neff\n（含bonus）",
+                           "声明的平均草稿接受比例\n（配置假设，非实测）"]
+CASE_PARAMETERS_SPANS = ((1, 4), (5, 5), (6, 6), (7, 8), (9, 12))
+CASE_PARAMETERS_SCOPE = ("S为每轮草稿预测token数；Neff为配置中的每请求每轮有效新token数（含bonus）。"
+    "接受比例仅展示明确声明且与S、Neff一致的配置假设；未声明或不一致时标为未声明，不从Neff推断实测接受率。")
+
+
+def _parameter_text(value):
+    """Use compact parameter labels without rounding any performance result."""
+    if not _number(value):
+        return "未声明"
+    if type(value) is int:
+        return str(value)
+    if value == 0:
+        return "0"
+    return format(value, ".6f").rstrip("0").rstrip(".")
+
+
+def _case_parameter_values(case):
+    """Display declared inputs; the consistency check never supplies a rate."""
+    config = case.get("config") or {}
+    bs, draft, effective = (config.get(key) for key in ("bs", "draft_tokens", "effective_tokens_per_round"))
+    rate = config.get("acceptance")
+    declared_rate = "未声明"
+    if (config.get("acceptance_semantics") == "mean_accepted_draft_fraction"
+            and type(draft) is int and draft >= 0 and _number(effective) and 1 <= effective <= 1 + draft
+            and _number(rate) and 0 <= rate <= 1
+            and math.isclose(effective, 1 + draft * rate, rel_tol=1e-9, abs_tol=1e-9)):
+        declared_rate = _parameter_text(100 * rate) + "%"
+    return [_parameter_text(bs) if type(bs) is int and bs > 0 else "未声明",
+            _parameter_text(draft) if type(draft) is int and draft >= 0 else "未声明",
+            _parameter_text(effective) if _number(effective) and effective >= 1 else "未声明", declared_rate]
+
+
+def _case_parameters(case):
+    bs, draft, effective, rate = _case_parameter_values(case)
+    return ("BS=" + bs + "；草稿S=" + draft + "；Neff=" + effective + "（含bonus）；"
+            "声明的平均草稿接受比例=" + rate + "（配置假设，非实测）")
+
+
+def _case_parameter_rows(report):
+    return [[case["name"], *_case_parameter_values(case)] for case in report["cases"]]
 
 
 def _bs_comparison_groups(report):
@@ -354,7 +397,7 @@ def _bs_comparison_groups(report):
         config = group["cases"][0].get("config") or {}
         group["label"] = ("BS对比组" + str(number) + " · " + _case_scope(group["cases"][0])
             + "；BS=" + _text([(case.get("config") or {}).get("bs") for case in group["cases"]])
-            + "；S=" + _text(config.get("draft_tokens")) + "，Neff=" + _text(config.get("effective_tokens_per_round"))
+            + "；S=" + _parameter_text(config.get("draft_tokens")) + "，Neff=" + _parameter_text(config.get("effective_tokens_per_round"))
             + "；目标DP=" + _text(config.get("target_dp")) + "，目标物理卡=" + _text(config.get("target_devices")))
         result.append(group)
     return result
@@ -668,9 +711,13 @@ def _overview(book, report):
         scope = PREVIEW + "：只读取配置，所有性能数值待估算。" + scope
     sheet = _sheet(book, SHEETS[0], "10T模型推理估算", scope)
     sheet.result_rows, sheet.result_cells = {}, {}
-    row = _bs_overview_section(sheet, 5, report)
+    row = _note(sheet, 5, CASE_PARAMETERS_TITLE)
+    row = _note(sheet, row, CASE_PARAMETERS_SCOPE)
+    row = _table(sheet, row, CASE_PARAMETERS_HEADERS, _case_parameter_rows(report), spans=CASE_PARAMETERS_SPANS)
+    row = _bs_overview_section(sheet, row, report)
     for case_index, case in enumerate(report["cases"]):
         row = _note(sheet, row, case["name"] + " · " + _case_scope(case), columns=12)
+        row = _note(sheet, row, _case_parameters(case), columns=12)
         for identity in ("method1", "method2"):
             method = _method(case, identity)
             row = _note(sheet, row, _layer_mean_name(method) + " / " + _layer_mean_status(method) +
@@ -684,6 +731,7 @@ def _overview(book, report):
 def _layer_mean_method_section(sheet, row, case, case_index, identity, method):
     row = _note(sheet, row, case["name"] + " · " + _layer_mean_name(method) +
                 " / " + _rank_note(method) + " / " + _layer_mean_status(method), columns=12)
+    row = _note(sheet, row, _case_parameters(case), columns=12)
     row = _layer_mean_cards(sheet, row, method, case_index, identity)
     rank_scope = ("以下为核心所选rank的均值；不独立取主/草稿或某组件的最大值。"
                   if _layer_mean_publishable(method) else "源参考均值保留；目标输入不足时不选择目标rank。")
@@ -1603,13 +1651,18 @@ def _html_preview(report, out):
              '<h1>10T模型推理估算</h1><p>' + esc(LAYER_MEAN_SCOPE) + '</p>',
              '<p><a href="' + esc(Path(out).name) + '">打开Excel（9个工作表）</a>；来源：' + esc(report.get('source_kind')) + '</p>']
     parts.append('<style>.bs-table{overflow-x:auto}.bs-table table{min-width:1200px}.bs-table th,.bs-table td{white-space:pre-line}.bs-trend{margin:28px 0;max-width:1120px}.bs-trend svg{display:block;width:100%;font:14px system-ui}.bs-trend figcaption{font-weight:600}</style>')
+    parts.append('<section class="case-parameters"><h2>' + esc(CASE_PARAMETERS_TITLE) + '</h2><p>'
+                 + esc(CASE_PARAMETERS_SCOPE) + '</p>'
+                 + _html_table(CASE_PARAMETERS_HEADERS, _case_parameter_rows(report)) + '</section>')
     parts.append(_bs_comparison_html(report))
     for case in report["cases"]:
         parts.append('<h2>' + esc(case["name"]) + '</h2><p>' + esc(_case_scope(case)) + '</p>')
+        parts.append('<p>' + esc(_case_parameters(case)) + '</p>')
         for identity in ("method1", "method2"):
             method = _method(case, identity)
             parts.append('<section><h3>' + esc(_layer_mean_name(method)) + '</h3><p>' +
                          esc(_rank_note(method)) + '；采样均值</p>')
+            parts.append('<p>' + esc(_case_parameters(case)) + '</p>')
             parts.append(_html_table(["完整周期(ms)", "TPOT(ms/token)", "预测单卡吞吐(token/s/card)", "状态"],
                          [[_target(method, "cycle_ms"), _target(method, "tpot_ms"), _target(method, "per_device_tokens_s"), _layer_mean_status(method)]]))
             parts.append(_html_table(LAYER_MEAN_MATRIX_HEADERS, _layer_mean_matrix_rows(method)))

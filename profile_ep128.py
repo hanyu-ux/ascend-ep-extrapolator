@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261106.2.kv_epilog_evidence"
+PROFILE_VERSION = "20261106.3.mixed_spec_cases"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -738,6 +738,29 @@ def referenced_object(value, base, name):
 
 
 def normalize_case(defaults, item, base):
+    def token_layer(values, label):
+        if not isinstance(values, dict):
+            raise ValueError(label + ' must be an object')
+        result = dict(values)
+        for field in ('draft_tokens', 'num_speculative_tokens'):
+            if field in result:
+                positive_int(result[field], label + '.' + field, zero=True)
+        if 'num_speculative_tokens' in result:
+            if 'draft_tokens' in result and result['draft_tokens'] != result['num_speculative_tokens']:
+                raise ValueError(label + ': draft_tokens conflicts with num_speculative_tokens')
+            result['draft_tokens'] = result.pop('num_speculative_tokens')
+        return result
+
+    # Normalize aliases separately so an explicit case S can override the
+    # other spelling in defaults without silently inheriting the old length.
+    defaults, item = token_layer(defaults, 'defaults'), token_layer(item, 'case')
+    if any(field in item for field in ('effective_tokens_per_round', 'synthetic_acceptance_length',
+                                       'acceptance', 'acceptance_semantics')):
+        # A case's explicit output policy replaces inherited fixed lengths.
+        # Keep a declared default rate as a consistency constraint unless the
+        # case overrides it; explicit Neff may still inherit its explanation.
+        defaults.pop('effective_tokens_per_round', None)
+        defaults.pop('synthetic_acceptance_length', None)
     case = {**defaults, **item}
     if not isinstance(case.get('name'), str) or not case['name'].strip():
         raise ValueError('Each case needs a nonempty name')
@@ -756,6 +779,10 @@ def normalize_case(defaults, item, base):
     if (case['draft_layers'], case['draft_passes']) != (3, 1):
         raise ValueError('The reviewed capture contract is three draft layers, one draft pass')
     case['trim_rounds'] = positive_int(case.get('trim_rounds', 2), 'trim_rounds', zero=True)
+    rate_effective = None
+    if case.get('acceptance_semantics') == 'mean_accepted_draft_fraction':
+        rate = finite_number(case.get('acceptance'), 'acceptance', minimum=0, maximum=1)
+        rate_effective = float(Decimal(1) + Decimal(case['draft_tokens']) * Decimal(str(rate)))
     if 'effective_tokens_per_round' in case:
         effective = finite_number(case['effective_tokens_per_round'], 'effective_tokens_per_round', minimum=1, maximum=1 + case['draft_tokens'])
         if not isinstance(case.get('token_basis'), str) or not case['token_basis'].strip():
@@ -763,14 +790,17 @@ def normalize_case(defaults, item, base):
     elif 'synthetic_acceptance_length' in case:
         effective = finite_number(case['synthetic_acceptance_length'], 'synthetic_acceptance_length', minimum=1, maximum=1 + case['draft_tokens'])
         case['token_basis'] = 'Configured synthetic mean new tokens per request per round, including the bonus token; not measured output'
-    elif case.get('acceptance_semantics') == 'mean_accepted_draft_fraction':
-        rate = finite_number(case.get('acceptance'), 'acceptance', minimum=0, maximum=1)
-        effective = 1 + case['draft_tokens'] * rate
+    elif rate_effective is not None:
+        effective = rate_effective
         case['token_basis'] = 'Configured 1+S*r, r=mean accepted draft count/S; includes one bonus token; not measured output'
     else:
         raise ValueError('Set effective_tokens_per_round plus token_basis; acceptance alone is ambiguous')
     if 'synthetic_acceptance_length' in case and not math.isclose(effective, finite_number(case['synthetic_acceptance_length'], 'synthetic_acceptance_length'), abs_tol=1e-9):
         raise ValueError('effective_tokens_per_round conflicts with synthetic_acceptance_length')
+    if rate_effective is not None and not math.isclose(effective, rate_effective, abs_tol=1e-9):
+        raise ValueError('effective output length conflicts with acceptance: mean_accepted_draft_fraction '
+                         + 'requires 1 + draft_tokens * acceptance = ' + str(rate_effective)
+                         + ' (including one bonus token), observed ' + str(effective))
     case['effective_tokens_per_round'] = effective
     for key in ('base_ep', 'expected_ranks'):
         positive_int(case.get(key), key)
@@ -2894,6 +2924,10 @@ def result_rows(report):
         config, target = case.get('config') or {}, case.get('target_model') or {}
         for method in displayed_methods(case):
             rows.append({'采样组合': case['name'], '每DP请求BS': config.get('bs'),
+                         '草稿token数S': config.get('draft_tokens'),
+                         '有效输出Neff(含bonus)': config.get('effective_tokens_per_round'),
+                         '配置平均草稿接受比例': (config.get('acceptance') if config.get('acceptance_semantics')
+                                           == 'mean_accepted_draft_fraction' else None),
                          '目标EP': config.get('target_ep'),
                          '数据范围': '目标' + str((target.get('main') or {}).get('num_hidden_layers', '未知'))
                                     + '主＋' + str((target.get('draft') or {}).get('num_hidden_layers', '未知')) + '草稿条件估算',

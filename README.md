@@ -38,7 +38,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-三个运行脚本应放在同一目录。当前版本：统计 `20261104.1.swa_u_drilldown`、Excel 生成器 `20261104.3.swa_u_drilldown`、写入器 `20261104.1.line_charts`。
+三个运行脚本应放在同一目录。当前版本：统计 `20261106.3.mixed_spec_cases`、Excel 生成器 `20261106.2.mixed_spec_cases`、写入器 `20261104.1.line_charts`。
 
 ## 快速运行
 
@@ -101,8 +101,11 @@ python -u build_ep128_leadership_excel.py --report ep128_report/model_architectu
 | --- | --- |
 | `bs` | **每个 DP rank/副本上的并发请求数**，不是整个系统请求数，也不是 MoE Dispatch 后的专家 token 行数 |
 | `draft_tokens` | 每轮草稿候选长度 S；不能直接作为有效输出长度 |
+| `num_speculative_tokens` | `draft_tokens` 的同义字段；同一层配置中若同时填写，两者必须相等 |
 | `effective_tokens_per_round` | 每请求、每轮平均有效新增输出 token 数 Neff，范围为 `[1, S+1]` |
-| `token_basis` | 说明 Neff 来自配置假设还是观测、是否包含 bonus token；必须填写 |
+| `synthetic_acceptance_length` | 含 bonus 的配置平均输出长度；与显式 Neff 同时提供时必须一致 |
+| `acceptance` / `acceptance_semantics` | 声明平均接受草稿比例 r 时，语义须为 `mean_accepted_draft_fraction`；Neff=`1+S*r` |
+| `token_basis` | 显式 Neff 的来源说明；SAL 或已声明语义的接受率会自动生成说明 |
 | `base_ep` / `target_ep` | 源/目标专家并行组大小；EP 不自动等于 DP 或物理卡数 |
 | `source_dp` / `target_dp` | 源/目标 DP 副本数量，用于系统吞吐折算 |
 | `source_devices` / `target_devices` | **物理卡数**，用于单卡吞吐分母 |
@@ -111,7 +114,34 @@ python -u build_ep128_leadership_excel.py --report ep128_report/model_architectu
 | `ranks_per_node` | 节点内参与的逻辑 rank 数，用于逻辑远端份额模型 |
 | `trim_rounds` | 每个 rank 首尾裁剪的轮次数，用于去除不稳定边界轮次 |
 
-模板中的 `Neff=5.2` 是**包含 bonus token 的配置假设**，不是设备 trace 统计出来的接受长度。`with_stack=false` 是当前计时采样合同；不要将不同采样条件混为同一基线。
+模板默认声明平均草稿接受比例 `r=0.6`，逐 case 按 `Neff=1+S*r` 计算；S7 仍为5.2，S9为6.4，均已包括一个 bonus token。这是**配置假设**，不是设备 trace 统计出来的接受率，也不是每个位置的条件接受概率。`with_stack=false` 是当前计时采样合同；不要将不同采样条件混为同一基线。
+
+### 一次统计不同草稿长度，固定平均接受比例60%
+
+在现有配置的 `defaults` 中使用以下两项，删除旧的固定 `effective_tokens_per_round`、`synthetic_acceptance_length` 及专门描述旧长度的 `token_basis`；模型、拓扑等通用设置继续保留：
+
+```json
+{"acceptance": 0.6, "acceptance_semantics": "mean_accepted_draft_fraction"}
+```
+
+将各次独立采样分别列入 `cases`，例如同 BS8 比较四种长度：
+
+```json
+[
+  {"name": "bs8-s3-r60", "bs": 8, "num_speculative_tokens": 3, "synthetic_acceptance_length": 2.8, "path": "data/bs8_s3_r60"},
+  {"name": "bs8-s5-r60", "bs": 8, "num_speculative_tokens": 5, "synthetic_acceptance_length": 4.0, "path": "data/bs8_s5_r60"},
+  {"name": "bs8-s7-r60", "bs": 8, "num_speculative_tokens": 7, "synthetic_acceptance_length": 5.2, "path": "data/bs8_s7_r60"},
+  {"name": "bs8-s9-r60", "bs": 8, "num_speculative_tokens": 9, "synthetic_acceptance_length": 6.4, "path": "data/bs8_s9_r60"}
+]
+```
+
+有默认60%策略时，也可省略每项 SAL，让脚本计算并核对 Neff。case 显式设置 SAL、Neff 或接受率时，会覆盖继承的固定长度；默认接受率仍作为一致性约束，除非该 case 也覆盖接受率。相互矛盾的声明会报错。旧的显式 Neff 配置仍有效，不会自动改成60%。
+
+```bash
+python -u profile_ep128.py cases.local.json --out ep128_report_multi --excel
+```
+
+每个 case 必须对应那组 S/接受长度实际采集的数据，不能反复使用同一 CSV 改 S 冒充不同实测。一个 case 的输入只能包含该次采样的各 rank；不要将所有不同 S 的共同父目录作为单个 case 扫描。总览、方法页、HTML 和最终 CSV 会标出 S、Neff 与已声明接受比例，原 BS 趋势仍按不同 S/Neff 分组。
 
 配置中的模型结构须与采样一致，包括隐藏维度、专家数、TopK、MoE 中间维度和完整 `compress_ratios` 序列。`schema_version=2` 是 JSON 结构版本，新增 BS 不改变它。
 
