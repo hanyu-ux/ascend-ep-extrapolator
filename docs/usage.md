@@ -27,7 +27,7 @@ data/communication-reference.csv
 - case 的 `bs` 是每个 DP 副本的请求数。名称中的数字不参与推断。
 - `base_ep`、`target_ep`、DP、物理卡数、每卡参与芯片数必须分别核对。不要自动把 EP、DP、rank 数和物理卡数当作同一个数。
 - `expected_ranks` 及可选的 `expected_rank_names` 对应本次采样全局逻辑 rank，不能反复选取同一个 CSV 冒充不同 rank。
-- `effective_tokens_per_round` 与 `token_basis` 明确有效新增 token 数的来源。示例 5.2 已包括 bonus，是假设，不是已核验接受率。
+- 显式 `effective_tokens_per_round` 与 `token_basis` 明确有效新增 token 数的来源；也可用 SAL 或有明确语义的接受率。模板采用平均草稿接受比例60%，S7 的 Neff 为5.2，已包括 bonus，是假设，不是已核验接受率。
 - `trim_rounds` 默认首尾各裁剪 2 轮。输入必须有足够的完整 HC 周期。
 
 示例配置中的 `data/bs8_s7` 等路径是占位。可以递归指定整个 case 的目录，也可以用显式 `inputs` 避免 rank 归属含糊：
@@ -47,6 +47,25 @@ data/communication-reference.csv
 这只演示两项输入，实际数量应与本次源采样相符。JSON 中的相对路径（包括 `communication_reference`）均相对于 cases JSON 所在目录。命令行 `--comm-reference` 的相对路径则相对于运行命令时的工作目录。使用 `inputs` 时移除该 case 原来的 `path`，避免同时指定两种输入方式。
 
 同次、同 rank 的 `trace_view.json` 可放在 CSV 相邻目录，或在对应 input 中配置 `trace_path`。缺 trace 时保留设备统计和缺失状态；不要借用其他轮次或其他 rank 的 trace。
+
+### 多组草稿长度与接受长度
+
+同一份 `cases.local.json` 可同时包含不同 BS、不同 `num_speculative_tokens`/`draft_tokens`、不同 `synthetic_acceptance_length` 的独立采样；每个 case 的名称须唯一，路径只包含该次采样的各 rank。工具不会从目录名推断 S，也不会用一份实测时间生成另一种 S 的采样。
+
+固定平均草稿接受比例60%时，使用 `acceptance=0.6`、`acceptance_semantics="mean_accepted_draft_fraction"`，不要同时在 defaults 写死一个 Neff 或 SAL。对应关系为：
+
+| num_speculative_tokens / S | synthetic_acceptance_length / Neff（含一个bonus） |
+| --- | --- |
+| 3 | 2.8 |
+| 5 | 4.0 |
+| 7 | 5.2 |
+| 9 | 6.4 |
+
+此处 `r=(Neff-1)/S`，不是 `Neff/S`，也不是逐位置条件接受概率。框架采样配置须与本组实际数据一致；分析配置不能改变真实采样条件。
+
+`num_speculative_tokens` 是 `draft_tokens` 的别名。defaults 和 case 各自先校验同义字段，再由 case 覆盖 defaults；同层双字段不等会报错。case 显式声明 Neff、SAL 或接受率时，覆盖继承的固定输出长度；仍保留的默认接受率会核对一致性。例如默认60%、S9、SAL5.2会被拒绝，正确 SAL 为6.4。显式 Neff 仍需 `token_basis`（可从 defaults 继承）；SAL/接受率模式会生成说明。
+
+完整混合配置片段见 [README](../README.md#一次统计不同草稿长度固定平均接受比例60)。用原主入口一次运行全部 cases，不需要单独的 scenarios 模式；同一 Excel 的配置对照表和各方法说明会列出每组 BS、S、Neff 与声明比例。未声明或语义不明的接受率显示为未声明，不反推成实测接受率。
 
 ## 2. 核对输入清单
 

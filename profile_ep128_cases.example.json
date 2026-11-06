@@ -134,8 +134,8 @@
     "target_devices": 128,
     "ranks_per_node": 8,
     "traffic_scope": "interhost",
-    "effective_tokens_per_round": 5.2,
-    "token_basis": "Configured synthetic mean new tokens per request per decode round (S=7), including one bonus token; not measured accepted output. Same 5.2 is an explicit target scenario assumption.",
+    "acceptance": 0.6,
+    "acceptance_semantics": "mean_accepted_draft_fraction",
     "exclude_target_layers": [
       0
     ],

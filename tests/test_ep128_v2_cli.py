@@ -337,6 +337,93 @@ raise SystemExit(p.main())
                     for name in expected:
                         self.assertIn(name, xml)
 
+    def test_same_bs_different_speculation_lengths_keep_independent_samples(self):
+        # Separate synthetic captures have deliberately different timings.
+        # Neither changing S on one capture nor reusing a BS-keyed result can
+        # establish the two independent estimates checked here.
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            path = manifest(base)
+            document = json.loads(path.read_text())
+            # Simulate an older manifest's stale S7 Neff/token_basis so the
+            # case-level synthetic length must take precedence for S9.
+            document['defaults'].update(acceptance=.6,
+                acceptance_semantics='mean_accepted_draft_fraction',
+                effective_tokens_per_round=5.2,
+                token_basis='Configured legacy S7 Neff including bonus; synthetic only')
+            document['cases'] = []
+            expected = {}
+            for speculative, factor, effective in ((7, 1, 5.2), (9, 2, 6.4)):
+                directory = base / f's{speculative}' / 'dp0'
+                directory.mkdir(parents=True)
+
+                def scale(rows, records):
+                    for row in rows:
+                        start = p.a_ns(row['Start Time(us)'])
+                        row['Start Time(us)'] = stamp_ns(EPOCH_NS + (start - EPOCH_NS) * factor)
+                        row['Duration(us)'] = str(float(row['Duration(us)']) * factor)
+                        if 'Dispatch' in row['Name']:
+                            tokens = 32 * (speculative + 1)
+                            row['Input Shapes'] = f'[{tokens},7168];[{tokens},16]'
+
+                capture, _ = fixture(directory, changes=scale)
+                name = f'SYNTHETIC_bs32_s{speculative}'
+                document['cases'].append({'name': name, 'bs': 32,
+                    'num_speculative_tokens': speculative,
+                    'synthetic_acceptance_length': effective,
+                    'inputs': [{'rank': 'dp0', 'path': capture['path']}]})
+                expected[name] = (speculative, effective, 1.1 * factor, capture['path'])
+            path.write_text(json.dumps(document))
+            result = self.invoke(path, base / 'out', '--excel')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            report = json.loads((base / 'out/model_architecture_report.json').read_text())
+            self.assertEqual(report['failures'], [])
+            self.assertEqual([case['name'] for case in report['cases']], list(expected))
+            methods = {}
+            digests = set()
+            for case in report['cases']:
+                speculative, effective, duration, source_path = expected[case['name']]
+                self.assertEqual(case['config']['bs'], 32)
+                self.assertEqual(case['config']['draft_tokens'], speculative)
+                self.assertAlmostEqual(case['config']['effective_tokens_per_round'], effective)
+                self.assertEqual([capture['path'] for capture in case['captures']], [source_path])
+                digests.add(case['captures'][0]['sha256'])
+                self.assertAlmostEqual(case['source']['aggregate']['cycle_ms'], duration)
+                self.assertAlmostEqual(case['source']['aggregate']['per_device_tokens_s'],
+                                       1000 * 32 * effective / duration)
+                self.assertTrue(case['measurements'][0]['rounds'])
+                for cycle in case['measurements'][0]['rounds']:
+                    self.assertAlmostEqual(cycle['duration_ms'], duration)
+                    self.assertAlmostEqual(cycle['output_tokens'], 32 * effective)
+                method = p.displayed_methods(case)[0]
+                methods[case['name']] = method
+                self.assertEqual(method['status'], 'LAYER_MEAN_ESTIMATE', method['reasons'])
+                self.assertAlmostEqual(method['tpot_ms'], method['cycle_ms'] / effective)
+            self.assertEqual(len(digests), 2)
+            self.assertNotAlmostEqual(*(method['cycle_ms'] for method in methods.values()))
+            with (base / 'out/最终结果.csv').open(encoding='utf-8-sig', newline='') as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 4)
+            for name, (speculative, effective, _, _) in expected.items():
+                own_rows = [row for row in rows if row['采样组合'] == name]
+                self.assertEqual(len(own_rows), 2)
+                for row in own_rows:
+                    self.assertEqual(int(row['草稿token数S']), speculative)
+                    self.assertAlmostEqual(float(row['有效输出Neff(含bonus)']), effective)
+                    self.assertAlmostEqual(float(row['配置平均草稿接受比例']), .6)
+                available = next(row for row in own_rows if row['周期(ms)'])
+                self.assertAlmostEqual(float(available['周期(ms)']), methods[name]['cycle_ms'])
+                self.assertAlmostEqual(float(available['TPOT(ms)']), methods[name]['cycle_ms'] / effective)
+            html = (base / 'out/report.html').read_text(encoding='utf-8')
+            for name in expected:
+                self.assertIn(name, html)
+            with ZipFile(base / 'out/10T模型推理估算.xlsx') as archive:
+                self.assertIsNone(archive.testzip())
+                for index in (1, 2, 3):
+                    xml = archive.read(f'xl/worksheets/sheet{index}.xml').decode()
+                    for name in expected:
+                        self.assertIn(name, xml)
+
 
 
     def test_default_diagnostics_and_excel_preserve_estimates_and_show_device_only_data(self):

@@ -337,6 +337,106 @@ class LayerMeanRendererTests(unittest.TestCase):
                                       if isinstance(value, (int, float)) and not isinstance(value, bool)})
         return chart.findall('.//c:lineChart/c:ser', ns)
 
+    def test_case_acceptance_label_requires_an_explicit_consistent_mean_fraction(self):
+        # All cases are synthetic declarations, not measured acceptance rates.
+        valid = dict(bs=8, draft_tokens=9, effective_tokens_per_round=6.399999999999999,
+                     acceptance=.6, acceptance_semantics='mean_accepted_draft_fraction')
+        self.assertEqual(renderer._case_parameter_values({'config': valid}), ['8', '9', '6.4', '60%'])
+        variants = [
+            {key: value for key, value in valid.items() if key != 'acceptance'},
+            {key: value for key, value in valid.items() if key != 'acceptance_semantics'},
+            {key: value for key, value in valid.items() if key != 'effective_tokens_per_round'},
+            {key: value for key, value in valid.items() if key != 'draft_tokens'},
+            {**valid, 'acceptance_semantics': 'conditional_per_position_probability'},
+            {**valid, 'effective_tokens_per_round': 5.2},
+            {**valid, 'acceptance': True},
+            {**valid, 'acceptance': '0.6'},
+            {**valid, 'acceptance': -0.1},
+            {**valid, 'acceptance': 1.1},
+            {**valid, 'draft_tokens': True},
+            {**valid, 'effective_tokens_per_round': True},
+            # A synthetic length alone never supplies an omitted Neff/rate.
+            {'bs': 8, 'draft_tokens': 9, 'synthetic_acceptance_length': 6.4},
+        ]
+        for config in variants:
+            with self.subTest(config=config):
+                before = copy.deepcopy(config)
+                self.assertEqual(renderer._case_parameter_values({'config': config})[-1], '未声明')
+                self.assertEqual(config, before)
+        for rate, effective, label in ((0., 1., '0%'), (1., 10., '100%'), (.625, 6.625, '62.5%')):
+            with self.subTest(rate=rate):
+                config = {**valid, 'acceptance': rate, 'effective_tokens_per_round': effective}
+                self.assertEqual(renderer._case_parameter_values({'config': config})[-1], label)
+        self.assertEqual(renderer._case_parameter_values({}), ['未声明'] * 4)
+
+    def test_mixed_speculation_parameters_are_visible_without_merging_cases_or_charts(self):
+        report = bs_trend_report()
+        templates = {case['config']['bs']: case for case in report['cases']}
+        report['cases'] = []
+        declarations = [('SYNTHETIC_Z_FIRST', 8, 9, 6.399999999999999),
+                        ('SYNTHETIC_A_SECOND', 8, 7, 5.2),
+                        ('SYNTHETIC_M_THIRD', 4, 9, 6.399999999999999),
+                        ('SYNTHETIC_B_FOURTH', 4, 7, 5.2)]
+        expected_rows, parameter_lines = [], []
+        for name, bs, draft, effective in declarations:
+            case = copy.deepcopy(templates[bs])
+            case['name'] = name
+            case['config'].update(name=name, bs=bs, draft_tokens=draft, effective_tokens_per_round=effective,
+                                  synthetic_acceptance_length=effective, acceptance=.6,
+                                  acceptance_semantics='mean_accepted_draft_fraction')
+            report['cases'].append(case)
+            neff = '6.4' if draft == 9 else '5.2'
+            expected_rows.append([name, str(bs), str(draft), neff, '60%'])
+            parameter_lines.append(f'BS={bs}；草稿S={draft}；Neff={neff}（含bonus）；'
+                                   '声明的平均草稿接受比例=60%（配置假设，非实测）')
+        groups = renderer._bs_comparison_groups(report)
+        self.assertEqual([[case['config']['draft_tokens'] for case in group['cases']] for group in groups],
+                         [[9, 9], [7, 7]])
+        self.assertEqual([[case['config']['bs'] for case in group['cases']] for group in groups], [[4, 8], [4, 8]])
+        self.assertEqual(renderer._case_parameter_rows(report), expected_rows)
+        out, (book, _) = self.build(report)
+        self.assertEqual(tuple(book), renderer.SHEETS)
+        overview = book['估算总览'][1]
+        title_row = next(int(cell[1:]) for cell, value in overview.items()
+                         if re.fullmatch(r'A\d+', cell) and value == '采样配置对照')
+        header_row = title_row + 2
+        self.assertEqual([overview.get(column + str(header_row)) for column in ('A', 'E', 'F', 'G', 'I')],
+                         renderer.CASE_PARAMETERS_HEADERS)
+        for offset, expected in enumerate(expected_rows, 1):
+            self.assertEqual([overview.get(column + str(header_row + offset))
+                              for column in ('A', 'E', 'F', 'G', 'I')], expected)
+        for sheet_name in ('估算总览', '方法1估算', '方法2估算'):
+            notes = [value for cell, value in book[sheet_name][1].items()
+                     if re.fullmatch(r'A\d+', cell) and value in parameter_lines]
+            self.assertEqual(notes, parameter_lines)
+            self.assertNotIn('Neff=6.399999', ' '.join(str(value) for value in book[sheet_name][1].values()))
+        ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
+        charts = self.chart_parts_by_sheet(out, book)
+        for sheet_name, expected_count in (('估算总览', 6), ('方法1估算', 2), ('方法2估算', 2)):
+            lines = [chart for chart in charts[sheet_name] if chart.find('.//c:lineChart', ns) is not None]
+            self.assertEqual(len(lines), expected_count)
+            for chart in lines:
+                self.assert_line_cache_matches_sheet(chart, book, [4, 8])
+        for group_index, group in enumerate(groups):
+            chart = charts['估算总览'][group_index * 3]
+            for series_index, identity in enumerate(('method1', 'method2')):
+                actual = [float(point.findtext('c:v', namespaces=ns)) for point in
+                          chart.findall('.//c:ser', ns)[series_index].findall('c:val/c:numRef/c:numCache/c:pt', ns)]
+                expected = [next(method for method in case['projection']['layer_mean_methods']
+                                 if method['id'] == identity)['per_device_tokens_s'] for case in group['cases']]
+                self.assertEqual(actual, expected)
+        preview = out.with_suffix('.html').read_text(encoding='utf-8')
+        start = preview.index('class="case-parameters"')
+        table = preview[start:preview.index('</table>', start)]
+        self.assertEqual(sorted(expected_rows, key=lambda row: table.index(row[0])), expected_rows)
+        for name, *_ in declarations:
+            self.assertIn('<td>' + name + '</td>', table)
+        for line in parameter_lines:
+            self.assertEqual(preview.count('<p>' + line + '</p>'), 3)
+        self.assertNotIn('Neff=6.399999', preview)
+        self.assertIn('非实测', table)
+        self.assertEqual(renderer.RENDERER_VERSION, '20261106.2.mixed_spec_cases')
+
     def test_old_style_twelve_columns_cards_matrices_and_closed_charts(self):
         report = layer_mean_fixture()
         out, (book, files) = self.build(report)
