@@ -24,7 +24,8 @@ def manifest(base, *, full=False):
     template = json.loads((HERE / 'profile_ep128_cases.example.json').read_text())
     template['sample_model'] = copy.deepcopy(MODEL)
     template['communication_reference'] = str(HERE / 'examples/communication-reference.synthetic.csv') if full else 'intentionally_absent_optional_reference.csv'
-    case = {'name': 'SYNTHETIC_CPU_ONLY', 'bs': 32, 'draft_tokens': 7, 'inputs': []}
+    case = {'name': 'SYNTHETIC_CPU_ONLY', 'bs': 32, 'draft_tokens': 7,
+            'synthetic_acceptance_length': 5.2, 'inputs': []}
     template['cases'] = [case]
     for rank in range(16 if full else 1):
         directory = base / ('dp' + str(rank))
@@ -251,6 +252,7 @@ raise SystemExit(p.main())
                     writer = csv.DictWriter(stream, fieldnames=fields)
                     writer.writeheader(); writer.writerows(rows)
                 document['cases'].append({'name': f'layout-bs{bs}', 'bs': bs, 'draft_tokens': 7,
+                    'synthetic_acceptance_length': 5.2,
                     'inputs': [{'rank': 'dp0', 'path': str(source)}]})
             path.write_text(json.dumps(document))
             result = self.invoke(path, base / 'out', '--excel')
@@ -305,6 +307,7 @@ raise SystemExit(p.main())
                 capture, _ = fixture(directory, changes=scale)
                 name = 'synthetic-bs' + str(bs)
                 document['cases'].append({'name': name, 'bs': bs, 'draft_tokens': 7,
+                                          'synthetic_acceptance_length': 5.2,
                                           'inputs': [{'rank': 'dp0', 'path': capture['path']}]})
                 expected[name] = (bs, 1.1 * factor)
             path.write_text(json.dumps(document))
@@ -345,8 +348,8 @@ raise SystemExit(p.main())
             base = Path(temporary)
             path = manifest(base)
             document = json.loads(path.read_text())
-            # Simulate an older manifest's stale S7 Neff/token_basis so the
-            # case-level synthetic length must take precedence for S9.
+            # An explicit case length replaces an older manifest's fixed
+            # Neff and acceptance policy; neither case declares a rate.
             document['defaults'].update(acceptance=.6,
                 acceptance_semantics='mean_accepted_draft_fraction',
                 effective_tokens_per_round=5.2,
@@ -368,9 +371,11 @@ raise SystemExit(p.main())
 
                 capture, _ = fixture(directory, changes=scale)
                 name = f'SYNTHETIC_bs32_s{speculative}'
+                length_field = ('synthetic_acceptance_length' if speculative == 7
+                                else 'synthetic_acception_length')
                 document['cases'].append({'name': name, 'bs': 32,
                     'num_speculative_tokens': speculative,
-                    'synthetic_acceptance_length': effective,
+                    length_field: effective,
                     'inputs': [{'rank': 'dp0', 'path': capture['path']}]})
                 expected[name] = (speculative, effective, 1.1 * factor, capture['path'])
             path.write_text(json.dumps(document))
@@ -386,6 +391,10 @@ raise SystemExit(p.main())
                 self.assertEqual(case['config']['bs'], 32)
                 self.assertEqual(case['config']['draft_tokens'], speculative)
                 self.assertAlmostEqual(case['config']['effective_tokens_per_round'], effective)
+                self.assertAlmostEqual(case['config']['synthetic_acceptance_length'], effective)
+                self.assertNotIn('synthetic_acception_length', case['config'])
+                self.assertNotIn('acceptance', case['config'])
+                self.assertNotIn('acceptance_semantics', case['config'])
                 self.assertEqual([capture['path'] for capture in case['captures']], [source_path])
                 digests.add(case['captures'][0]['sha256'])
                 self.assertAlmostEqual(case['source']['aggregate']['cycle_ms'], duration)
@@ -410,7 +419,7 @@ raise SystemExit(p.main())
                 for row in own_rows:
                     self.assertEqual(int(row['草稿token数S']), speculative)
                     self.assertAlmostEqual(float(row['有效输出Neff(含bonus)']), effective)
-                    self.assertAlmostEqual(float(row['配置平均草稿接受比例']), .6)
+                    self.assertEqual(row['配置平均草稿接受比例'], '')
                 available = next(row for row in own_rows if row['周期(ms)'])
                 self.assertAlmostEqual(float(available['周期(ms)']), methods[name]['cycle_ms'])
                 self.assertAlmostEqual(float(available['TPOT(ms)']), methods[name]['cycle_ms'] / effective)

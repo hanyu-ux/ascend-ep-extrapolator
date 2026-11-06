@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261106.3.mixed_spec_cases"
+PROFILE_VERSION = "20261106.4.per_case_spec_params"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -749,6 +749,14 @@ def normalize_case(defaults, item, base):
             if 'draft_tokens' in result and result['draft_tokens'] != result['num_speculative_tokens']:
                 raise ValueError(label + ': draft_tokens conflicts with num_speculative_tokens')
             result['draft_tokens'] = result.pop('num_speculative_tokens')
+        for field in ('synthetic_acceptance_length', 'synthetic_acception_length'):
+            if field in result:
+                finite_number(result[field], label + '.' + field, minimum=1)
+        if 'synthetic_acception_length' in result:
+            if ('synthetic_acceptance_length' in result and not math.isclose(
+                    result['synthetic_acceptance_length'], result['synthetic_acception_length'], abs_tol=1e-9)):
+                raise ValueError(label + ': synthetic_acceptance_length conflicts with synthetic_acception_length')
+            result['synthetic_acceptance_length'] = result.pop('synthetic_acception_length')
         return result
 
     # Normalize aliases separately so an explicit case S can override the
@@ -761,6 +769,12 @@ def normalize_case(defaults, item, base):
         # case overrides it; explicit Neff may still inherit its explanation.
         defaults.pop('effective_tokens_per_round', None)
         defaults.pop('synthetic_acceptance_length', None)
+    if 'synthetic_acceptance_length' in item and not any(
+            field in item for field in ('acceptance', 'acceptance_semantics')):
+        # A case's explicit synthetic length is its complete output policy;
+        # an older default acceptance-rate policy must not constrain it.
+        defaults.pop('acceptance', None)
+        defaults.pop('acceptance_semantics', None)
     case = {**defaults, **item}
     if not isinstance(case.get('name'), str) or not case['name'].strip():
         raise ValueError('Each case needs a nonempty name')
@@ -795,7 +809,9 @@ def normalize_case(defaults, item, base):
         case['token_basis'] = 'Configured 1+S*r, r=mean accepted draft count/S; includes one bonus token; not measured output'
     else:
         raise ValueError('Set effective_tokens_per_round plus token_basis; acceptance alone is ambiguous')
-    if 'synthetic_acceptance_length' in case and not math.isclose(effective, finite_number(case['synthetic_acceptance_length'], 'synthetic_acceptance_length'), abs_tol=1e-9):
+    if 'synthetic_acceptance_length' in case and not math.isclose(effective, finite_number(
+            case['synthetic_acceptance_length'], 'synthetic_acceptance_length',
+            minimum=1, maximum=1 + case['draft_tokens']), abs_tol=1e-9):
         raise ValueError('effective_tokens_per_round conflicts with synthetic_acceptance_length')
     if rate_effective is not None and not math.isclose(effective, rate_effective, abs_tol=1e-9):
         raise ValueError('effective output length conflicts with acceptance: mean_accepted_draft_fraction '

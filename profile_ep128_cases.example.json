@@ -134,8 +134,6 @@
     "target_devices": 128,
     "ranks_per_node": 8,
     "traffic_scope": "interhost",
-    "acceptance": 0.6,
-    "acceptance_semantics": "mean_accepted_draft_fraction",
     "exclude_target_layers": [
       0
     ],
@@ -146,25 +144,29 @@
       "name": "bs8-s7",
       "path": "data/bs8_s7",
       "bs": 8,
-      "draft_tokens": 7
+      "num_speculative_tokens": 7,
+      "synthetic_acceptance_length": 5.2
     },
     {
       "name": "bs16-s7",
       "path": "data/bs16_s7",
       "bs": 16,
-      "draft_tokens": 7
+      "num_speculative_tokens": 7,
+      "synthetic_acceptance_length": 5.2
     },
     {
       "name": "bs32-s7",
       "path": "data/bs32_s7",
       "bs": 32,
-      "draft_tokens": 7
+      "num_speculative_tokens": 7,
+      "synthetic_acceptance_length": 5.2
     },
     {
       "name": "bs64-s7",
       "path": "data/bs64_s7",
       "bs": 64,
-      "draft_tokens": 7
+      "num_speculative_tokens": 7,
+      "synthetic_acceptance_length": 5.2
     }
   ],
   "schema_version": 2,

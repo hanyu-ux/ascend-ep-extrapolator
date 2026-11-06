@@ -435,7 +435,71 @@ class LayerMeanRendererTests(unittest.TestCase):
             self.assertEqual(preview.count('<p>' + line + '</p>'), 3)
         self.assertNotIn('Neff=6.399999', preview)
         self.assertIn('非实测', table)
-        self.assertEqual(renderer.RENDERER_VERSION, '20261106.2.mixed_spec_cases')
+        self.assertEqual(renderer.RENDERER_VERSION, '20261106.3.per_case_spec_params')
+
+    def test_sal_only_cases_hide_unused_rate_column_and_keep_legacy_declared_rates(self):
+        # Synthetic normalized core reports: the second case never declares a rate.
+        for with_legacy_rate in (False, True):
+            with self.subTest(with_legacy_rate=with_legacy_rate):
+                report = layer_mean_fixture()
+                first = report['cases'][0]
+                first['name'] = 'SYNTHETIC_FIRST_S7'
+                first['config'].update(name=first['name'], bs=8, draft_tokens=7,
+                                       synthetic_acceptance_length=5.2, effective_tokens_per_round=5.2)
+                second = copy.deepcopy(first)
+                second['name'] = 'SYNTHETIC_SECOND_S9'
+                second['config'].update(name=second['name'], draft_tokens=9,
+                                        synthetic_acceptance_length=6.4, effective_tokens_per_round=6.4)
+                report['cases'].append(second)
+                if with_legacy_rate:
+                    first['config'].update(acceptance=.6, acceptance_semantics='mean_accepted_draft_fraction')
+                expected_headers = renderer.CASE_PARAMETERS_HEADERS if with_legacy_rate else renderer.CASE_PARAMETERS_HEADERS[:-1]
+                expected_rows = [[first['name'], '8', '7', '5.2'], [second['name'], '8', '9', '6.4']]
+                if with_legacy_rate:
+                    expected_rows[0].append('60%')
+                    expected_rows[1].append('未声明')
+                headers, rows, _ = renderer._case_parameter_table(report)
+                self.assertEqual(headers, expected_headers)
+                self.assertEqual(rows, expected_rows)
+                first_line = 'BS=8；草稿S=7；Neff=5.2（含bonus）'
+                if with_legacy_rate:
+                    first_line += '；声明的平均草稿接受比例=60%（配置假设，非实测）'
+                second_line = 'BS=8；草稿S=9；Neff=6.4（含bonus）'
+                out, (book, _) = self.build(report)
+                self.assertEqual(tuple(book), renderer.SHEETS)
+                cells = book['估算总览'][1]
+                title_row = next(int(cell[1:]) for cell, value in cells.items()
+                                 if re.fullmatch(r'A\d+', cell) and value == '采样配置对照')
+                header_row = title_row + 2
+                columns = ('A', 'E', 'F', 'G', 'I') if with_legacy_rate else ('A', 'E', 'F', 'G')
+                self.assertEqual([cells.get(column + str(header_row)) for column in columns], expected_headers)
+                for offset, expected in enumerate(expected_rows, 1):
+                    self.assertEqual([cells.get(column + str(header_row + offset)) for column in columns], expected)
+                if not with_legacy_rate:
+                    self.assertNotIn('I' + str(header_row), cells)
+                    self.assertIn(f'G{header_row}:L{header_row}',
+                                  [node.get('ref') for node in book['估算总览'][0].findall('{*}mergeCells/{*}mergeCell')])
+                for sheet_name in ('估算总览', '方法1估算', '方法2估算'):
+                    values = list(book[sheet_name][1].values())
+                    self.assertIn(first_line, values)
+                    self.assertIn(second_line, values)
+                    self.assertFalse(any('声明的平均草稿接受比例=未声明' in str(value) for value in values))
+                    if sheet_name != '估算总览':
+                        method_id = 'method1' if sheet_name == '方法1估算' else 'method2'
+                        for case in report['cases']:
+                            method = next(row for row in case['projection']['layer_mean_methods'] if row['id'] == method_id)
+                            for field in ('cycle_ms', 'tpot_ms', 'per_device_tokens_s'):
+                                self.assertIn(method[field], values)
+                preview = out.with_suffix('.html').read_text(encoding='utf-8')
+                start = preview.index('class="case-parameters"')
+                table = preview[start:preview.index('</table>', start)]
+                self.assertEqual(table.count('<th>'), 5 if with_legacy_rate else 4)
+                self.assertEqual(preview.count('<p>' + first_line + '</p>'), 3)
+                self.assertEqual(preview.count('<p>' + second_line + '</p>'), 3)
+                self.assertNotIn('声明的平均草稿接受比例=未声明', preview)
+                # Spellings are explained once, rather than repeated in every case.
+                self.assertEqual(preview.count('synthetic_acceptance_length'), 1)
+                self.assertEqual(preview.count('synthetic_acception_length'), 1)
 
     def test_old_style_twelve_columns_cards_matrices_and_closed_charts(self):
         report = layer_mean_fixture()
