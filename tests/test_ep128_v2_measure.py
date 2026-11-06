@@ -987,6 +987,182 @@ class ResidualStageTests(unittest.TestCase):
         self.assertIn("candidate_11 ", rows[0]["reason"])
         self.assertLess(len(rows[0]["reason"]), 1000)
 
+    def context_epilog_fixture(self, batch=4, fusion_rows=None, cache_shape=(4096,),
+                               cache_dtype="UINT8", slot_dtype="INT32", output_dtype=None):
+        """Public synthetic WKV/cache evidence; no customer capture is needed."""
+        window, tasks, boundaries = self.stage_fixture()
+        def shapes_text(shapes):
+            return ";".join(",".join(str(value) for value in shape) for shape in shapes)
+        for task in tasks:
+            for field in ("input_shapes", "output_shapes"):
+                shapes = residual.a_dims(getattr(task, field))
+                for shape in shapes:
+                    if shape and shape[0] == 4:
+                        shape[0] = batch
+                setattr(task, field, shapes_text(shapes))
+        # The proposer may crop padded fused features to num_context before
+        # WKV.  An exported Slice task is not required by that source contract.
+        if fusion_rows is not None:
+            concat = next(task for task in tasks if task.op_type == "ConcatD")
+            concat.input_shapes = ";".join([f"{fusion_rows},16"] * 3)
+            concat.output_shapes = f"{fusion_rows},48"
+            fusion = next(task for task in tasks if task.name == "auxiliary_fusion_matmul")
+            fusion.input_shapes = f"{fusion_rows},48;16,48"
+            fusion.output_shapes = f"{fusion_rows},16"
+        matrices = [task for task in tasks if task.name == "context_kv_matmul"]
+        writes = [task for task in tasks if task.op_type == "ScatterNdUpdateSk"]
+        cache = ",".join(str(value) for value in cache_shape)
+        for write in writes:
+            write.name = "aclnnKvCompressEpilog_KvCompressEpilog"
+            write.op_type = "KvCompressEpilog"
+            write.input_shapes = f"{cache};{batch},32;{batch}"
+            write.output_shapes = cache
+            write.input_dtypes = f"{cache_dtype};DT_BF16;{slot_dtype}"
+            write.output_dtypes = output_dtype or cache_dtype
+        return window, tasks, boundaries, matrices, writes
+
+    def test_context_epilog_direct_and_cropped_features_preserve_eight_stages_at_each_batch(self):
+        for batch in (4, 8, 16):
+            for cropped in (False, True):
+                with self.subTest(batch=batch, cropped=cropped):
+                    window, tasks, boundaries, matrices, _ = self.context_epilog_fixture(
+                        batch, fusion_rows=2 * batch if cropped else batch)
+                    # WKV processes the actual context rows, not the padded
+                    # fused row count, while all eight temporal anchors stay put.
+                    self.assertEqual(residual.a_dims(matrices[0].input_shapes)[0], [batch, 16])
+                    rows = residual.residual_stage_plan(window, tasks,
+                        {"bs": batch, "draft_layers": 3, "draft_tokens": 7})
+                    parents = self.assert_spans(rows, window, boundaries)
+                    self.assertEqual(len(parents), 8)
+                    self.assertEqual(next(row for row in parents if row["stage_key"] == "context_kv")["duration_ns"], 20)
+
+    def test_context_epilog_irregular_context_count_preserves_eight_stages(self):
+        # Deliberately synthetic: fusion has 256 padded rows and WKV consumes
+        # 130 context rows.  Neither count is inferred from the request batch.
+        window, tasks, boundaries, matrices, writes = self.context_epilog_fixture(batch=8, fusion_rows=256)
+        for matrix, write in zip(matrices, writes):
+            matrix.name, matrix.op_type = "context_kv_quantized_matmul", "QuantBatchMatmulV3"
+            matrix.input_shapes, matrix.output_shapes = "130,16;32,16;32,2,2;130,2,2", "130,32"
+            write.input_shapes = "4096;130,32;130"
+        rows = residual.residual_stage_plan(window, tasks, {"bs": 8, "draft_layers": 3, "draft_tokens": 7})
+        self.assertEqual(len(self.assert_spans(rows, window, boundaries)), 8)
+
+    def test_context_epilog_dtype_aliases_refer_to_the_same_in_place_cache_type(self):
+        aliases = (("UINT8", "DT_UINT8", "BFLOAT16", "DT_INT32"),
+                   ("DT_UINT8", "torch.uint8", "torch.bfloat16", "torch.int32"),
+                   ("torch.uint8", "UINT8", "BF16", "INT32"))
+        for cache_in, cache_out, payload, slots in aliases:
+            with self.subTest(cache_in=cache_in, cache_out=cache_out, payload=payload, slots=slots):
+                window, tasks, boundaries, _, writes = self.context_epilog_fixture(
+                    cache_dtype=cache_in, slot_dtype=slots, output_dtype=cache_out)
+                for write in writes:
+                    write.input_dtypes = f"{cache_in};{payload};{slots}"
+                rows = residual.residual_stage_plan(window, tasks, {"draft_layers": 3})
+                self.assertEqual(len(self.assert_spans(rows, window, boundaries)), 8)
+
+    def test_context_epilog_contradictions_remain_unresolved_without_losing_window_time(self):
+        cases = ("expanded_context", "different_layer_context", "wrong_hidden", "wrong_weight_hidden", "wrong_projection_output",
+                 "payload_rows", "payload_width", "slots_length", "slots_rank", "missing_slots",
+                 "cache_output_shape", "cache_output_dtype", "float16_payload", "packed_int64_slots",
+                 "fp8_e4m3fn_cache", "fp8_e5m2_cache", "unknown_cache_dtype", "unknown_slots_dtype",
+                 "missing_dtypes", "cache_rank_two", "cache_rank_three", "cache_rank_four", "cache_rank_five",
+                 "cache_zero_dimension", "cache_negative_dimension", "cache_nonunit_head",
+                 "zero_context_rows")
+        for batch in (4, 8, 16):
+            for case in cases:
+                with self.subTest(batch=batch, contradiction=case):
+                    window, tasks, boundaries, matrices, writes = self.context_epilog_fixture(batch)
+                    matrix, write = matrices[0], writes[0]
+                    if case == "expanded_context":
+                        matrix.input_shapes = f"{batch + 1},16;32,16"
+                        matrix.output_shapes = f"{batch + 1},32"
+                        write.input_shapes = f"4096;{batch + 1},32;{batch + 1}"
+                    elif case == "different_layer_context":
+                        for count, other, update in zip((batch, batch - 1, batch - 2), matrices, writes):
+                            other.input_shapes, other.output_shapes = f"{count},16;32,16", f"{count},32"
+                            update.input_shapes = f"4096;{count},32;{count}"
+                    elif case == "wrong_hidden":
+                        matrix.input_shapes = f"{batch},8;32,8"
+                    elif case == "wrong_weight_hidden":
+                        matrix.input_shapes = f"{batch},16;32,8"
+                    elif case == "wrong_projection_output":
+                        matrix.output_shapes = f"{batch},31"
+                        write.input_shapes = f"4096;{batch},31;{batch}"
+                    elif case == "payload_rows":
+                        write.input_shapes = f"4096;{batch + 1},32;{batch}"
+                    elif case == "payload_width":
+                        write.input_shapes = f"4096;{batch},31;{batch}"
+                    elif case == "slots_length":
+                        write.input_shapes = f"4096;{batch},32;{batch + 1}"
+                    elif case == "slots_rank":
+                        write.input_shapes = f"4096;{batch},32;{batch},1"
+                    elif case == "missing_slots":
+                        write.input_shapes = f"4096;{batch},32"
+                    elif case == "cache_output_shape":
+                        write.output_shapes = "2048"
+                    elif case == "cache_output_dtype":
+                        write.output_dtypes = "FLOAT8_E4M3FN"
+                    elif case == "float16_payload":
+                        write.input_dtypes = "UINT8;FLOAT16;INT32"
+                    elif case == "packed_int64_slots":
+                        write.input_dtypes = "UINT8;DT_BF16;INT64"
+                    elif case in ("fp8_e4m3fn_cache", "fp8_e5m2_cache"):
+                        cache_type = "FLOAT8_E4M3FN" if case == "fp8_e4m3fn_cache" else "FLOAT8_E5M2"
+                        write.input_dtypes, write.output_dtypes = f"{cache_type};DT_BF16;INT32", cache_type
+                    elif case == "unknown_cache_dtype":
+                        write.input_dtypes, write.output_dtypes = "FLOAT8_UNKNOWN;DT_BF16;INT32", "FLOAT8_UNKNOWN"
+                    elif case == "unknown_slots_dtype":
+                        write.input_dtypes = "UINT8;DT_BF16;FLOAT32"
+                    elif case == "missing_dtypes":
+                        write.input_dtypes = write.output_dtypes = ""
+                    elif case.startswith("cache_"):
+                        layout = {"cache_rank_two": "64,64", "cache_rank_three": "8,1,512",
+                                  "cache_rank_four": "2,4,1,512", "cache_rank_five": "1,2,1,4,512",
+                                  "cache_zero_dimension": "0,512",
+                                  "cache_negative_dimension": "-1,512", "cache_nonunit_head": "2,4,2,512"}[case]
+                        write.input_shapes = f"{layout};{batch},32;{batch}"
+                        write.output_shapes = layout
+                    elif case == "zero_context_rows":
+                        matrix.input_shapes, matrix.output_shapes = "0,16;32,16", "0,32"
+                        write.input_shapes = "4096;0,32;0"
+                    rows = residual.residual_stage_plan(window, tasks, {"bs": batch, "draft_layers": 3})
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["status"], "UNRESOLVED")
+                    self.assertEqual(int(rows[0]["start_ns"]), int(window["start_ns"]))
+                    self.assertEqual(int(rows[0]["end_ns"]), int(window["end_ns"]))
+                    self.assertEqual(rows[0]["duration_ns"], boundaries[-1])
+                    self.assertIn("KvCompressEpilog", rows[0]["reason"])
+                    self.assertIn("; failed=", rows[0]["reason"])
+                    self.assertIn("; projection row=", rows[0]["reason"])
+                    self.assertIn("; epilog row=", rows[0]["reason"])
+                    self.assertIn("; types=", rows[0]["reason"])
+                    self.assertLess(len(rows[0]["reason"]), 1600)
+
+    def test_many_distinct_failure_rows_keep_a_bounded_summary_and_full_raw_reasons(self):
+        window, tasks, _ = self.stage_fixture()
+        tasks.remove(next(task for task in tasks if task.name == "RmsNorm"))
+        template = residual.residual_stage_plan(window, tasks, {"draft_layers": 3})[0]
+        template.update(dict.fromkeys(residual.RESIDUAL_SOURCE_COUNTS, None))
+        template.update(dict.fromkeys(residual.RESIDUAL_SOURCE_NUMBERS, None))
+        template["source_status"] = "UNAVAILABLE"
+        stages, windows = [], []
+        for index in range(200):
+            reason = "sample_" + str(index) + "; epilog row=" + str(1000 + index) + "; " + "x" * 1500
+            stages.append({**template, "round_id": str(index), "reason": reason})
+            windows.append({**window, "round_id": str(index)})
+        original = copy.deepcopy(stages)
+        summary = residual.residual_stage_summary(stages, windows, 0)[0]
+        self.assertEqual(summary["status"], "UNRESOLVED")
+        self.assertEqual(summary["matched_windows"], 0)
+        self.assertEqual(summary["rounds"], 200)
+        self.assertEqual(summary["duration_ns_total"], template["duration_ns"] * 200)
+        self.assertLess(len(summary["reason"]), 4000)
+        self.assertIn("sample_0;", summary["reason"])
+        self.assertIn("sample_2;", summary["reason"])
+        self.assertNotIn("sample_199;", summary["reason"])
+        self.assertIn("197 additional distinct reasons", summary["reason"])
+        self.assertEqual(stages, original)
+
     def test_missing_lookup_output_uses_indices_shape_instead_of_bias_batch(self):
         for indices, matches in (("4", True), ("9", False), ("", False)):
             window, tasks, boundaries = self.stage_fixture("draft_to_nextmain")
@@ -1265,7 +1441,7 @@ class Dp9PastedStageTests(unittest.TestCase):
                     expected = self.oracle["rounds"][round_id][kind]
                     rows = residual.residual_stage_plan(window, list(reversed(tasks)), case)
                     parents = [row for row in rows if row["level"] == 0]
-                    children = [row for row in rows if row["level"] == 1]
+                    children = [row for row in rows if row["level"] == 1 and row["parent_stage_key"] == "markov"]
                     boundaries = expected["boundaries_ns"]
                     self.assertEqual([row["stage_key"] for row in parents], expected["stage_keys"])
                     self.assertEqual([row["start_ns"] for row in parents], boundaries[:-1])
@@ -1275,6 +1451,15 @@ class Dp9PastedStageTests(unittest.TestCase):
                                      int(window["end_ns"]) - int(window["start_ns"]))
                     self.assertTrue(all(row["status"] == "MATCHED" for row in rows))
                     self.assertEqual((window, tasks, case), original)
+                    for parent in parents:
+                        nested = sorted((row for row in rows if row["level"] == 1
+                                         and row["parent_stage_key"] == parent["stage_key"]),
+                                        key=lambda row: int(row["start_ns"]))
+                        if nested:
+                            self.assertEqual(nested[0]["start_ns"], parent["start_ns"])
+                            self.assertEqual(nested[-1]["end_ns"], parent["end_ns"])
+                            self.assertTrue(all(a["end_ns"] == b["start_ns"] for a, b in zip(nested, nested[1:])))
+                            self.assertEqual(sum(row["duration_ns"] for row in nested), parent["duration_ns"])
                     if kind == "draft_to_nextmain":
                         self.assertEqual([row["stage_key"] for row in children],
                                          ["markov_" + str(index) for index in range(1, 8)])

@@ -138,6 +138,10 @@ Dispatch 阶段只追加核心的 Dispatch 增量，Combine 阶段只追加 Comb
 
 全部匹配时，“轮次剩余区间耗时构成”仍展示15阶段。若某个窗口全部轮次均为 `UNRESOLVED`，但单一未识别记录的轮次数、累计纳秒与窗口总量一致，则用该“未识别整窗”总耗时与另一侧已匹配父阶段共同展示；例如一个整窗加7段时，图中是8项，明确标注部分识别。每项互斥且总和须同时等于两窗口总量、诊断 U 和本方法所选 rank 的 U；不完整或矛盾的证据仍不能绘图。不把未识别窗口猜成8个阶段，不将未知值补零，也不把 Markov 等子段重复加入父项。
 
+若原因包含 `KvCompressEpilog`，检查同一行的 `failed=`：它区分 context 行数/hidden、跨层 context 形状一致性、投影输出、cache 布局、payload、slots 和 dtype 等校验。原因同时带出原始 CSV 行号及观测形状、类型。一维 UINT8 缓存、BF16 payload、INT32 slots 签名保持严格校验；仅有融合 padding 导致的 context 裁剪不再要求投影行数与融合总行数完全相等，但各草稿层必须处理同一 context 形状。更新核心后须使用原 CSV 重新生成 JSON，再导出 Excel；只重绘旧 JSON 不会重新识别阶段。
+
+阶段汇总至多保留3条有界原因样例，避免大量不同 CSV 行号撑大 Excel 单元格；完整原因仍保存在逐轮阶段明细 CSV 中。
+
 “missing final hidden-width Norm before vocabulary projection”表示未能建立最终 Norm 到词表投影的边界，不证明模型没有 Norm。Norm 可以先处理全部或填充 token，再通过 Index/Gather 抽取投影所需行。脚本仅接受形状和时序完整的已知抽行链；否则继续显示未知，并附投影激活形状及可见 Norm 候选，便于核对原始 CSV。
 
 下一主模型 `main_inputs` 可细分为：
