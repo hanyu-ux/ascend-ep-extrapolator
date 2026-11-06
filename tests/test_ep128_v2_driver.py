@@ -232,7 +232,8 @@ class MixedSpeculationConfigTests(unittest.TestCase):
     def test_explicit_lengths_and_recognized_acceptance_rate_must_agree(self):
         valid = {'name': 'consistent-s9', 'bs': 8, 'draft_tokens': 9,
                  'effective_tokens_per_round': 6.4, 'synthetic_acceptance_length': 6.4,
-                 'token_basis': 'Configured including one bonus token'}
+                 'token_basis': 'Configured including one bonus token', 'acceptance': .6,
+                 'acceptance_semantics': 'mean_accepted_draft_fraction'}
         self.assertEqual(self.normalize(self.defaults(), valid)['effective_tokens_per_round'], 6.4)
         for altered in (
             {'synthetic_acceptance_length': 5.2},
@@ -242,11 +243,113 @@ class MixedSpeculationConfigTests(unittest.TestCase):
         ):
             with self.subTest(altered=altered), self.assertRaises(ValueError):
                 self.normalize(self.defaults(), {**valid, **altered})
-        for explicit in ({'synthetic_acceptance_length': 5.2},
-                         {'effective_tokens_per_round': 5.2, 'token_basis': 'Including bonus'}):
-            with self.subTest(default_rate_conflict=explicit), self.assertRaises(ValueError):
-                self.normalize(self.defaults(), {'name': 'conflicting-s9', 'bs': 8,
-                                                'draft_tokens': 9, **explicit})
+        result = self.normalize(self.defaults(), {'name': 'sal-overrides-default-rate', 'bs': 8,
+                                'draft_tokens': 9, 'synthetic_acceptance_length': 5.2})
+        self.assertEqual(result['effective_tokens_per_round'], 5.2)
+        self.assertNotIn('acceptance', result)
+        self.assertNotIn('acceptance_semantics', result)
+        # Explicit Neff alone retains the existing default-rate constraint.
+        with self.assertRaises(ValueError):
+            self.normalize(self.defaults(), {'name': 'conflicting-s9', 'bs': 8, 'draft_tokens': 9,
+                'effective_tokens_per_round': 5.2, 'token_basis': 'Including bonus'})
+
+    def test_independent_samples_need_only_speculative_count_and_synthetic_length(self):
+        common = self.defaults(rate=False)
+        for spelling in ('synthetic_acceptance_length', 'synthetic_acception_length'):
+            normalized = []
+            for length, effective in ((3, 2.3), (5, 4.4), (7, 5.2), (9, 6.4)):
+                with self.subTest(spelling=spelling, length=length):
+                    local = {'name': f'bs8-s{length}', 'bs': 8, 'num_speculative_tokens': length,
+                             spelling: effective, 'path': f'generic-independent-samples/s{length}'}
+                    result = self.normalize(common, local)
+                    self.assertEqual(result['draft_tokens'], length)
+                    self.assertEqual(result['synthetic_acceptance_length'], effective)
+                    self.assertEqual(result['effective_tokens_per_round'], effective)
+                    self.assertIn('bonus', result['token_basis'])
+                    self.assertNotIn('num_speculative_tokens', result)
+                    self.assertNotIn('synthetic_acception_length', result)
+                    self.assertNotIn('acceptance', result)
+                    self.assertNotIn('acceptance_semantics', result)
+                    normalized.append(result)
+            self.assertEqual(len({entry['name'] for entry in normalized}), 4)
+            self.assertEqual(len({entry['path'] for entry in normalized}), 4)
+
+    def test_synthetic_length_spellings_share_canonical_case_override_behavior(self):
+        configurations = (
+            ({'synthetic_acception_length': 5.2}, {}, 5.2),
+            ({'synthetic_acceptance_length': 5.2}, {'synthetic_acception_length': 6.4}, 6.4),
+            ({'synthetic_acception_length': 5.2}, {'synthetic_acceptance_length': 6.4}, 6.4),
+            ({'synthetic_acceptance_length': 5.2, 'synthetic_acception_length': 5.2},
+             {'synthetic_acceptance_length': 6.4, 'synthetic_acception_length': 6.4}, 6.4),
+        )
+        for inherited, explicit, expected in configurations:
+            with self.subTest(defaults=inherited, item=explicit):
+                result = self.normalize({**self.defaults(rate=False), **inherited},
+                    {'name': 'canonical-sal', 'bs': 8, 'num_speculative_tokens': 9, **explicit})
+                self.assertEqual(result['synthetic_acceptance_length'], expected)
+                self.assertEqual(result['effective_tokens_per_round'], expected)
+                self.assertNotIn('synthetic_acception_length', result)
+        for inherited, explicit in (
+            ({'synthetic_acceptance_length': 5.2, 'synthetic_acception_length': 6.4},
+             {'synthetic_acceptance_length': 6.4}),
+            ({'synthetic_acceptance_length': 5.2},
+             {'synthetic_acceptance_length': 5.2, 'synthetic_acception_length': 6.4}),
+        ):
+            with self.subTest(conflicting_defaults=inherited, conflicting_item=explicit), self.assertRaises(ValueError):
+                self.normalize({**self.defaults(rate=False), **inherited},
+                    {'name': 'conflicting-sal', 'bs': 8, 'draft_tokens': 9, **explicit})
+
+    def test_synthetic_length_aliases_reject_invalid_values_before_inheritance(self):
+        invalid_values = (None, True, False, '5.2', 0, .999, -1, float('nan'), float('inf'), -float('inf'))
+        for spelling in ('synthetic_acceptance_length', 'synthetic_acception_length'):
+            for invalid in invalid_values:
+                for layer in ('defaults', 'item'):
+                    common = self.defaults(rate=False)
+                    local = {'name': 'invalid-sal', 'bs': 8, 'num_speculative_tokens': 9,
+                             'synthetic_acceptance_length': 6.4}
+                    if layer == 'defaults':
+                        common[spelling] = invalid  # Explicit overrides must not hide malformed defaults.
+                    else:
+                        local[spelling] = invalid
+                    with self.subTest(spelling=spelling, invalid=invalid, layer=layer), self.assertRaises(ValueError):
+                        self.normalize(common, local)
+        for spelling in ('synthetic_acceptance_length', 'synthetic_acception_length'):
+            for length in (3, 9):
+                for effective in (1, length + 1):
+                    with self.subTest(spelling=spelling, length=length, boundary=effective):
+                        result = self.normalize(self.defaults(rate=False),
+                            {'name': 'sal-boundary', 'bs': 8, 'num_speculative_tokens': length, spelling: effective})
+                        self.assertEqual(result['effective_tokens_per_round'], effective)
+                with self.subTest(spelling=spelling, length=length, outside='S+1'), self.assertRaises(ValueError):
+                    self.normalize(self.defaults(rate=False),
+                        {'name': 'too-large-sal', 'bs': 8, 'num_speculative_tokens': length, spelling: length + 1.01})
+                # Approximate equality to an explicit Neff must never bypass
+                # the strict [1,S+1] domain of the separately declared SAL.
+                with self.subTest(spelling=spelling, length=length, outside='near-S+1'), self.assertRaises(ValueError):
+                    self.normalize(self.defaults(rate=False), {'name': 'near-boundary-sal', 'bs': 8,
+                        'num_speculative_tokens': length, spelling: length + 1 + 1e-9,
+                        'effective_tokens_per_round': length + 1, 'token_basis': 'Including one bonus token'})
+                with self.subTest(spelling=spelling, length=length, inside='small-valid-difference'):
+                    result = self.normalize(self.defaults(rate=False), {'name': 'in-range-sal', 'bs': 8,
+                        'num_speculative_tokens': length, spelling: length + .5 + 1e-9,
+                        'effective_tokens_per_round': length + .5, 'token_basis': 'Including one bonus token'})
+                    self.assertEqual(result['effective_tokens_per_round'], length + .5)
+
+    def test_explicit_synthetic_length_isolates_old_default_rate_but_preserves_explicit_rate_checks(self):
+        for spelling in ('synthetic_acceptance_length', 'synthetic_acception_length'):
+            common = {**self.defaults(), 'effective_tokens_per_round': 5.2,
+                      'token_basis': 'Old configured S7 mean including bonus'}
+            local = {'name': 'independent-s9-sal', 'bs': 8, 'num_speculative_tokens': 9, spelling: 3.3}
+            result = self.normalize(common, local)
+            self.assertEqual(result['effective_tokens_per_round'], 3.3)
+            self.assertNotIn('acceptance', result)
+            self.assertNotIn('acceptance_semantics', result)
+            self.assertNotEqual(result['token_basis'], common['token_basis'])
+            for explicit_rate in ({'acceptance': .6},
+                                  {'acceptance_semantics': 'mean_accepted_draft_fraction'},
+                                  {'acceptance': .6, 'acceptance_semantics': 'mean_accepted_draft_fraction'}):
+                with self.subTest(spelling=spelling, explicit_rate=explicit_rate), self.assertRaises(ValueError):
+                    self.normalize(common, {**local, **explicit_rate})
 
     def test_legacy_explicit_neff_is_preserved_without_inferring_acceptance(self):
         common = {**self.defaults(rate=False), 'draft_tokens': 7,

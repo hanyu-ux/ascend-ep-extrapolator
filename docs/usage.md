@@ -27,7 +27,7 @@ data/communication-reference.csv
 - case 的 `bs` 是每个 DP 副本的请求数。名称中的数字不参与推断。
 - `base_ep`、`target_ep`、DP、物理卡数、每卡参与芯片数必须分别核对。不要自动把 EP、DP、rank 数和物理卡数当作同一个数。
 - `expected_ranks` 及可选的 `expected_rank_names` 对应本次采样全局逻辑 rank，不能反复选取同一个 CSV 冒充不同 rank。
-- 显式 `effective_tokens_per_round` 与 `token_basis` 明确有效新增 token 数的来源；也可用 SAL 或有明确语义的接受率。模板采用平均草稿接受比例60%，S7 的 Neff 为5.2，已包括 bonus，是假设，不是已核验接受率。
+- 每个 case 单独填写 `num_speculative_tokens` 和 `synthetic_acceptance_length`（兼容 `synthetic_acception_length`），不需要接受率。长度已含 bonus，是配置假设；旧 Neff/接受率配置仍兼容。
 - `trim_rounds` 默认首尾各裁剪 2 轮。输入必须有足够的完整 HC 周期。
 
 示例配置中的 `data/bs8_s7` 等路径是占位。可以递归指定整个 case 的目录，也可以用显式 `inputs` 避免 rank 归属含糊：
@@ -36,7 +36,8 @@ data/communication-reference.csv
 {
   "name": "bs8-s7",
   "bs": 8,
-  "draft_tokens": 7,
+  "num_speculative_tokens": 7,
+  "synthetic_acceptance_length": 5.2,
   "inputs": [
     {"rank": "dp0", "path": "data/bs8_s7/dp0/kernel_details.csv"},
     {"rank": "dp1", "path": "data/bs8_s7/dp1/kernel_details.csv"}
@@ -52,7 +53,7 @@ data/communication-reference.csv
 
 同一份 `cases.local.json` 可同时包含不同 BS、不同 `num_speculative_tokens`/`draft_tokens`、不同 `synthetic_acceptance_length` 的独立采样；每个 case 的名称须唯一，路径只包含该次采样的各 rank。工具不会从目录名推断 S，也不会用一份实测时间生成另一种 S 的采样。
 
-固定平均草稿接受比例60%时，使用 `acceptance=0.6`、`acceptance_semantics="mean_accepted_draft_fraction"`，不要同时在 defaults 写死一个 Neff 或 SAL。对应关系为：
+推荐直接在每组 case 填写 S 与 SAL，不在 defaults 中填写接受率或统一输出长度。以下数值对应之前60%的示例，但工具不会强制这个比例：
 
 | num_speculative_tokens / S | synthetic_acceptance_length / Neff（含一个bonus） |
 | --- | --- |
@@ -61,11 +62,11 @@ data/communication-reference.csv
 | 7 | 5.2 |
 | 9 | 6.4 |
 
-此处 `r=(Neff-1)/S`，不是 `Neff/S`，也不是逐位置条件接受概率。框架采样配置须与本组实际数据一致；分析配置不能改变真实采样条件。
+SAL 已包含 bonus，直接作为 Neff 使用，不再加1。框架采样配置须与本组实际数据一致；分析配置不能改变真实采样条件，也不会从 profiling 反推出实测接受率。
 
-`num_speculative_tokens` 是 `draft_tokens` 的别名。defaults 和 case 各自先校验同义字段，再由 case 覆盖 defaults；同层双字段不等会报错。case 显式声明 Neff、SAL 或接受率时，覆盖继承的固定输出长度；仍保留的默认接受率会核对一致性。例如默认60%、S9、SAL5.2会被拒绝，正确 SAL 为6.4。显式 Neff 仍需 `token_basis`（可从 defaults 继承）；SAL/接受率模式会生成说明。
+`num_speculative_tokens` 是 `draft_tokens` 的别名；`synthetic_acception_length` 是 `synthetic_acceptance_length` 的兼容拼写。defaults 和 case 各自先校验同义字段，再由 case 覆盖 defaults；同层两种写法不等会报错。case 显式填写 SAL 且没有自己声明接受率时，清除继承的旧接受率策略及固定输出长度；不受 defaults 中旧60%值干扰。同 case 自己另外声明的 Neff/接受率仍必须一致。SAL 路径自动生成 token_basis，直接填这两个参数即可；旧显式 Neff 路径仍需来源说明。
 
-完整混合配置片段见 [README](../README.md#一次统计不同草稿长度固定平均接受比例60)。用原主入口一次运行全部 cases，不需要单独的 scenarios 模式；同一 Excel 的配置对照表和各方法说明会列出每组 BS、S、Neff 与声明比例。未声明或语义不明的接受率显示为未声明，不反推成实测接受率。
+完整混合配置片段见 [README](../README.md)。用原主入口一次运行全部 cases，不需要单独的 scenarios 模式；同一 Excel 的配置对照表和各方法说明会列出每组 BS、S、SAL/Neff。无接受率输入时不展示该列；旧报告若明确声明了有效接受率，仍保留其说明。
 
 ## 2. 核对输入清单
 

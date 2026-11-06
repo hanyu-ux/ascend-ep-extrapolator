@@ -18,7 +18,7 @@ import traceback
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261106.2.mixed_spec_cases"
+RENDERER_VERSION = "20261106.3.per_case_spec_params"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -320,11 +320,12 @@ BS_INDEX_SPANS = ((1, 1), (2, 3), (4, 6), (7, 12))
 BS_COMPARISON_SCOPE = ("按报告已声明的非BS条件及观测rank集合分组；横轴取config.bs，按数值升序、等距展示档位。"
     "每个点沿用该BS、该方法核心选中的rank，rank可随BS改变；缺少结果留空并断线，不补0或插值。")
 CASE_PARAMETERS_TITLE = "采样配置对照"
-CASE_PARAMETERS_HEADERS = ["采样组合", "配置BS", "草稿S\n（num_speculative_tokens）", "Neff\n（含bonus）",
+CASE_PARAMETERS_HEADERS = ["采样组合", "配置BS", "草稿S\n（num_speculative_tokens）", "SAL / Neff\n（含bonus）",
                            "声明的平均草稿接受比例\n（配置假设，非实测）"]
 CASE_PARAMETERS_SPANS = ((1, 4), (5, 5), (6, 6), (7, 8), (9, 12))
-CASE_PARAMETERS_SCOPE = ("S为每轮草稿预测token数；Neff为配置中的每请求每轮有效新token数（含bonus）。"
-    "接受比例仅展示明确声明且与S、Neff一致的配置假设；未声明或不一致时标为未声明，不从Neff推断实测接受率。")
+CASE_PARAMETERS_SCOPE = ("S为每轮草稿预测token数；SAL（synthetic_acceptance_length，兼容拼写synthetic_acception_length）"
+    "按每请求每轮有效新token数Neff展示，含bonus。接受比例仅在明确声明且与S、Neff一致时展示，"
+    "属于配置假设；不从长度反推实测接受率。")
 
 
 def _parameter_text(value):
@@ -356,12 +357,19 @@ def _case_parameter_values(case):
 
 def _case_parameters(case):
     bs, draft, effective, rate = _case_parameter_values(case)
-    return ("BS=" + bs + "；草稿S=" + draft + "；Neff=" + effective + "（含bonus）；"
-            "声明的平均草稿接受比例=" + rate + "（配置假设，非实测）")
+    label = "BS=" + bs + "；草稿S=" + draft + "；Neff=" + effective + "（含bonus）"
+    return label if rate == "未声明" else label + "；声明的平均草稿接受比例=" + rate + "（配置假设，非实测）"
 
 
 def _case_parameter_rows(report):
     return [[case["name"], *_case_parameter_values(case)] for case in report["cases"]]
+
+
+def _case_parameter_table(report):
+    rows = _case_parameter_rows(report)
+    if any(row[-1] != "未声明" for row in rows):
+        return CASE_PARAMETERS_HEADERS, rows, CASE_PARAMETERS_SPANS
+    return CASE_PARAMETERS_HEADERS[:-1], [row[:-1] for row in rows], (*CASE_PARAMETERS_SPANS[:3], (7, 12))
 
 
 def _bs_comparison_groups(report):
@@ -713,7 +721,8 @@ def _overview(book, report):
     sheet.result_rows, sheet.result_cells = {}, {}
     row = _note(sheet, 5, CASE_PARAMETERS_TITLE)
     row = _note(sheet, row, CASE_PARAMETERS_SCOPE)
-    row = _table(sheet, row, CASE_PARAMETERS_HEADERS, _case_parameter_rows(report), spans=CASE_PARAMETERS_SPANS)
+    headers, records, spans = _case_parameter_table(report)
+    row = _table(sheet, row, headers, records, spans=spans)
     row = _bs_overview_section(sheet, row, report)
     for case_index, case in enumerate(report["cases"]):
         row = _note(sheet, row, case["name"] + " · " + _case_scope(case), columns=12)
@@ -1651,9 +1660,10 @@ def _html_preview(report, out):
              '<h1>10T模型推理估算</h1><p>' + esc(LAYER_MEAN_SCOPE) + '</p>',
              '<p><a href="' + esc(Path(out).name) + '">打开Excel（9个工作表）</a>；来源：' + esc(report.get('source_kind')) + '</p>']
     parts.append('<style>.bs-table{overflow-x:auto}.bs-table table{min-width:1200px}.bs-table th,.bs-table td{white-space:pre-line}.bs-trend{margin:28px 0;max-width:1120px}.bs-trend svg{display:block;width:100%;font:14px system-ui}.bs-trend figcaption{font-weight:600}</style>')
+    parameter_headers, parameter_rows, _ = _case_parameter_table(report)
     parts.append('<section class="case-parameters"><h2>' + esc(CASE_PARAMETERS_TITLE) + '</h2><p>'
                  + esc(CASE_PARAMETERS_SCOPE) + '</p>'
-                 + _html_table(CASE_PARAMETERS_HEADERS, _case_parameter_rows(report)) + '</section>')
+                 + _html_table(parameter_headers, parameter_rows) + '</section>')
     parts.append(_bs_comparison_html(report))
     for case in report["cases"]:
         parts.append('<h2>' + esc(case["name"]) + '</h2><p>' + esc(_case_scope(case)) + '</p>')
