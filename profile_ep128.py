@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261105.2.target_layer_stages"
+PROFILE_VERSION = "20261106.1.u_stage_evidence"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -2180,6 +2180,82 @@ def residual_stage_plan(window, tasks, case=None):
     def integer64(value):
         return value in ("INT64", "DTINT64", "TORCHINT64")
 
+    def norm_tasks():
+        # Both native CANN names and explicit exported operator types occur.
+        # FusedRmsNorm/MhcRmsNorm already contain RmsNorm; underscore spelling
+        # is an additional known RMSNorm name, not a generic "norm" fallback.
+        pattern = re.compile(r"Rms_?Norm", re.I)
+        return [task for task in tasks if pattern.search(task.name) or pattern.search(task.op_type)]
+
+    def norm_links(matrix):
+        """Exact direct shape, or one explicit row-selection shape chain.
+
+        Main forward can normalize all/padded tokens before the runner selects
+        logits_indices and calls LMHead.  A shared hidden width alone cannot
+        identify that path: require the selector's actual input AND output.
+        """
+        activation = dims(matrix)[0]
+        candidates = norm_tasks()
+        direct = [task for task in candidates if task.end_ns <= matrix.start_ns
+                  and dims(task) and dims(task)[0] == activation]
+        if direct:
+            return direct, []
+        links = []
+        for norm in candidates:
+            inputs, outputs = dims(norm), dims(norm, "output_shapes")
+            if not (left <= norm.start_ns < norm.end_ns <= matrix.start_ns
+                    and inputs and outputs and len(inputs[0]) == len(activation) == 2
+                    and outputs[0] == inputs[0] and inputs[0][1] == activation[1]
+                    and inputs[0][0] > activation[0] > 0 and activation[1] > 0):
+                continue
+            for select in tasks:
+                family = re.sub(r"[^a-z0-9]", "", select.op_type.lower())
+                # IndexCheck only checks indices and has no selected payload.
+                # Embedding/Gather is a separate semantic anchor, never a
+                # fallback for an unidentified hidden-state selection.
+                if (family not in ("index", "gather", "gatherv2")
+                        or "embedding" in select.name.lower()
+                        or "indexcheck" in select.name.lower()
+                        or not norm.end_ns <= select.start_ns < select.end_ns <= matrix.start_ns):
+                    continue
+                raw_inputs = a_dims(str(getattr(select, "input_shapes", "")))
+                indexed = [(number, shape) for number, shape in enumerate(raw_inputs) if shape]
+                outputs = dims(select, "output_shapes")
+                if not indexed or indexed[0][0] != 0 or indexed[0][1] != inputs[0] or outputs != [activation]:
+                    continue
+                extra = [shape for _, shape in indexed[1:]]
+                rows = [activation[0]]
+                if family == "index":
+                    # Native Index can expose two small integer metadata
+                    # inputs before the index vector (observed 1;rank;M).
+                    # Their values are not available in CSV; do not interpret
+                    # them as an axis or invent arbitrary multi-input chains.
+                    signature = extra == [rows] or extra == [[1], [2], rows]
+                else:
+                    signature = extra == [rows] or extra == [rows, [1]]
+                if not signature:
+                    continue
+                types = dtypes(select)
+                if any(number < len(types) and types[number]
+                       and not (integer64(types[number]) or types[number] in ("INT32", "DTINT32", "TORCHINT32"))
+                       for number, _ in indexed[1:]):
+                    continue
+                links.append((norm, select))
+        return [], links
+
+    def norm_failure(matrix, links):
+        def brief(shapes):
+            return "[" + ";".join(",".join(map(str, shape[:4])) + (",..." if len(shape) > 4 else "")
+                                   for shape in shapes[:2]) + (";..." if len(shapes) > 2 else "") + "]"
+        visible = norm_tasks()
+        sample = "; ".join(task.name[:80] + " in=" + brief(dims(task))
+                           + " out=" + brief(dims(task, "output_shapes")) for task in visible[-4:]) or "none"
+        return ("ambiguous final Norm row-selection chain" if len(links) > 1 else
+                "missing final hidden-width Norm before vocabulary projection") + (
+                    "; projection activation=" + brief(dims(matrix)[:1])
+                    + "; visible Norm candidates=" + str(len(visible)) + " {" + sample + "}"
+                    + "; proven row-selection chains=" + str(len(links)))
+
     def after(task):
         number = tasks.index(task) + 1
         if number == len(tasks):
@@ -2236,15 +2312,16 @@ def residual_stage_plan(window, tasks, case=None):
                            and all(value > 0 for shape in dims(task)[:2] for value in shape)
                            and dims(task)[0][1] == dims(task)[1][1]
                            and dims(task, "output_shapes") == [[dims(task)[0][0], dims(task)[1][0]]]
-                           and any(norm.end_ns <= task.start_ns and dims(norm)
-                                   and dims(norm)[0] == dims(task)[0] for norm in named(r"RmsNorm"))]
+                           and any(norm_links(task))]
         projection = one(projections, "vocabulary projection H->V")
         head_vocab = dims(projection, "output_shapes")[0][1]
-        norms = [task for task in named(r"RmsNorm") if task.end_ns <= projection.start_ns
-                 and dims(task) and dims(task)[0] == dims(projection)[0]]
-        if not norms:
-            raise ValueError("missing final hidden-width Norm before vocabulary projection")
-        norm = norms[-1]
+        norms, links = norm_links(projection)
+        if norms:
+            norm = norms[-1]  # Preserve the established exact full-shape path.
+        elif len(links) == 1:
+            norm, _ = links[0]
+        else:
+            raise ValueError(norm_failure(projection, links))
         children = []
         if window["window_key"] == "main_to_draft":
             sample = one(named(r"^_compute_local_logits_stats_kernel$"), "logits statistics")

@@ -872,6 +872,121 @@ class ResidualStageTests(unittest.TestCase):
                 self.assertEqual(rows[0]["status"], "UNRESOLVED")
                 self.assertEqual(rows[0]["duration_ns"], boundaries[-1])
 
+    def selected_norm_fixture(self, key="main_to_draft", family="Index"):
+        """Main forward Norm over padded tokens, then explicit logits selection."""
+        window, tasks, boundaries = self.stage_fixture(key)
+        norm = next(task for task in tasks if task.name == "RmsNorm")
+        norm.input_shapes, norm.output_shapes = '"8,16;16"', '"8,16;8,1"'
+        if family == "Index":
+            inputs, types = '"8,16;1;2;4"', "DT_BF16;INT64;INT64;INT64"
+        else:
+            inputs, types = '"8,16;4;1"', "DT_BF16;DT_INT32;DT_INT64"
+        select = self.extra_task(tasks, "aclnnSelect_" + family, 13, family, inputs, '"4,16"')
+        select.input_dtypes, select.output_dtypes = types, "DT_BF16"
+        return window, tasks, boundaries, norm, select
+
+    def test_final_norm_accepts_complete_single_index_or_gather_row_selection(self):
+        for key in ("main_to_draft", "draft_to_nextmain"):
+            for family in ("Index", "GatherV2"):
+                with self.subTest(window=key, family=family):
+                    window, tasks, boundaries, _, _ = self.selected_norm_fixture(key, family)
+                    # Selection need not be adjacent to Norm: ordinary buffer
+                    # setup and IndexCheck do not produce the selected payload.
+                    check = self.extra_task(tasks, "aclnnIndex_IndexCheck", 12, "IndexCheck", '"1;4"', "")
+                    check.input_dtypes = "INT64;INT64"
+                    self.extra_task(tasks, "buffer_fill", 12, "Fill", '"4"', '"4"')
+                    self.assert_spans(residual.residual_stage_plan(window, tasks,
+                        {"draft_layers": 3, "draft_tokens": 7}), window, boundaries)
+
+    def test_final_norm_preserves_direct_shape_and_known_name_variants(self):
+        for name, family in (("FusedRmsNorm", "FusedRmsNorm"), ("MhcRmsNorm", "MhcRmsNorm"),
+                             ("_rms_norm_kernel", "RmsNorm"), ("native_exported_norm", "RmsNorm")):
+            with self.subTest(name=name, family=family):
+                window, tasks, boundaries = self.stage_fixture()
+                norm = next(task for task in tasks if task.name == "RmsNorm")
+                norm.name, norm.op_type = name, family
+                self.assert_spans(residual.residual_stage_plan(window, tasks, {"draft_layers": 3}), window, boundaries)
+
+    def test_final_norm_row_selection_requires_all_shape_and_index_evidence(self):
+        for missing in ("norm_output", "select_output", "wrong_source", "wrong_output", "wrong_indices",
+                        "unknown_metadata_signature", "floating_indices", "check_only", "unknown_family"):
+            with self.subTest(missing=missing):
+                window, tasks, boundaries, norm, select = self.selected_norm_fixture()
+                if missing == "norm_output":
+                    norm.output_shapes = ""
+                elif missing == "select_output":
+                    select.output_shapes = "N/A"
+                elif missing == "wrong_source":
+                    select.input_shapes = '"9,16;1;2;4"'
+                elif missing == "wrong_output":
+                    select.output_shapes = '"4,8"'
+                elif missing == "wrong_indices":
+                    select.input_shapes = '"8,16;1;2;5"'
+                elif missing == "unknown_metadata_signature":
+                    select.input_shapes = '"8,16;1;3;4"'
+                elif missing == "floating_indices":
+                    select.input_dtypes = "DT_BF16;INT64;INT64;DT_FLOAT"
+                elif missing == "check_only":
+                    select.name, select.op_type = "aclnnIndex_IndexCheck", "IndexCheck"
+                else:
+                    select.name, select.op_type = "unknown_select", "Custom"
+                rows = residual.residual_stage_plan(window, tasks, {"draft_layers": 3})
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["status"], "UNRESOLVED")
+                self.assertEqual(rows[0]["duration_ns"], boundaries[-1])
+                self.assertIn("projection activation=[4,16]", rows[0]["reason"])
+                self.assertIn("visible Norm candidates=1", rows[0]["reason"])
+
+    def test_final_norm_selection_integer_metadata_checked_only_when_present(self):
+        window, tasks, boundaries, _, select = self.selected_norm_fixture()
+        select.input_dtypes = ""
+        self.assert_spans(residual.residual_stage_plan(window, tasks, {"draft_layers": 3}), window, boundaries)
+        select.input_shapes, select.input_dtypes = '"8,16;4"', "DT_BF16;INT64"
+        self.assert_spans(residual.residual_stage_plan(window, tasks, {"draft_layers": 3}), window, boundaries)
+        select.input_dtypes = "DT_BF16;DT_FLOAT"
+        rows = residual.residual_stage_plan(window, tasks, {"draft_layers": 3})
+        self.assertEqual(rows[0]["status"], "UNRESOLVED")
+
+    def test_final_norm_selection_rejects_reversed_or_overlapping_dependencies(self):
+        for start, duration in ((9, 1), (11, 2), (14, 2)):
+            with self.subTest(start=start, duration=duration):
+                window, tasks, boundaries, _, select = self.selected_norm_fixture()
+                select.start_ns, select.end_ns = RESIDUAL_EPOCH + start, RESIDUAL_EPOCH + start + duration
+                rows = residual.residual_stage_plan(window, tasks, {"draft_layers": 3})
+                self.assertEqual(rows[0]["status"], "UNRESOLVED")
+                self.assertEqual(rows[0]["duration_ns"], boundaries[-1])
+
+    def test_final_norm_selection_rejects_multiple_possible_shape_chains(self):
+        window, tasks, boundaries, _, select = self.selected_norm_fixture()
+        second = self.extra_task(tasks, "second_hidden_select", 14, "Index", select.input_shapes, select.output_shapes)
+        second.input_dtypes = select.input_dtypes
+        rows = residual.residual_stage_plan(window, tasks, {"draft_layers": 3})
+        self.assertEqual(rows[0]["status"], "UNRESOLVED")
+        self.assertIn("ambiguous final Norm", rows[0]["reason"])
+        self.assertIn("proven row-selection chains=2", rows[0]["reason"])
+
+    def test_hc_head_wide_norm_does_not_substitute_for_final_hidden_norm(self):
+        window, tasks, boundaries, norm, select = self.selected_norm_fixture()
+        norm.input_shapes, norm.output_shapes = '"8,64;64"', '"8,64;8,1"'
+        select.input_shapes = '"8,64;1;2;4"'
+        rows = residual.residual_stage_plan(window, tasks, {"draft_layers": 3})
+        self.assertEqual(rows[0]["status"], "UNRESOLVED")
+        self.assertEqual(rows[0]["duration_ns"], boundaries[-1])
+
+    def test_missing_final_norm_diagnostic_limits_visible_candidate_details(self):
+        window, tasks, boundaries = self.stage_fixture()
+        tasks.remove(next(task for task in tasks if task.name == "RmsNorm"))
+        for number in range(12):
+            self.extra_task(tasks, "RmsNorm_candidate_" + str(number), 3, "RmsNorm",
+                            '"9,16;16"', '"9,16;9,1"')
+        rows = residual.residual_stage_plan(window, tasks, {"draft_layers": 3})
+        self.assertEqual(rows[0]["status"], "UNRESOLVED")
+        self.assertEqual(rows[0]["duration_ns"], boundaries[-1])
+        self.assertIn("visible Norm candidates=12", rows[0]["reason"])
+        self.assertNotIn("candidate_0 ", rows[0]["reason"])
+        self.assertIn("candidate_11 ", rows[0]["reason"])
+        self.assertLess(len(rows[0]["reason"]), 1000)
+
     def test_missing_lookup_output_uses_indices_shape_instead_of_bias_batch(self):
         for indices, matches in (("4", True), ("9", False), ("", False)):
             window, tasks, boundaries = self.stage_fixture("draft_to_nextmain")

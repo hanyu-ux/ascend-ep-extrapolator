@@ -44,6 +44,40 @@ def residual_report():
     return report
 
 
+def unresolved_window_report():
+    """Synthetic 71-round structure: 3.25 ms unknown U1 plus seven known U2 stages."""
+    report = residual_report()
+    case = report['cases'][0]
+    capture, method = case['measurements'][0], case['projection']['layer_mean_methods'][0]
+    capture['rank'] = method['selected_rank'] = case['captures'][0]['rank'] = 'dp1'
+    diagnostic = capture['step_residuals']
+    diagnostic['rank'] = 'dp1'
+    for item in diagnostic['summary']:
+        item['rounds'] = 71
+        if item['window_key'] == 'main_to_draft':
+            item['duration_ms_mean'] = 3.25
+    unknown = dict(window_key='main_to_draft', stage_key='unresolved', stage_order=1,
+                   label='SYNTHETIC_UNRESOLVED_WINDOW', level=0, parent_stage_key=None,
+                   rounds=71, matched_windows=0, status='UNRESOLVED', duration_ms_mean=None,
+                   duration_ns_total=230750000, reason='SYNTHETIC_MISSING_FINAL_HIDDEN_NORM')
+    diagnostic['stage_summary'] = [unknown] + [row for row in diagnostic['stage_summary']
+                                               if row['window_key'] == 'draft_to_nextmain']
+    for row in diagnostic['stage_summary'][1:] + diagnostic['substage_summary']:
+        row.update(rounds=71, matched_windows=71)
+        row['label'] = row['label'].replace('dp7_', 'dp1_', 1)
+    total = sum(item['duration_ms_mean'] for item in diagnostic['summary'])
+    diagnostic['residual_ms_mean'] = total
+    old = method['source_partition']['residual_ms']
+    method['source_partition'].update(residual_ms=total, cross_role_tail_residual_ms=total)
+    method['cycle_ms'] += total - old
+    method['breakdown'][-1]['value_ms'] = total
+    for rank in method['per_rank']:
+        if rank['rank'] == 'dp7':
+            rank.update(rank='dp1', cycle_ms=method['cycle_ms'],
+                        source_partition=copy.deepcopy(method['source_partition']))
+    return report
+
+
 DRILLDOWN_TITLES = ('SWA层内阶段展开', '下一主模型KV与输入准备 · 阶段展开',
                     '下一主metadata及输入映射准备 · 阶段展开')
 MAIN_DRILLDOWN_TITLES = ('CSA层内阶段展开', 'HCA层内阶段展开')
@@ -943,7 +977,7 @@ class LayerMeanRendererTests(unittest.TestCase):
                     self.assertIn('1/2', rows[0][3])
                     self.assertNotIn('请重跑基础统计', note)
 
-    def test_wholly_unresolved_window_keeps_measured_total_without_semantic_mean_or_chart(self):
+    def test_wholly_unresolved_windows_keep_measured_totals_as_two_window_bars(self):
         report = residual_report()
         case = report['cases'][0]
         method = case['projection']['layer_mean_methods'][0]
@@ -969,20 +1003,32 @@ class LayerMeanRendererTests(unittest.TestCase):
         rows, items, note = renderer._method_residual_data(case, method)
         self.assertEqual(len(rows), 2)
         self.assertAlmostEqual(sum(row[2] for row in rows), diagnostic['residual_ms_mean'])
-        self.assertTrue(all(row[1] == '阶段未识别（原窗口实测总耗时）' for row in rows))
+        self.assertTrue(all(row[1].endswith('阶段未识别（原窗口实测总耗时）') for row in rows))
         self.assertTrue(all('0/2' in row[3] and 'SYNTHETIC_MISSING_STAGE_ANCHOR' in row[3] for row in rows))
-        self.assertIsNone(items)
+        self.assertEqual(len(items), 2)
+        self.assertTrue(all(item['unresolved_window'] for item in items))
+        self.assertEqual(sum(item['value_ms'] for item in items), diagnostic['residual_ms_mean'])
+        self.assertIn('含2个未识别整窗和0个已匹配阶段', note)
+        self.assertIn('并非15阶段全匹配', note)
         self.assertNotIn('请重跑基础统计', note)
         html = renderer._method_residual_html(case, method)
         self.assertIn('阶段未识别（原窗口实测总耗时）', html)
-        self.assertNotIn('class="u-bar"', html)
+        self.assertEqual(html.count('class="u-bar"'), 2)
+        self.assertIn('轮次剩余区间2项耗时构成，含2个未识别整窗', html)
         out, (book, _) = self.build(report)
         self.assertEqual(diagnostic, before)
         self.assertTrue(all(row['duration_ms_mean'] is None for row in diagnostic['stage_summary']))
         cells = book['方法1估算'][1]
-        self.assertIn('阶段未识别（原窗口实测总耗时）', cells.values())
+        self.assertTrue(any(isinstance(value, str) and value.endswith('阶段未识别（原窗口实测总耗时）')
+                            for value in cells.values()))
         self.assertIn(original['summary'][0]['duration_ms_mean'], cells.values())
         self.assertIn('阶段未识别（原窗口实测总耗时）', out.with_suffix('.html').read_text())
+        chart = next(chart for chart in self.chart_parts_by_sheet(out, book)['方法1估算']
+                     if self.chart_title(chart).startswith('轮次剩余区间耗时构成'))
+        series = self.assert_bar_cache_matches_own_sheet(chart, book, '方法1估算')
+        self.assertEqual(len(series[0][0]), 2)
+        self.assertNotEqual(series[0][0][0], series[0][0][1])
+        self.assertEqual(sum(series[0][1]), diagnostic['residual_ms_mean'])
 
     def test_partial_unresolved_subgroup_never_claims_full_window_stage_or_occupancy_means(self):
         report = residual_report()
@@ -1010,6 +1056,112 @@ class LayerMeanRendererTests(unittest.TestCase):
         self.assertIsNone(items)
         self.assertNotIn('class="u-bar"', renderer._method_residual_html(case, method))
         self.assertNotIn('请重跑基础统计', note)
+
+    def test_unknown_whole_window_and_known_seven_stages_form_one_closed_chart(self):
+        report = unresolved_window_report()
+        before = copy.deepcopy(report)
+        case = report['cases'][0]
+        method = case['projection']['layer_mean_methods'][0]
+        diagnostic = case['measurements'][0]['step_residuals']
+        rows, items, note = renderer._method_residual_data(case, method)
+        self.assertEqual(len(rows), 8)
+        self.assertEqual(len(items), 8)
+        self.assertEqual(items[0]['value_ms'], 3.25)
+        self.assertTrue(items[0]['unresolved_window'])
+        self.assertEqual(items[0]['window_key'], 'main_to_draft')
+        self.assertTrue(items[0]['label'].startswith('主→草稿 · 阶段未识别'))
+        self.assertIn('0/71 · UNRESOLVED', rows[0][3])
+        self.assertIn('SYNTHETIC_MISSING_FINAL_HIDDEN_NORM', rows[0][3])
+        self.assertTrue(all(row[-1] == '71/71 · MATCHED' for row in rows[1:]))
+        self.assertEqual(sum(item['value_ms'] for item in items), diagnostic['residual_ms_mean'])
+        self.assertEqual(sum(item['value_ms'] for item in items), method['source_partition']['residual_ms'])
+        self.assertIn('含1个未识别整窗和7个已匹配阶段', note)
+        self.assertIn('并非15阶段全匹配', note)
+        self.assertNotIn('_CHILD_NOT_ADDED_', repr(items))
+        self.assertNotIn('dp3_PARENT_', repr(items))
+        html = renderer._method_residual_html(case, method)
+        self.assertEqual(html.count('class="u-bar"'), 8)
+        self.assertIn('轮次剩余区间8项耗时构成，含1个未识别整窗', html)
+        self.assertNotIn('aria-label="轮次剩余区间15阶段', html)
+        out, (book, _) = self.build(report)
+        charts = self.chart_parts_by_sheet(out, book)['方法1估算']
+        chart = next(chart for chart in charts if self.chart_title(chart).startswith('轮次剩余区间耗时构成'))
+        self.assertIn('含未识别整窗', self.chart_title(chart))
+        series = self.assert_bar_cache_matches_own_sheet(chart, book, '方法1估算')
+        self.assertEqual(len(series), 1)
+        self.assertEqual(series[0][0], [row[1] for row in rows])
+        self.assertEqual(series[0][1], [item['value_ms'] for item in items])
+        cells = book['方法1估算'][1]
+        card_row = next(int(cell[1:]) for cell, value in cells.items()
+                        if cell.startswith('A') and value == '完整周期 · ms')
+        self.assertEqual(cells['A' + str(card_row + 1)], method['cycle_ms'])
+        self.assertEqual(cells['E' + str(card_row + 1)], method['tpot_ms'])
+        self.assertEqual(cells['I' + str(card_row + 1)], method['per_device_tokens_s'])
+        self.assertIsNone(diagnostic['stage_summary'][0]['duration_ms_mean'])
+        self.assertEqual(report, before)
+
+    def test_whole_unresolved_window_requires_complete_rounds_and_totals(self):
+        for invalid in ('subset', 'rounds', 'status', 'matched', 'no_total', 'missing_mean', 'negative_mean',
+                        'nonfinite_mean', 'duplicate_summary', 'duplicate_stage', 'extra_partial',
+                        'different_window_rounds', 'diagnostic_total', 'method_total', 'summary_total', 'known_window_partial'):
+            report = unresolved_window_report()
+            case = report['cases'][0]
+            method = case['projection']['layer_mean_methods'][0]
+            diagnostic = case['measurements'][0]['step_residuals']
+            unknown, summary = diagnostic['stage_summary'][0], diagnostic['summary'][0]
+            if invalid == 'subset':
+                unknown['duration_ns_total'] //= 2
+            elif invalid == 'rounds':
+                unknown['rounds'] = 70
+            elif invalid == 'status':
+                unknown['status'] = 'PARTIAL'
+            elif invalid == 'matched':
+                unknown['matched_windows'] = 1
+            elif invalid == 'no_total':
+                unknown.pop('duration_ns_total')
+            elif invalid == 'missing_mean':
+                summary.pop('duration_ms_mean')
+            elif invalid == 'negative_mean':
+                summary['duration_ms_mean'] = -3.25
+            elif invalid == 'nonfinite_mean':
+                summary['duration_ms_mean'] = float('nan')
+            elif invalid == 'duplicate_summary':
+                diagnostic['summary'].append(copy.deepcopy(summary))
+            elif invalid == 'duplicate_stage':
+                diagnostic['stage_summary'].append(copy.deepcopy(unknown))
+            elif invalid == 'extra_partial':
+                diagnostic['stage_summary'].append(dict(diagnostic['stage_summary'][1],
+                    window_key='main_to_draft', status='PARTIAL', matched_windows=1))
+            elif invalid == 'different_window_rounds':
+                diagnostic['summary'][1]['rounds'] = 70
+                for stage in diagnostic['stage_summary'][1:]:
+                    stage.update(rounds=70, matched_windows=70)
+            elif invalid == 'diagnostic_total':
+                diagnostic['residual_ms_mean'] += 1
+            elif invalid == 'method_total':
+                method['source_partition']['cross_role_tail_residual_ms'] += 1
+            elif invalid == 'summary_total':
+                summary['duration_ms_mean'] += 1
+            else:
+                diagnostic['stage_summary'][1].update(status='PARTIAL', matched_windows=1)
+            with self.subTest(invalid=invalid):
+                rows, items, note = renderer._method_residual_data(case, method)
+                self.assertTrue(rows)
+                self.assertIsNone(items)
+                self.assertIn('未绘图', note)
+                self.assertNotIn('class="u-bar"', renderer._method_residual_html(case, method))
+
+    def test_zero_duration_known_stage_is_kept_in_partial_window_chart(self):
+        report = unresolved_window_report()
+        case = report['cases'][0]
+        method = case['projection']['layer_mean_methods'][0]
+        stages = case['measurements'][0]['step_residuals']['stage_summary']
+        stages[2]['duration_ms_mean'] += stages[1]['duration_ms_mean']
+        stages[1]['duration_ms_mean'] = 0.
+        _, items, _ = renderer._method_residual_data(case, method)
+        self.assertEqual(len(items), 8)
+        self.assertEqual(items[1]['value_ms'], 0.)
+        self.assertEqual(sum(item['value_ms'] for item in items), method['source_partition']['residual_ms'])
 
     def test_method_drilldown_tables_and_horizontal_charts_use_each_selected_rank(self):
         report = drilldown_report()

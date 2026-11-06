@@ -18,7 +18,7 @@ import traceback
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261105.2.target_layer_stages"
+RENDERER_VERSION = "20261106.1.u_stage_evidence"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -763,6 +763,20 @@ def _residual_stages(diagnostic, window_key, field="stage_summary"):
                   key=lambda item: item.get("stage_order", 0))
 
 
+def _whole_unresolved_window(stages, summary):
+    """Accept an unknown whole window only when every retained sample is covered."""
+    if len(stages) != 1:
+        return False
+    item = stages[0]
+    rounds, value, total = summary.get("rounds"), summary.get("duration_ms_mean"), item.get("duration_ns_total")
+    return (item.get("stage_key") == "unresolved" and item.get("status") == "UNRESOLVED"
+            and item.get("level", 0) == 0 and not item.get("parent_stage_key")
+            and type(rounds) is int and rounds > 0 and item.get("rounds") == rounds
+            and type(item.get("matched_windows")) is int and item["matched_windows"] == 0
+            and _number(value) and value >= 0 and type(total) is int and total >= 0
+            and math.isclose(total, value * rounds * 1e6, rel_tol=1e-9, abs_tol=1e-5))
+
+
 def _method_residual_data(case, method):
     """Copy only this method's selected rank; check closure before plotting."""
     selected = method.get("selected_rank")
@@ -774,11 +788,28 @@ def _method_residual_data(case, method):
     diagnostic = captures[0]["step_residuals"]
     rows, items, problems = [], [], []
     unresolved_windows = False
+    whole_unknown_count, expected_items = 0, 0
     summary = {item.get("window_key"): item for item in diagnostic.get("summary") or []}
     for key, label in RESIDUAL_WINDOWS:
         stages = [item for item in _residual_stages(diagnostic, key)
                   if not item.get("parent_stage_key") and item.get("level", 0) == 0]
         expected = 8 if key == "main_to_draft" else 7
+        summaries = [item for item in diagnostic.get("summary") or [] if item.get("window_key") == key]
+        if len(summaries) != 1:
+            problems.append(label + "缺少唯一原窗口统计")
+        if len(summaries) == 1 and _whole_unresolved_window(stages, summaries[0]):
+            unknown, window = stages[0], summaries[0]
+            state = "0/" + str(window["rounds"]) + " · UNRESOLVED"
+            if unknown.get("reason"):
+                state += "；" + _text(unknown["reason"])
+            rows.append([label, label + " · 阶段未识别（原窗口实测总耗时）", window["duration_ms_mean"], state])
+            items.append(dict(label=rows[-1][1], value_ms=window["duration_ms_mean"],
+                              window_key=key, unresolved_window=True))
+            whole_unknown_count += 1
+            expected_items += 1
+            unresolved_windows = True
+            continue
+        expected_items += expected
         ordered = not (len(stages) != expected or [item.get("stage_order") for item in stages] != list(range(1, expected + 1))
                 or len({item.get("stage_key") for item in stages}) != expected
                 or any(not isinstance(item.get("stage_key"), str) or not item["stage_key"] for item in stages))
@@ -822,14 +853,22 @@ def _method_residual_data(case, method):
     partition = method.get("source_partition") or {}
     residual = partition.get("cross_role_tail_residual_ms", partition.get("residual_ms"))
     total = sum(item["value_ms"] for item in items)
+    if whole_unknown_count:
+        counts = [summary.get(key, {}).get("rounds") for key, _ in RESIDUAL_WINDOWS]
+        if not all(type(count) is int and count > 0 for count in counts) or len(set(counts)) != 1:
+            problems.append("未识别整窗与已匹配窗口未使用相同保留轮次")
     if (not _number(residual) or residual <= 0 or not _number(diagnostic.get("residual_ms_mean"))
-            or len(items) != 15 or not math.isclose(total, residual, rel_tol=1e-9, abs_tol=1e-8)
+            or len(items) != expected_items or not math.isclose(total, residual, rel_tol=1e-9, abs_tol=1e-8)
             or not math.isclose(total, diagnostic["residual_ms_mean"], rel_tol=1e-9, abs_tol=1e-8)):
-        problems.append("15阶段未与本方法源分区中的U闭合")
+        problems.append(("窗口/阶段" if whole_unknown_count else "15阶段") + "未与本方法源分区中的U闭合")
     if not _layer_mean_publishable(method):
         problems.append("本方法目标结果尚不可发布")
     note = ("仅本方法所选rank=" + _text(selected) + "；以下为已含在完整周期中的轮次剩余区间U组成，"
             "不额外加到完整周期。设备锚点之间的连续跨度包含间隔，不代表完整Python模块耗时；各父阶段的细分子项不另加。")
+    if whole_unknown_count and not problems:
+        note += ("识别不完整：本图按" + str(len(items)) + "项展示，含" + str(whole_unknown_count)
+                 + "个未识别整窗和" + str(len(items) - whole_unknown_count)
+                 + "个已匹配阶段，并非15阶段全匹配。未识别项保留原窗口实测总量，不补零、不拆造语义阶段；状态及缺锚原因见表格。")
     if problems:
         note += "未绘图：" + "；".join(dict.fromkeys(problems)) + "。"
         note += ("阶段识别未完成，原窗口耗时仍保留，按具体原因核对原始设备明细；原匹配详情见时间账本。"
@@ -840,7 +879,7 @@ def _method_residual_data(case, method):
 def _method_residual_section(sheet, row, case, method):
     rows, items, note = _method_residual_data(case, method)
     row = _note(sheet, row, "轮次剩余区间耗时构成 · " + _rank_note(method))
-    row = _note(sheet, row, note, warning=items is None)
+    row = _note(sheet, row, note, warning=items is None or any(item.get("unresolved_window") for item in items))
     if not rows:
         return row + 1
     written = []
@@ -852,10 +891,11 @@ def _method_residual_section(sheet, row, case, method):
         return _note(sheet, row, "阶段表存在长文本续行，未绘图；原始阶段数值保留。", warning=True)
     height = max(18, 2 * len(items) + 6)
     reference = "'" + sheet.name.replace("'", "''") + "'!"
-    sheet.add_bar_chart("轮次剩余区间耗时构成 · " + _layer_mean_name(method),
+    partial = any(item.get("unresolved_window") for item in items)
+    sheet.add_bar_chart("轮次剩余区间耗时构成 · " + _layer_mean_name(method) + ("（含未识别整窗）" if partial else ""),
         categories=[item["label"] for item in items],
         categories_ref=reference + "$C$" + str(written[0]) + ":$C$" + str(written[-1]),
-        series=[dict(name="阶段耗时(ms)", values=[item["value_ms"] for item in items], color="168B8D",
+        series=[dict(name="窗口/阶段耗时(ms)" if partial else "阶段耗时(ms)", values=[item["value_ms"] for item in items], color="168B8D",
                      values_ref=reference + "$I$" + str(written[0]) + ":$I$" + str(written[-1]))],
         anchor=(row, 1, row + height, 12), stacked=False, x_axis_title="ms/HC周期；已计入完整周期，不额外相加")
     return row + height + 2
@@ -1076,12 +1116,7 @@ def _residual_stage_rows(stages, window_summary=None):
     for item in stages:
         # An unresolved subset is not a whole-window mean. Only use the window
         # summary when this one row accounts for every retained window in full.
-        whole_unknown = (len(stages) == 1 and item.get("stage_key") == "unresolved"
-            and item.get("level", 0) == 0 and not item.get("parent_stage_key")
-            and item.get("rounds") == summary.get("rounds") and _number(summary.get("rounds"))
-            and summary["rounds"] > 0 and _number(summary.get("duration_ms_mean"))
-            and _number(item.get("duration_ns_total")) and math.isclose(item["duration_ns_total"],
-                summary["duration_ms_mean"] * summary["rounds"] * 1e6, rel_tol=1e-9, abs_tol=1e-5))
+        whole_unknown = _whole_unresolved_window(stages, summary)
         source = summary if whole_unknown else item if item.get("status") == "MATCHED" else {}
         rows.append(["阶段未识别（原窗口实测总耗时）" if whole_unknown else item.get("label", item.get("stage_key")),
                      *[source.get(field) if source.get(field) is not None else NA for field in fields],
@@ -1384,7 +1419,10 @@ def _method_residual_html(case, method):
         parts.append('<div class="method-residual">' + _html_table(METHOD_RESIDUAL_HEADERS, rows) + '</div>')
     if items is not None:
         maximum = max(item["value_ms"] for item in items)
-        parts.append('<div class="u-bars" role="img" aria-label="轮次剩余区间15阶段耗时构成，单位毫秒">')
+        unknown_count = sum(bool(item.get("unresolved_window")) for item in items)
+        chart_label = ("轮次剩余区间" + str(len(items)) + "项耗时构成，含" + str(unknown_count) + "个未识别整窗，单位毫秒"
+                       if unknown_count else "轮次剩余区间15阶段耗时构成，单位毫秒")
+        parts.append('<div class="u-bars" role="img" aria-label="' + esc(chart_label) + '">')
         for record, item in zip(rows, items):
             parts.append('<div class="u-bar"><span>' + esc(record[0] + ' · ' + item["label"]) +
                          '</span><span class="u-track"><i style="width:' + str(100 * item["value_ms"] / maximum) +
