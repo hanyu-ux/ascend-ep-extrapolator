@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261106.1.u_stage_evidence"
+PROFILE_VERSION = "20261106.2.kv_epilog_evidence"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -2371,28 +2371,53 @@ def residual_stage_plan(window, tasks, case=None):
                     not a.end_ns <= b.start_ns for a, b in zip(kv_projections, writes))
                     or any(a.end_ns > b.start_ns for a, b in zip(writes, kv_projections[1:]))):
                 raise ValueError("context-KV projections/writes do not form the expected sequence")
-            # FP8 context caches use a packed-cache epilog instead of Scatter.
-            # Its cache, payload and slot inputs must agree with the associated
-            # projection; a same-position kernel name alone is not evidence.
+            # Packed context caches use an epilog instead of Scatter.
+            # The proposer crops fused features to num_context before WKV;
+            # their token counts need not equal the padded fusion output.
+            # Payload, slots and in-place output must still agree with WKV.
             for matrix, write in zip(kv_projections, writes):
                 if write.op_type.casefold() != "kvcompressepilog":
                     continue
                 source, dest = dims(matrix), dims(matrix, "output_shapes")
                 inputs, outputs = dims(write), dims(write, "output_shapes")
                 types, output_types = dtypes(write), dtypes(write, "output_dtypes")
-                if not (len(source) >= 2 and source[0] == dims(fusion, "output_shapes")[0]
-                        and len(source[1]) == 2 and source[1][1] == hidden
-                        and len(dest) == 1 and len(dest[0]) == 2
-                        and dest[0] == [source[0][0], source[1][0]]
-                        and all(value > 0 for value in dest[0])
-                        and len(inputs) == 3 and len(inputs[0]) == 1 and inputs[0][0] > 0
-                        and inputs[1] == dest[0] and inputs[2] == [dest[0][0]]
-                        and outputs == [inputs[0]] and len(types) == 3
-                        and types[0] in ("UINT8", "DTUINT8", "TORCHUINT8")
-                        and types[1] in ("BF16", "DTBF16", "BFLOAT16", "DTBFLOAT16", "TORCHBFLOAT16")
-                        and types[2] in ("INT32", "DTINT32", "TORCHINT32")
-                        and len(output_types) == 1 and output_types[0] == types[0]):
-                    raise ValueError("KvCompressEpilog cache/payload/slots contradict context-KV projection")
+                def cache_dtype(value):
+                    return "UINT8" if value in ("UINT8", "DTUINT8", "TORCHUINT8") else None
+                cache_kind = cache_dtype(types[0]) if len(types) == 3 else None
+                cache_shape = inputs[0] if len(inputs) == 3 else []
+                fusion_shape = dims(fusion, "output_shapes")
+                projection_shape = (len(source) >= 2 and len(source[0]) == len(source[1]) == 2
+                                    and source[0][1] == source[1][1] == hidden
+                                    and all(value > 0 for shape in source[:2] for value in shape))
+                checks = [
+                    ("context_rows/hidden", projection_shape and len(fusion_shape) == 1
+                     and len(fusion_shape[0]) == 2 and fusion_shape[0][1] == hidden
+                     and source[0][0] <= fusion_shape[0][0]),
+                    ("shared_context_shape", projection_shape and all(
+                     dims(other) and dims(other)[0] == source[0] for other in kv_projections)),
+                    ("projection_output", projection_shape and dest == [[source[0][0], source[1][0]]]),
+                    ("cache_layout", len(cache_shape) == 1 and cache_shape[0] > 0),
+                    ("payload_shape", len(inputs) == 3 and len(dest) == 1 and inputs[1] == dest[0]),
+                    ("slots_shape", len(inputs) == 3 and len(dest) == 1 and len(dest[0]) == 2
+                     and inputs[2] == [dest[0][0]]),
+                    ("cache_output_shape", bool(cache_shape) and outputs == [cache_shape]),
+                    ("cache_dtype", cache_kind is not None),
+                    ("payload_dtype", len(types) == 3
+                     and types[1] in ("BF16", "DTBF16", "BFLOAT16", "DTBFLOAT16", "TORCHBFLOAT16")),
+                    ("slots_dtype", len(types) == 3 and types[2] in ("INT32", "DTINT32", "TORCHINT32")),
+                    ("cache_output_dtype", cache_kind is not None and len(output_types) == 1
+                     and cache_dtype(output_types[0]) == cache_kind),
+                ]
+                failed = [label for label, valid in checks if not valid]
+                if failed:
+                    raise ValueError("KvCompressEpilog cache/payload/slots contradict context-KV projection"
+                        + "; failed=" + ",".join(failed)
+                        + "; fusion output=" + str(fusion_shape)[:160]
+                        + "; projection row=" + str(matrix.row_index)
+                        + " in=" + str(source)[:160] + " out=" + str(dest)[:160]
+                        + "; epilog row=" + str(write.row_index)
+                        + " in=" + str(inputs)[:200] + " out=" + str(outputs)[:160]
+                        + "; types=" + str(types)[:160] + " -> " + str(output_types)[:100])
             if not projection.end_ns <= sample.start_ns < post.end_ns <= concat.start_ns < prepares[0].start_ns:
                 raise ValueError("main output, verification and draft preparation anchors are out of order")
             metadata_start = after(writes[-1])
@@ -2515,10 +2540,16 @@ def residual_stage_summary(stages, windows, level):
     for (key, stage), rows in groups.items():
         complete = len(rows) == totals[key] and all(row["status"] == "MATCHED" for row in rows)
         item = {field: rows[0][field] for field in ("stage_key", "stage_order", "label", "level", "parent_stage_key", "boundary_basis")}
+        reasons = list(dict.fromkeys(row["reason"] for row in rows if row.get("reason")))
+        # Per-round reasons retain CSV row references. Do not concatenate
+        # hundreds of distinct samples into an oversized Excel cell.
+        reason = "; ".join(value[:1200] + ("..." if len(value) > 1200 else "") for value in reasons[:3])
+        if len(reasons) > 3:
+            reason += "; " + str(len(reasons) - 3) + " additional distinct reasons; see per-round stages CSV"
         item.update(window_key=key, rounds=totals[key], matched_windows=sum(row["status"] == "MATCHED" for row in rows),
                     status="MATCHED" if complete else "UNRESOLVED" if stage == "unresolved" else "PARTIAL",
                     duration_ns_total=sum(row["duration_ns"] for row in rows),
-                    reason="; ".join(dict.fromkeys(row["reason"] for row in rows if row.get("reason"))) or None)
+                    reason=reason or None)
         for field in fields:
             values = [row.get(field) for row in rows]
             item[field + "_mean"] = statistics.fmean(values) if complete and all(value is not None for value in values) else None
