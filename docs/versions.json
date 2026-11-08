@@ -14,8 +14,8 @@
       "matches_imported_source": false
     },
     "build_ep128_leadership_excel.py": {
-      "version": "20261108.1.operator_drilldown",
-      "sha256": "76205cbfb3e7465cb7e892611b5b23b7961548f9a9fdbcf5335a15aca1a1721e",
+      "version": "20261108.2.full_operator_labels",
+      "sha256": "efdb0a1ba6d9d83a90fb33937b36e64abe3886afec9dab47d1e92242a9212c61",
       "imported_version": "20261104.2.bs_inventory",
       "imported_sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
       "matches_imported_source": false
@@ -62,11 +62,12 @@
     "Context-KV stages accept a shared positive num_context prefix of padded fused features while preserving hidden, projection, payload, slots and in-place cache checks. Packed UINT8 aliases compare by semantic dtype; bounded summary examples retain full per-round failure details in the stages CSV. Original cycle and extrapolation formulas are unchanged.",
     "Independent cases can mix speculative-token counts and synthetic output lengths under an explicit mean accepted-draft fraction. Normalize num_speculative_tokens as the draft_tokens alias per configuration layer; case output policies override inherited fixed lengths and declared rates must agree with Neff=1+S*r. The template uses 60% instead of fixed Neff5.2. CSV, Excel and HTML display per-case parameters; existing timing formulas and BS grouping are unchanged.",
     "Each case can supply only num_speculative_tokens and synthetic_acceptance_length; synthetic_acception_length is a compatible alias. Explicit case SAL replaces inherited fixed lengths and, when no case rate is declared, clears inherited rate policy. Same-case contradictory declarations remain errors and SAL stays within [1,S+1]. The template no longer requires acceptance rates; all-no-rate Excel/HTML reports hide the unused rate column. Legacy explicit Neff/rate configurations and timing formulas remain supported.",
-    "Final selected-rank CSA/HCA/SWA stages add optional operator drill-downs. Integer-nanosecond, all-stream clipped sweeps retain named parallel multiplicities and no-record gaps; source means use the parent reference layers and retained rounds, including zero for proven absent fingerprints. Native names, shapes, dtypes, streams and original row examples remain traceable. Existing Dispatch/Combine/GMM deltas are separate signed model entries; original cycle, TPOT, throughput, rank selection and ten-stage/U accounting are unchanged. Method1/2 sheets and HTML show closed Top-N coverage/model ledgers and separate nonadditive source-kernel hotspots, with readable labels, explicit aggregate remainders and old-report fallback. Only final selected-rank groups export operator detail, with source aggregation cached across methods; no private capture or detailed analysis is included."
+    "Final selected-rank CSA/HCA/SWA stages add optional operator drill-downs. Integer-nanosecond, all-stream clipped sweeps retain named parallel multiplicities and no-record gaps; source means use the parent reference layers and retained rounds, including zero for proven absent fingerprints. Native names, shapes, dtypes, streams and original row examples remain traceable. Existing Dispatch/Combine/GMM deltas are separate signed model entries; original cycle, TPOT, throughput, rank selection and ten-stage/U accounting are unchanged. Method1/2 sheets and HTML show closed Top-N coverage/model ledgers and separate nonadditive source-kernel hotspots, with readable labels, explicit aggregate remainders and old-report fallback. Only final selected-rank groups export operator detail, with source aggregation cached across methods; no private capture or detailed analysis is included.",
+    "Operator labels in both method sheets and HTML retain complete parent-stage and operator type names, input shapes and streams with explicit wrapping. Full native names, output shapes and dtypes stay visible in source columns. Table and chart heights follow text length; continuation rows preserve long evidence and charts retain their original values. This renderer-only update can redraw existing operator-bearing JSON without resampling or changing core estimates, rankings or Top-N limits."
   ],
   "validation": {
-    "discovered_tests": 325,
-    "passed": 315,
+    "discovered_tests": 326,
+    "passed": 316,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,
