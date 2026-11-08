@@ -19,7 +19,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261108.1.operator_drilldown"
+RENDERER_VERSION = "20261108.2.full_operator_labels"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -1135,10 +1135,10 @@ def _method_expansion_data(case, method):
 
 
 OPERATOR_LEDGER_HEADERS = ["细项 / 父阶段（已含）", "源覆盖×目标层数\n(ms/完整周期)", "模型增减×目标层数\n(ms/完整周期)",
-                           "合计(ms)", "占完整周期", "类型 / 来源摘要\n（完整见JSON）"]
+                           "合计(ms)", "占完整周期", "类型 / 算子与来源"]
 OPERATOR_LEDGER_SPANS = ((1, 4), (5, 6), (7, 8), (9, 9), (10, 10), (11, 12))
 OPERATOR_KERNEL_HEADERS = ["源实测算子 / 父阶段", "相交调用\n/单层均值", "段内累计\n(ms/单层均值)",
-                          "段内单次均值\n(ms)", "段内单次P90\n(ms)", "native / 指纹与来源摘要\n（完整见JSON）"]
+                          "段内单次均值\n(ms)", "段内单次P90\n(ms)", "native / 指纹与来源"]
 OPERATOR_KERNEL_SPANS = ((1, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 12))
 OPERATOR_SCOPE = ("关键路径及优化收益尚未验证。目标互斥区间和有符号模型增减仅展开已有父项，不再计入周期；"
                   "具名并行组合不分摊给成员，无记录区间不等于CPU瓶颈。源kernel累计可重叠，不能当目标关键耗时或优化收益；"
@@ -1146,22 +1146,19 @@ OPERATOR_SCOPE = ("关键路径及优化收益尚未验证。目标互斥区间�
 OPERATOR_KINDS = {"operator": "单算子覆盖", "parallel": "具名并行组合", "gap": "无设备记录区间", "model_delta": "模型增减（非原生执行）"}
 
 
-def _operator_short(value, limit=88):
-    value = " ".join(_text(value).split())
-    return value if len(value) <= limit else value[:limit - 1] + "…"
-
-
 def _operator_example_text(example):
     if not isinstance(example, dict):
         return "无独立原生执行样例；模型修正不代表已验证收益"
     text = "rank=" + _text(example.get("rank")) + "；轮=" + _text(example.get("round_id")) + "；层=" + _text(example.get("layer"))
-    text += "\n原行=" + _operator_short(example.get("row_indices", example.get("row_index")), 48)
+    text += "\n原行=" + _text(example.get("row_indices", example.get("row_index")))
     if _number(example.get("duration_ns")):
         text += "；例跨度=" + format(example["duration_ns"] / 1e6, ".6g") + "ms"
     for label, key in (("前", "before"), ("后", "after")):
         task = example.get(key)
         if isinstance(task, dict):
-            text += "\n" + label + "=" + _operator_short(task.get("op_type") or task.get("name"), 24)
+            text += "\n" + label + "=" + _text(task.get("op_type") or task.get("name"))
+            if task.get("name") and task.get("name") != task.get("op_type"):
+                text += "；native=" + task["name"]
             text += "[s=" + _text(task.get("stream_id")) + ",row=" + _text(task.get("row_index")) + "]"
         elif key in example:
             text += "；" + label + "=边界处无相邻任务"
@@ -1169,29 +1166,29 @@ def _operator_example_text(example):
 
 
 def _operator_fingerprint_text(item):
-    return ("指纹#" + item["key"][-16:] + "\nnative=" + _operator_short(item.get("name") or "未导出名称", 80)
-        + "\nshape in=" + _operator_short(item.get("input_shapes"), 46) + " → out=" + _operator_short(item.get("output_shapes"), 36)
-        + "\ndtype in=" + _operator_short(item.get("input_dtypes"), 34) + " → out=" + _operator_short(item.get("output_dtypes"), 25)
-        + "\nstream=" + _text(item.get("stream_id")) + "；task=" + _operator_short(item.get("task_type"), 25)
-        + "\n" + _operator_example_text(item.get("example")))
+    return ("指纹#" + item["key"] + "\nnative=" + _text(item.get("name") or "未导出名称")
+        + "\nop_type=" + _text(item.get("op_type"))
+        + "\nshape in=" + _text(item.get("input_shapes")) + " → out=" + _text(item.get("output_shapes"))
+        + "\ndtype in=" + _text(item.get("input_dtypes")) + " → out=" + _text(item.get("output_dtypes"))
+        + "\nstream=" + _text(item.get("stream_id")) + "；task=" + _text(item.get("task_type"))
+        + ("\n" + _operator_example_text(item.get("example")) if "example" in item else ""))
 
 
 def _operator_label(item, number):
-    stage = _operator_short(item.get("stage_label"), 8)
     if item.get("remainder"):
         return item["label"]
+    parts = ["#" + str(number) + " " + _text(item.get("stage_label"))]
     kind = item["kind"]
     if kind in ("operator", "parallel"):
-        parts = []
-        for member in item["members"]:
-            name = _operator_short(member.get("op_type") or member.get("name") or "未导出名称", 18 if kind == "operator" else 12)
-            shape = " " + _operator_short(member.get("input_shapes") or "shape未记录", 14) if kind == "operator" else ""
-            parts.append(name + shape + "[s" + _text(member.get("stream_id")) + "]"
-                         + ("×" + str(member.get("instances", 1)) if member.get("instances", 1) > 1 else ""))
-        detail = " ∥ ".join(parts)
+        for index, member in enumerate(item["members"], 1):
+            parts.append(("∥ 成员" + str(index) + "：" if kind == "parallel" else "")
+                         + _text(member.get("op_type") or member.get("name") or "未导出名称"))
+            parts.append("输入shape=" + _text(member.get("input_shapes") or "未记录"))
+            parts.append("stream=" + _text(member.get("stream_id"))
+                         + ("；并发实例=" + str(member.get("instances", 1)) if member.get("instances", 1) > 1 else ""))
     else:
-        detail = ("无设备记录" if kind == "gap" else "模型增减") + " · " + _operator_short(item["label"], 45)
-    return "#" + str(number) + " " + stage + " · " + _operator_short(detail, 48)
+        parts.append(item["label"].removeprefix("模型增减：").removeprefix("模型增减:") if kind == "model_delta" else item["label"])
+    return "\n".join(line for part in parts for line in _operator_svg_label_lines(part, width=72))
 
 
 def _operator_preview(records, limit):
@@ -1217,7 +1214,7 @@ def _operator_preview(records, limit):
         retained.append(dict(key="remainder_" + kind, kind="model_delta" if kind.startswith("model_") else kind,
             label="其余" + str(len(subset)) + "项" + label + "合计（非单一热点）", remainder=True,
             members=[], example=representative.get("example"), stage_label="多个父阶段", stage_order=99,
-            details="；".join(_operator_short(item["stage_label"] + ":" + item["label"], 100) for item in subset[:3]),
+            details="\n\n".join(_operator_label(item, index) for index, item in enumerate(subset[:3], 1)),
             **{field: math.fsum(item[field] for item in subset)
                for field in ("source_ms", "delta_ms", "target_ms", "target_total_ms", "cycle_share")}))
     return retained
@@ -1252,7 +1249,7 @@ def _method_operator_data(method, role, attention, limit=12, kernel_limit=8):
 
     try:
         for stage in sorted(group["stage_rows"], key=lambda item: item["stage_order"]):
-            prefix = "父阶段" + str(stage["stage_order"]) + "（" + _operator_short(stage.get("label", stage["stage_key"]), 45) + "）"
+            prefix = "父阶段" + str(stage["stage_order"]) + "（" + _text(stage.get("label", stage["stage_key"])) + "）"
             breakdown = stage.get("operator_breakdown")
             if not isinstance(breakdown, dict):
                 raise ValueError(prefix + "缺少operator_breakdown；请用新版核心重算")
@@ -1327,18 +1324,17 @@ def _method_operator_data(method, role, attention, limit=12, kernel_limit=8):
     target_rows = []
     for number, item in enumerate(preview, 1):
         correction = item["kind"] == "model_delta"
-        detail = OPERATOR_KINDS[item["kind"]] + "\n指纹#" + item["key"][-16:] + "\n" + _operator_example_text(item.get("example"))
+        detail = OPERATOR_KINDS[item["kind"]] + "\n指纹#" + item["key"] + "\n" + _operator_example_text(item.get("example"))
         if item.get("details"):
-            detail += "\n组合预览：" + _operator_short(item["details"], 130)
+            detail += "\n前三项预览：\n" + item["details"]
         elif item["members"]:
-            detail += "\nnative=" + _operator_short(" ∥ ".join(member.get("name") or member.get("op_type") or "未导出名称"
-                                                              for member in item["members"]), 120)
+            detail += "\n\n" + "\n\n".join("成员" + str(index) + "\n" + _operator_fingerprint_text(member)
+                                                for index, member in enumerate(item["members"], 1))
         target_rows.append([_operator_label(item, number), 0. if correction else item["target_total_ms"],
                             item["target_total_ms"] if correction else 0., item["target_total_ms"], item["cycle_share"], detail])
     kernels = sorted(all_kernels, key=lambda item: (-item["kernel_sum_ms"], item["stage_order"], item["key"]))[:kernel_limit]
-    kernel_rows = [["#K" + str(number) + " " + _operator_short(item["stage_label"], 8) + " · "
-        + _operator_short(item.get("op_type") or item["name"] or "未导出名称", 18) + " " + _operator_short(item["input_shapes"], 16)
-        + "[s" + _text(item["stream_id"]) + "]", item["calls_mean"], item["kernel_sum_ms"], item["duration_mean_ms"],
+    kernel_rows = [[_operator_label(dict(item, kind="operator", members=[dict(item, instances=1)]), "K" + str(number)),
+        item["calls_mean"], item["kernel_sum_ms"], item["duration_mean_ms"],
         item["duration_p90_ms"], _operator_fingerprint_text(item)] for number, item in enumerate(kernels, 1)]
     total_row = ["合计（闭合目标父类）", math.fsum(row[1] for row in target_rows), math.fsum(row[2] for row in target_rows),
                  group["target_total_ms"], math.fsum(item["cycle_share"] for item in all_rows), "完整明细已核对全部10个父阶段；模型增减不代表优化收益"]
@@ -1351,19 +1347,50 @@ def _method_operator_data(method, role, attention, limit=12, kernel_limit=8):
 
 
 def _operator_table(sheet, row, headers, records, spans, percent=False):
-    header, written = row, []
-    row = _table(sheet, row, headers, records, spans=spans, record_rows=written)
+    header, written, expanded = row, [], []
+    widths = [max(8, int(sum(WIDTHS[first - 1:last]) - 4)) for first, last in spans]
+    for number, record in enumerate(records, 1):
+        cells = [_operator_svg_label_lines(value, width=widths[index]) if isinstance(value, str) else [value]
+                 for index, value in enumerate(record)]
+        pieces = max((math.ceil(len(lines) / 27) for lines in cells), default=1)
+        for piece in range(pieces):
+            values = []
+            for index, lines in enumerate(cells):
+                if isinstance(record[index], str):
+                    value = "\n".join(lines[piece * 27:(piece + 1) * 27])
+                    if index == 0 and piece:
+                        value = "（续 #" + str(number) + " · " + str(piece + 1) + "/" + str(pieces) + "）\n" + value
+                else:
+                    value = record[index] if piece == 0 else None
+                values.append(value)
+            expanded.append(values)
+    row = _table(sheet, row, headers, expanded, spans=spans, record_rows=written,
+                 blank_columns=tuple(range(1, len(headers) + 1)))
     sheet.row_height(header, 56)
-    for actual, record in zip(written, records):
-        sheet.row_height(actual, min(240, max(62, 14 * (str(record[-1]).count("\n") + 2))))
+    for actual, record in zip(written, expanded):
+        lines = max((len(_operator_svg_label_lines(value, width=widths[index]))
+                     for index, value in enumerate(record) if isinstance(value, str)), default=1)
+        sheet.row_height(actual, min(409, max(42, 14 * lines + 12)))
         if percent and _number(record[4]):
             sheet.write(actual, 10, record[4], "percent")
-    return row, header, written
+    return row, header, written if len(expanded) == len(records) else []
 
 
 def _operator_bar(sheet, row, title, headers, records, spans, header, written, columns, axis):
-    if not records or written != list(range(written[0], written[0] + len(records))):
-        return _note(sheet, row, "算子表存在长文本续行或无可绘制记录，未绘图；原值及核心JSON保留。")
+    if not records:
+        return _note(sheet, row, "本类没有可绘制算子记录；实测零值及核心JSON保留。")
+    if not written or written != list(range(written[0], written[0] + len(records))):
+        row = _note(sheet, row, "图表数据（与上表同一组数值，不另加）；正文长文本已在续行完整展示。")
+        headers = [headers[0], *[headers[column] for column in columns]]
+        records = [[record[0], *[record[column] for column in columns]] for record in records]
+        spans = ((1, 8), (9, 12)) if len(columns) == 1 else ((1, 8), (9, 10), (11, 12))
+        columns = tuple(range(1, len(columns) + 1))
+        header, written = row, []
+        row = _table(sheet, row, headers, records, spans=spans, record_rows=written)
+        if written != list(range(written[0], written[0] + len(records))):
+            return _note(sheet, row, "单条图分类超过Excel单元格长度上限，完整正文已分续行展示；本图不截断分类绘制。", warning=True)
+        for actual, record in zip(written, records):
+            sheet.row_height(actual, min(409, max(42, 14 * len(record[0].splitlines()) + 12)))
     reference = "'" + sheet.name.replace("'", "''") + "'!"
     series = []
     for index, column in enumerate(columns):
@@ -1371,7 +1398,7 @@ def _operator_bar(sheet, row, title, headers, records, spans, header, written, c
         series.append(dict(name=headers[column], values=[record[column] for record in records], color=("168B8D", "D4793A")[index],
             name_ref=reference + cell_reference(header, letter, True),
             values_ref=reference + cell_reference(written[0], letter, True) + ":" + cell_reference(written[-1], letter, True)))
-    height = max(18, 2 * len(records) + 6)
+    height = max(18, math.ceil(sum(max(3, len(record[0].splitlines()) + 1) for record in records) * .85) + 6)
     sheet.add_bar_chart(title, categories=[record[0] for record in records], series=series,
         categories_ref=reference + cell_reference(written[0], 1, True) + ":" + cell_reference(written[-1], 1, True),
         anchor=(row, 1, row + height, 12), stacked=False, x_axis_title=axis)
@@ -1764,20 +1791,17 @@ def _method_residual_html(case, method):
     return ''.join(parts)
 
 
-def _operator_svg_label_lines(value, width=68, max_lines=2):
+def _operator_svg_label_lines(value, width=68):
     """Fit mixed CJK/ASCII labels into the fixed SVG label column."""
     lines, line, used = [], "", 0
     for char in _text(value):
+        if char == "\n":
+            lines.append(line)
+            line, used = "", 0
+            continue
         cells = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
         if used + cells > width:
             lines.append(line)
-            if len(lines) == max_lines:
-                # Keep room for the ellipsis within the final visible line.
-                while sum(2 if unicodedata.east_asian_width(item) in ("W", "F") else 1
-                          for item in lines[-1] + "…") > width:
-                    lines[-1] = lines[-1][:-1]
-                lines[-1] += "…"
-                return lines
             line, used = "", 0
         line += char
         used += cells
@@ -1791,25 +1815,30 @@ def _operator_svg(title, labels, series, axis):
     low, high = min([0., *values]), max([0., *values])
     if low == high:
         high = low + 1
-    left, right, top, stride = 490, 1000, 46, 44
-    bottom = top + stride * len(labels)
+    left, right, top = 490, 1000, 46
+    layout, bottom = [], top
+    for label in labels:
+        lines = _operator_svg_label_lines(label)
+        content_height = max(len(lines) * 14, len(series) * 15)
+        layout.append((bottom, content_height, lines))
+        bottom += content_height + 14
+    legends = [(name, _operator_svg_label_lines(name, width=166), color) for name, _, color in series]
+    legend_height = sum(len(lines) * 14 + 8 for _, lines, _ in legends)
+    axis_lines = _operator_svg_label_lines(axis, width=175)
+    chart_height = bottom + 40 + legend_height + 14 * len(axis_lines) + 14
     x = lambda value: left + (value - low) / (high - low) * (right - left)
     parts = ['<div class="operator-chart"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 '
-        + str(bottom + 64) + '" role="img"><title>' + esc(title) + '</title>',
+        + str(chart_height) + '" role="img"><title>' + esc(title) + '</title>',
         '<text x="12" y="23" font-weight="bold">' + esc(title) + '</text>',
         f'<line x1="{x(0):.3f}" y1="{top - 10}" x2="{x(0):.3f}" y2="{bottom}" stroke="#60778c"/>']
-    for series_index, (name, _, color) in enumerate(series):
-        legend = _operator_svg_label_lines('■ ' + name.replace('\n', ' '), width=44, max_lines=1)[0]
-        parts.append(f'<text x="{left + series_index * 290}" y="23" fill="#{color}"><title>'
-                     + esc(name) + '</title>' + esc(legend) + '</text>')
     for index, label in enumerate(labels):
-        position = top + index * stride
+        position, content_height, lines = layout[index]
         parts.append('<text x="12" y="' + str(position + 12) + '"><title>' + esc(label) + '</title>'
             + ''.join('<tspan x="12" dy="' + str(0 if index == 0 else 14) + '">' + esc(line) + '</tspan>'
-                      for index, line in enumerate(_operator_svg_label_lines(label))) + '</text>')
+                      for index, line in enumerate(lines)) + '</text>')
         for series_index, (name, entries, color) in enumerate(series):
             value, height = entries[index], 12
-            y = position + series_index * 15
+            y = position + (content_height - len(series) * 15) / 2 + series_index * 15
             parts.append(f'<rect x="{min(x(0), x(value)):.3f}" y="{y}" width="{abs(x(value) - x(0)):.3f}" '
                 + f'height="{height}" fill="#{color}"><title>' + esc(label + ' · ' + name + ' = ' + format(value, '.6f') + ' ms') + '</title></rect>')
             if value:
@@ -1819,7 +1848,16 @@ def _operator_svg(title, labels, series, axis):
                              + esc(format(value, '.6g')) + '</text>')
     parts.append(f'<text x="{left}" y="{bottom + 20}">{low:.6g}</text>'
                  + f'<text x="{right}" y="{bottom + 20}" text-anchor="end">{high:.6g} ms</text>')
-    parts.append('<text x="12" y="' + str(bottom + 42) + '">' + esc(axis) + '</text></svg></div>')
+    legend_y = bottom + 38
+    for _, lines, color in legends:
+        parts.append('<rect x="12" y="' + str(legend_y - 10) + '" width="12" height="12" fill="#' + color + '"/>')
+        parts.append('<text x="34" y="' + str(legend_y) + '">'
+            + ''.join('<tspan x="34" dy="' + str(0 if index == 0 else 14) + '">' + esc(line) + '</tspan>'
+                      for index, line in enumerate(lines)) + '</text>')
+        legend_y += len(lines) * 14 + 8
+    parts.append('<text x="12" y="' + str(legend_y + 6) + '">'
+        + ''.join('<tspan x="12" dy="' + str(0 if index == 0 else 14) + '">' + esc(line) + '</tspan>'
+                  for index, line in enumerate(axis_lines)) + '</text></svg></div>')
     return ''.join(parts)
 
 

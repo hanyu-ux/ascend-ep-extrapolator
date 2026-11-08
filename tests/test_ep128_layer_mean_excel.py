@@ -489,7 +489,7 @@ class LayerMeanRendererTests(unittest.TestCase):
             self.assertEqual(preview.count('<p>' + line + '</p>'), 3)
         self.assertNotIn('Neff=6.399999', preview)
         self.assertIn('非实测', table)
-        self.assertEqual(renderer.RENDERER_VERSION, '20261108.1.operator_drilldown')
+        self.assertTrue(renderer.RENDERER_VERSION.startswith('20261108.'))
 
     def test_operator_preview_closes_signed_models_and_keeps_largest_remaining_gap(self):
         report = operator_drilldown_report()
@@ -508,8 +508,12 @@ class LayerMeanRendererTests(unittest.TestCase):
         self.assertIn('合计（非单一热点）', remainder_gap['label'])
         self.assertEqual(remainder_gap['example']['duration_ns'], 10000)
         gap_row = next(row for row in rows if '无设备记录区间' in row[0])
-        self.assertIn('前=MatMul[s=A,row=17]', gap_row[-1])
-        self.assertIn('后=MatMul[s=B,row=29]', gap_row[-1])
+        self.assertIn('前=MatMul', gap_row[-1])
+        self.assertIn('[s=A,row=17]', gap_row[-1])
+        self.assertIn('后=MatMul', gap_row[-1])
+        self.assertIn('[s=B,row=29]', gap_row[-1])
+        for direction in ('before', 'after'):
+            self.assertIn(remainder_gap['example'][direction]['name'], gap_row[-1])
         self.assertIn('模型增减', data['total_row'][-1])
         self.assertEqual(report, before)
 
@@ -517,34 +521,52 @@ class LayerMeanRendererTests(unittest.TestCase):
         labels = ['模型修正与无记录区间' * 20,
                   '#12 CSA输出 · QuantMatmul BF16[s18] 输入[16,7168] A<& ' * 8,
                   'MatMul FP16']
+        coverage_legend = '原覆盖：' + '按目标同类层数展开的源互斥记录覆盖；' * 8
+        model_legend = '模型修正：' + '独立显示有符号增减，不视为已验证优化收益；' * 8
         markup = renderer._operator_svg('SYNTHETIC_SIGNED_CHART', labels,
-            [('原覆盖', [4., 8., 2.], '168B8D'), ('模型修正', [-2., .5, 0.], 'D4793A')], 'ms')
+            [(coverage_legend, [4., 8., 2.], '168B8D'),
+             (model_legend, [-2., .5, 0.], 'D4793A')], 'ms')
         svg = ET.fromstring(re.search(r'<svg\b.*?</svg>', markup, re.DOTALL).group())
-        self.assertEqual([node.findtext('{*}title') for node in svg.findall('{*}text') if node.get('fill')],
-                         ['原覆盖', '模型修正'])
-        texts = [node for node in svg.findall('{*}text') if node.findall('{*}tspan')]
+        visible_texts = [''.join([node.text or '', *(line.text or '' for line in node.findall('{*}tspan'))])
+                         for node in svg.findall('{*}text')]
+        self.assertIn(coverage_legend, visible_texts)
+        self.assertIn(model_legend, visible_texts)
+        texts = [node for node in svg.findall('{*}text')
+                 if node.findall('{*}tspan') and node.findtext('{*}title') in labels]
         self.assertEqual([node.findtext('{*}title') for node in texts], labels)
         for index, node in enumerate(texts):
             lines = node.findall('{*}tspan')
-            self.assertTrue(1 <= len(lines) <= 2)
+            if index < 2:
+                self.assertGreater(len(lines), 2)
+            else:
+                self.assertEqual(len(lines), 1)
+            self.assertEqual(''.join(line.text or '' for line in lines), labels[index])
             for line in lines:
                 cells = sum(2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1 for char in line.text or '')
                 self.assertLessEqual(cells, 68)
                 self.assertEqual(line.get('x'), '12')
-            self.assertEqual([line.get('dy') for line in lines], ['0', '14'] if index < 2 else ['0'])
-            self.assertEqual(lines[-1].text.endswith('…'), index < 2)
-        rectangles = svg.findall('{*}rect')
+            self.assertFalse(any('…' in (line.text or '') for line in lines))
+            if index + 1 < len(texts):
+                baseline = float(node.get('y'))
+                for line in lines:
+                    baseline = float(line.get('y')) if line.get('y') is not None else baseline + float(line.get('dy', 0))
+                self.assertLess(baseline, float(texts[index + 1].get('y')))
+                self.assertGreater(float(texts[index + 1].get('y')) - float(node.get('y')), 44)
+        rectangles = [node for node in svg.findall('{*}rect') if node.find('{*}title') is not None]
         zero = float(svg.find('{*}line').get('x1'))
         self.assertEqual(len(rectangles), 6)
         self.assertAlmostEqual(float(rectangles[0].get('x')), zero)
-        self.assertAlmostEqual(float(rectangles[0].get('width')), 204.)
-        self.assertAlmostEqual(float(rectangles[1].get('x')), 490.)
         self.assertAlmostEqual(float(rectangles[1].get('x')) + float(rectangles[1].get('width')), zero)
+        self.assertAlmostEqual(float(rectangles[1].get('width')) / float(rectangles[0].get('width')), .5)
+        self.assertAlmostEqual(float(rectangles[2].get('width')) / float(rectangles[0].get('width')), 2.)
         self.assertTrue(all(float(node.get('width')) >= 0 for node in rectangles))
+        self.assertLess(max(float(node.get('y')) + float(node.get('height')) for node in rectangles),
+                        float(svg.get('viewBox').split()[3]))
 
     def test_operator_charts_use_selected_core_values_and_readable_traceable_fingerprints(self):
         report = operator_drilldown_report()
         out, (book, _) = self.build(report)
+        compact = lambda value: ''.join(str(value).split())
         self.assertEqual(tuple(book), renderer.SHEETS)
         charts = self.chart_parts_by_sheet(out, book)
         for number, method in enumerate(report['cases'][0]['projection']['layer_mean_methods'], 1):
@@ -558,12 +580,22 @@ class LayerMeanRendererTests(unittest.TestCase):
                 cache = self.assert_bar_cache_matches_own_sheet(target, book, sheet_name)
                 self.assertEqual([values for _, values in cache], [[row[column] for row in data['target_rows']] for column in (1, 2)])
                 self.assertEqual(len(cache[0][0]), len(set(cache[0][0])))
-                self.assertTrue(all(len(label) < 100 for label in cache[0][0]))
+                self.assertEqual(cache[0][0], [row[0] for row in data['target_rows']])
+                for label, item, record in zip(cache[0][0], data['target_items'], data['target_rows']):
+                    if item.get('remainder'):
+                        continue
+                    self.assertIn(compact(item['stage_label']), compact(label))
+                    for member in item['members']:
+                        self.assertIn(compact(member['op_type'] or member['name']), compact(label))
+                        self.assertIn(compact(member['input_shapes']), compact(label))
+                        self.assertIn(compact(member['output_shapes']), compact(record[-1]))
                 self.assertNotIn('合计（闭合目标父类）', cache[0][0])
                 self.assertAlmostEqual(sum(sum(values) for _, values in cache), data['total_row'][3])
                 hotspot = next(chart for chart in charts[sheet_name] if self.chart_title(chart).startswith(attention + '源实测算子热点'))
                 raw_cache = self.assert_bar_cache_matches_own_sheet(hotspot, book, sheet_name)
                 self.assertEqual(raw_cache[0][1], [row[2] for row in data['kernel_rows']])
+                for row, kernel in zip(data['kernel_rows'], data['kernel_items']):
+                    self.assertIn(compact(kernel['name']), compact(row[-1]))
                 self.assertEqual(len(data['kernel_items']), 8)
                 # Same native name retains distinct shape/stream fingerprints.
                 self.assertEqual(len({row['name'] for row in data['kernel_items']}), 1)
@@ -588,6 +620,123 @@ class LayerMeanRendererTests(unittest.TestCase):
         rectangles = [node for svg in svgs for node in svg.findall('{*}rect')]
         self.assertTrue(rectangles)
         self.assertTrue(all(float(node.get('width')) >= 0 for node in rectangles))
+
+    def test_long_operator_fields_remain_visible_in_tables_chart_categories_and_html(self):
+        from html.parser import HTMLParser
+
+        report = operator_drilldown_report()
+        expected = {}
+        for method in report['cases'][0]['projection']['layer_mean_methods']:
+            for group in method['target_stage_breakdowns']:
+                role, attention = group['role'], group['attention']
+                before = renderer._method_operator_data(method, role, attention)
+                expected[method['id'], attention] = (
+                    [(row['key'], row['kind'], row['stage_order']) for row in before['target_items']],
+                    [row[1:5] for row in before['target_rows']],
+                    [row['key'] for row in before['kernel_items']], [row[1:5] for row in before['kernel_rows']])
+                for stage in group['stage_rows']:
+                    stage['label'] = ('完整父阶段：HCPre与层内QKV准备及输入映射、结果归并衔接；' * 5
+                                      + attention + '_' + str(stage['stage_order']) + '_PARENT_END')
+                    breakdown = stage['operator_breakdown']
+                    replacements = {}
+                    for kernel in breakdown['kernels']:
+                        suffix = kernel['key'][-1]
+                        fields = dict(
+                            name='aclnn_FullNative_' + 'ProjectionAndPreparation_' * 10 + suffix + '_NATIVE_END',
+                            op_type='FullOperatorType_' + 'QuantBatchMatmulV3_' * 7 + suffix + '_TYPE_END',
+                            input_shapes=';'.join(f'{number},8192,128,16' for number in range(1, 14)),
+                            output_shapes=';'.join(f'{number},7168,64,8' for number in range(1, 10)))
+                        kernel.update(fields)
+                        replacements[kernel['key']] = fields
+                    for row in breakdown['rows']:
+                        for member in row['members']:
+                            member.update(replacements[member['key']])
+                        example = row.get('example') or {}
+                        for direction in ('before', 'after'):
+                            neighbor = example.get(direction)
+                            if neighbor and neighbor.get('key') in replacements:
+                                neighbor.update(replacements[neighbor['key']])
+
+        out, (book, _) = self.build(report)
+        charts = self.chart_parts_by_sheet(out, book)
+        compact = lambda value: ''.join(str(value).split())
+        visible_fields = set()
+        for number, method in enumerate(report['cases'][0]['projection']['layer_mean_methods'], 1):
+            sheet_name = '方法' + str(number) + '估算'
+            cells = book[sheet_name][1]
+            # Only directly displayed provenance cells count; raw JSON and
+            # hover titles must not be the only place with complete names.
+            provenance = ''.join(str(value) for cell, value in sorted(cells.items(),
+                key=lambda item: (int(re.search(r'\d+', item[0]).group()), item[0]))
+                if re.fullmatch(r'(?:I|K)\d+', cell) and isinstance(value, str))
+            continuations = [int(cell[1:]) for cell, value in cells.items()
+                             if re.fullmatch(r'A\d+', cell) and isinstance(value, str)
+                             and value.startswith('（续 #')]
+            self.assertTrue(continuations)
+            for row in continuations:
+                self.assertTrue(all(not isinstance(cells.get(column + str(row)), (int, float))
+                                    for column in ('E', 'F', 'G', 'H', 'I', 'J')))
+            for role, attention in (('main', 'CSA'), ('main', 'HCA'), ('draft', 'SWA')):
+                data = renderer._method_operator_data(method, role, attention)
+                self.assertTrue(data['available'], data['note'])
+                old_items, old_values, old_kernels, old_kernel_values = expected[method['id'], attention]
+                self.assertEqual([(row['key'], row['kind'], row['stage_order']) for row in data['target_items']], old_items)
+                self.assertEqual([row[1:5] for row in data['target_rows']], old_values)
+                self.assertEqual([row['key'] for row in data['kernel_items']], old_kernels)
+                self.assertEqual([row[1:5] for row in data['kernel_rows']], old_kernel_values)
+                for prefix, records in ((attention + '算子互斥覆盖与模型增减', data['target_rows']),
+                                        (attention + '源实测算子热点', data['kernel_rows'])):
+                    chart = next(chart for chart in charts[sheet_name] if self.chart_title(chart).startswith(prefix))
+                    cache = self.assert_bar_cache_matches_own_sheet(chart, book, sheet_name)
+                    self.assertEqual(cache[0][0], [row[0] for row in records])
+                    self.assertTrue(any(len(label) > 180 for label in cache[0][0]))
+                    self.assertFalse(any('…' in label for label in cache[0][0]))
+                for record, item in zip(data['target_rows'], data['target_items']):
+                    if item.get('remainder'):
+                        continue
+                    self.assertIn(compact(item['stage_label']), compact(record[0]))
+                    visible_fields.add(item['stage_label'])
+                    for member in item['members']:
+                        self.assertIn(compact(member['op_type']), compact(record[0]))
+                        self.assertIn(compact(member['input_shapes']), compact(record[0]))
+                        for field in ('name', 'output_shapes'):
+                            self.assertIn(compact(member[field]), compact(provenance))
+                        visible_fields.update(member[field] for field in ('name', 'op_type', 'input_shapes', 'output_shapes'))
+            for row in book[sheet_name][0].findall('.//{*}sheetData/{*}row'):
+                source_text = [cells.get(cell.get('r')) for cell in row.findall('{*}c')
+                               if re.fullmatch(r'(?:I|K)\d+', cell.get('r'))]
+                source_text = [value for value in source_text if isinstance(value, str)]
+                if source_text:
+                    self.assertGreaterEqual(float(row.get('ht', 20)),
+                        10 * max(value.count('\n') + 1 for value in source_text))
+                    self.assertLessEqual(float(row.get('ht', 20)), 409)
+
+        class VisibleText(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.hidden, self.parts = [], []
+            def handle_starttag(self, tag, attrs):
+                if tag in ('title', 'details', 'script', 'style'):
+                    self.hidden.append(tag)
+            def handle_endtag(self, tag):
+                if self.hidden and tag == self.hidden[-1]:
+                    self.hidden.pop()
+            def handle_data(self, data):
+                if not self.hidden:
+                    self.parts.append(data)
+
+        preview = out.with_suffix('.html').read_text(encoding='utf-8')
+        parser = VisibleText(); parser.feed(preview)
+        visible = compact(''.join(parser.parts))
+        for field in visible_fields:
+            self.assertIn(compact(field), visible)
+        for source in re.findall(r'<svg\b.*?</svg>', preview, re.DOTALL):
+            svg = ET.fromstring(source)
+            for node in svg.findall('{*}text'):
+                lines = node.findall('{*}tspan')
+                if lines and node.findtext('{*}title', '').startswith(('#', '其余')):
+                    self.assertEqual(compact(''.join(line.text or '' for line in lines)),
+                                     compact(node.findtext('{*}title')))
 
     def test_operator_missing_conflicting_or_partial_evidence_suppresses_only_new_class_charts(self):
         for invalid in ('old_json', 'status', 'rounds', 'references', 'source_sum', 'delta', 'total', 'share',
