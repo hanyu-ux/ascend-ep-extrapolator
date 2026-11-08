@@ -1388,6 +1388,99 @@ class ResidualStageTests(unittest.TestCase):
         self.assertNotIn("host_summary", result)
 
 
+class OperatorCoverageTests(unittest.TestCase):
+    """Exact synthetic device intervals; coverage is not a critical-path claim."""
+    def task(self, row, name, start, end, shape="4,16", *, stream="1", kind="AI_VECTOR_CORE"):
+        return SimpleNamespace(row_index=row, row_indices=[row], name=name, op_type=name,
+            start_ns=EPOCH_NS + start, end_ns=EPOCH_NS + end, stream_id=stream,
+            input_shapes=shape, output_shapes=shape, input_dtypes="DT_BF16", output_dtypes="DT_BF16",
+            task_type=kind)
+
+    def coverage(self, tasks, start=0, end=20):
+        index = M.ATimeIndex(sorted(tasks, key=lambda task: (task.start_ns, task.end_ns, task.row_index)))
+        stage = {"start_ns": str(EPOCH_NS + start), "end_ns": str(EPOCH_NS + end)}
+        result = M._lm_operator_stage(stage, index, {"rank": "dp0", "round_id": "r1", "layer": 2})
+        self.assertEqual(result["status"], "MATCHED", result["reason"])
+        self.assertEqual(sum(row["duration_ns"] for row in result["rows"]), end - start)
+        return result
+
+    def test_serial_touching_tasks_and_gap_cover_each_nanosecond_once(self):
+        tasks = [self.task(1, "A", 0, 5), self.task(2, "B", 5, 9),
+                 self.task(3, "C", 12, 20), self.task(4, "zero", 9, 9)]
+        result = self.coverage(tasks)
+        self.assertEqual(sorted((row["kind"], row["duration_ns"]) for row in result["rows"]),
+                         [("gap", 3), ("operator", 4), ("operator", 5), ("operator", 8)])
+        self.assertEqual(len(result["kernels"]), 3)
+        gap = next(row for row in result["rows"] if row["kind"] == "gap")
+        self.assertEqual(gap["example"]["before"]["row_index"], 4)  # Raw zero task is still a valid neighbour record.
+        self.assertEqual(gap["example"]["after"]["row_index"], 3)
+
+    def test_parallel_operators_are_a_set_not_two_charges_to_the_same_time(self):
+        result = self.coverage([self.task(1, "A", 0, 10), self.task(2, "B", 4, 8)], end=10)
+        parallel = next(row for row in result["rows"] if row["kind"] == "parallel")
+        self.assertEqual(parallel["duration_ns"], 4)
+        self.assertEqual({member["name"] for member in parallel["members"]}, {"A", "B"})
+        self.assertEqual(sum(sum(row["durations_ns"]) for row in result["kernels"].values()), 14)
+        self.assertEqual(sum(row["duration_ns"] for row in result["rows"]), 10)
+
+    def test_same_fingerprint_nested_instances_stay_parallel_until_both_finish(self):
+        result = self.coverage([self.task(1, "A", 0, 10), self.task(2, "A", 3, 7)], end=10)
+        self.assertEqual(len(result["kernels"]), 1)
+        parallel = next(row for row in result["rows"] if row["kind"] == "parallel")
+        self.assertEqual(parallel["duration_ns"], 4)
+        self.assertEqual(len(parallel["members"]), 1)
+        self.assertEqual(parallel["members"][0]["instances"], 2)
+        self.assertEqual({row["row_index"] for row in parallel["example"]["records"]}, {1, 2})
+        self.assertTrue(all(row["clip_start_ns"] == str(EPOCH_NS + 3)
+                            and row["clip_end_ns"] == str(EPOCH_NS + 7)
+                            for row in parallel["example"]["records"]))
+        self.assertEqual(next(row for row in result["rows"] if row["kind"] == "operator")["duration_ns"], 6)
+
+    def test_cross_stage_tasks_are_clipped_and_shapes_define_distinct_fingerprints(self):
+        tasks = [self.task(1, "Copy", -5, 5, "4,16"), self.task(2, "Copy", 1, 8, "8,16")]
+        first, second = self.coverage(tasks, end=4), self.coverage(tasks, start=4, end=10)
+        self.assertEqual(len(first["kernels"]), 2)
+        self.assertEqual(sum(sum(item["durations_ns"]) for item in first["kernels"].values()), 7)
+        self.assertEqual(sum(sum(item["durations_ns"]) for item in second["kernels"].values()), 5)
+        example = next(item["example"] for item in first["kernels"].values() if item["member"]["input_shapes"] == "4,16")
+        self.assertEqual(example["task_start_ns"], str(EPOCH_NS - 5))
+        self.assertEqual(example["task_end_ns"], str(EPOCH_NS + 5))
+        self.assertEqual(example["clip_start_ns"], str(EPOCH_NS))
+        self.assertEqual(example["clip_end_ns"], str(EPOCH_NS + 4))
+
+    def test_control_wait_records_remain_visible_when_they_overlap_compute(self):
+        result = self.coverage([self.task(1, "EVENT WAIT", 0, 20, kind="EVENT_WAIT"), self.task(2, "MatMul", 4, 8)])
+        control = next(item for item in result["kernels"].values() if item["member"]["name"] == "EVENT WAIT")
+        self.assertEqual(control["member"]["record_kind"], "synchronization_control")
+        self.assertEqual(control["durations_ns"], [20])
+        self.assertEqual(next(row for row in result["rows"] if row["kind"] == "parallel")["duration_ns"], 4)
+
+    def test_empty_stage_retains_unknown_gap_with_neighbours_outside_the_stage(self):
+        result = self.coverage([self.task(1, "Before", -10, -2), self.task(2, "After", 12, 15)], end=10)
+        self.assertEqual(len(result["rows"]), 1)
+        gap = result["rows"][0]
+        self.assertEqual((gap["kind"], gap["duration_ns"]), ("gap", 10))
+        self.assertEqual(gap["example"]["before"]["row_index"], 1)
+        self.assertEqual(gap["example"]["after"]["row_index"], 2)
+        self.assertEqual(result["kernels"], {})
+
+    def test_zero_length_stage_has_no_fabricated_operator_or_gap_cost(self):
+        result = self.coverage([self.task(1, "A", 0, 10)], end=0)
+        self.assertEqual(result["rows"], [])
+        self.assertEqual(result["kernels"], {})
+
+    def test_gap_totals_preserve_the_largest_individual_gap_as_the_example(self):
+        result = self.coverage([self.task(1, "A", 0, 2), self.task(2, "B", 4, 6),
+                                self.task(3, "C", 16, 30)], end=30)
+        gap = next(row for row in result["rows"] if row["kind"] == "gap")
+        self.assertEqual(gap["duration_ns"], 12)
+        self.assertEqual(gap["example"]["duration_ns"], 10)
+        self.assertEqual(gap["example"]["clip_start_ns"], str(EPOCH_NS + 6))
+        self.assertEqual(gap["example"]["clip_end_ns"], str(EPOCH_NS + 16))
+        self.assertEqual(gap["example"]["before"]["row_index"], 2)
+        self.assertEqual(gap["example"]["after"]["row_index"], 3)
+
+
 @unittest.skipUnless(
     (Path(__file__).resolve().parents[1] / "real_validation_20261102"
      / "dp9_pasted_evidence_20261103" / "stage_oracle.json").is_file(),
