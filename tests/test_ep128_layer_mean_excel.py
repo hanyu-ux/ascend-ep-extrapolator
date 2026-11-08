@@ -10,6 +10,7 @@ from zipfile import ZipFile
 from pathlib import Path
 import tempfile
 import unittest
+import unicodedata
 from unittest import mock
 
 from test_ep128_v2_excel import fixture, read_book, renderer
@@ -239,6 +240,59 @@ def bs_trend_report():
     return report
 
 
+def operator_drilldown_report():
+    """Synthetic independent core contract: concurrent calls, gaps and signed models."""
+    report = full_layer_drilldown_report()
+    for method in report['cases'][0]['projection']['layer_mean_methods']:
+        next(row for row in method['class_means'] if row['attention'] == 'SWA')['dispatch_delta_ms'] = -.03
+    attach_target_stage_contract(report)
+    native = 'SYNTHETIC_SAME_NATIVE_NAME_' + 'long_component_' * 12
+    for method in report['cases'][0]['projection']['layer_mean_methods']:
+        for group in method['target_stage_breakdowns']:
+            # A measured zero-length phase remains a complete, empty partition.
+            first, second = group['stage_rows'][:2]
+            transfer = first['source_ms']
+            for field in ('source_ms', 'target_ms'):
+                first[field] = 0.
+                second[field] += transfer
+            first.update(target_total_ms=0., cycle_share=0.)
+            second.update(target_total_ms=second['target_ms'] * group['target_layers'])
+            second['cycle_share'] = second['target_total_ms'] / method['cycle_ms']
+            for stage in group['stage_rows']:
+                source, count = stage['source_ms'], group['target_layers']
+                rows, kernels, members = [], [], []
+                example = dict(rank=method['selected_rank'], round_id='SYNTHETIC_ROUND_4',
+                    layer=group['reference_layers'][0], row_index=stage['stage_order'] * 10,
+                    row_indices=[stage['stage_order'] * 10], start_ns='100', end_ns='200', duration_ns=100)
+                for suffix, width, duration, calls in (('A', 16, .8 * source, 2.), ('B', 32, .35 * source, 1.)):
+                    member = dict(key='SYNTHETIC_' + group['attention'] + '_' + stage['stage_key'] + '_' + suffix,
+                        name=native, op_type='MatMul', input_shapes=f'{stage["stage_order"]},{width};{width},16',
+                        output_shapes=f'{stage["stage_order"]},16', input_dtypes='BF16;BF16', output_dtypes='BF16',
+                        stream_id=suffix, task_type='AI_CORE')
+                    members.append(dict(member, instances=1))
+                    if source:
+                        kernels.append(dict(member, calls_mean=calls, kernel_sum_ms=duration,
+                            duration_mean_ms=duration / calls, duration_p90_ms=duration / calls,
+                            example={**example, 'row_index': example['row_index'] + (suffix == 'B')}))
+                def append_row(key, kind, value, row_members, sample, delta=0.):
+                    rows.append(dict(key=key, label='SYNTHETIC_' + kind + '_' + stage['stage_key'], kind=kind,
+                        source_ms=value, delta_ms=delta, target_ms=value + delta,
+                        target_total_ms=(value + delta) * count,
+                        cycle_share=(value + delta) * count / method['cycle_ms'], members=row_members, example=sample))
+                if source:
+                    append_row('single', 'operator', .45 * source, members[:1], example)
+                    append_row('parallel', 'parallel', .35 * source, members, example)
+                    gap_duration = stage['stage_order'] * 1000
+                    gap = {**example, 'start_ns': '100', 'end_ns': str(100 + gap_duration), 'duration_ns': gap_duration,
+                           'before': {**members[0], 'row_index': 17}, 'after': {**members[1], 'row_index': 29}}
+                    append_row('gap', 'gap', .2 * source, [], gap)
+                if stage['delta_ms']:
+                    append_row('model_' + stage['stage_key'], 'model_delta', 0., [], None, stage['delta_ms'])
+                stage['operator_breakdown'] = dict(status='MATCHED', reason=None, rows=rows, kernels=kernels,
+                    reference_layers=group['reference_layers'], rounds=group['rounds'], note='SYNTHETIC_OPERATOR_SCOPE')
+    return report
+
+
 class LayerMeanRendererTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='ep128-layer-mean-excel-')
@@ -435,7 +489,153 @@ class LayerMeanRendererTests(unittest.TestCase):
             self.assertEqual(preview.count('<p>' + line + '</p>'), 3)
         self.assertNotIn('Neff=6.399999', preview)
         self.assertIn('非实测', table)
-        self.assertEqual(renderer.RENDERER_VERSION, '20261106.3.per_case_spec_params')
+        self.assertEqual(renderer.RENDERER_VERSION, '20261108.1.operator_drilldown')
+
+    def test_operator_preview_closes_signed_models_and_keeps_largest_remaining_gap(self):
+        report = operator_drilldown_report()
+        method = report['cases'][0]['projection']['layer_mean_methods'][0]
+        before = copy.deepcopy(report)
+        data = renderer._method_operator_data(method, 'draft', 'SWA', limit=1)
+        self.assertTrue(data['available'], data['note'])
+        group = next(row for row in method['target_stage_breakdowns'] if row['attention'] == 'SWA')
+        rows = data['target_rows']
+        self.assertAlmostEqual(sum(row[3] for row in rows), group['target_total_ms'])
+        self.assertAlmostEqual(sum(row[1] + row[2] for row in rows), group['target_total_ms'])
+        self.assertTrue(any(row[2] < 0 for row in rows))
+        self.assertTrue(any(row[2] > 0 for row in rows))
+        self.assertTrue(all(row[1] >= 0 for row in rows))
+        remainder_gap = next(row for row in data['target_items'] if row.get('remainder') and row['kind'] == 'gap')
+        self.assertIn('合计（非单一热点）', remainder_gap['label'])
+        self.assertEqual(remainder_gap['example']['duration_ns'], 10000)
+        gap_row = next(row for row in rows if '无设备记录区间' in row[0])
+        self.assertIn('前=MatMul[s=A,row=17]', gap_row[-1])
+        self.assertIn('后=MatMul[s=B,row=29]', gap_row[-1])
+        self.assertIn('模型增减', data['total_row'][-1])
+        self.assertEqual(report, before)
+
+    def test_operator_svg_wraps_cjk_and_mixed_labels_without_changing_signed_bars(self):
+        labels = ['模型修正与无记录区间' * 20,
+                  '#12 CSA输出 · QuantMatmul BF16[s18] 输入[16,7168] A<& ' * 8,
+                  'MatMul FP16']
+        markup = renderer._operator_svg('SYNTHETIC_SIGNED_CHART', labels,
+            [('原覆盖', [4., 8., 2.], '168B8D'), ('模型修正', [-2., .5, 0.], 'D4793A')], 'ms')
+        svg = ET.fromstring(re.search(r'<svg\b.*?</svg>', markup, re.DOTALL).group())
+        self.assertEqual([node.findtext('{*}title') for node in svg.findall('{*}text') if node.get('fill')],
+                         ['原覆盖', '模型修正'])
+        texts = [node for node in svg.findall('{*}text') if node.findall('{*}tspan')]
+        self.assertEqual([node.findtext('{*}title') for node in texts], labels)
+        for index, node in enumerate(texts):
+            lines = node.findall('{*}tspan')
+            self.assertTrue(1 <= len(lines) <= 2)
+            for line in lines:
+                cells = sum(2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1 for char in line.text or '')
+                self.assertLessEqual(cells, 68)
+                self.assertEqual(line.get('x'), '12')
+            self.assertEqual([line.get('dy') for line in lines], ['0', '14'] if index < 2 else ['0'])
+            self.assertEqual(lines[-1].text.endswith('…'), index < 2)
+        rectangles = svg.findall('{*}rect')
+        zero = float(svg.find('{*}line').get('x1'))
+        self.assertEqual(len(rectangles), 6)
+        self.assertAlmostEqual(float(rectangles[0].get('x')), zero)
+        self.assertAlmostEqual(float(rectangles[0].get('width')), 204.)
+        self.assertAlmostEqual(float(rectangles[1].get('x')), 490.)
+        self.assertAlmostEqual(float(rectangles[1].get('x')) + float(rectangles[1].get('width')), zero)
+        self.assertTrue(all(float(node.get('width')) >= 0 for node in rectangles))
+
+    def test_operator_charts_use_selected_core_values_and_readable_traceable_fingerprints(self):
+        report = operator_drilldown_report()
+        out, (book, _) = self.build(report)
+        self.assertEqual(tuple(book), renderer.SHEETS)
+        charts = self.chart_parts_by_sheet(out, book)
+        for number, method in enumerate(report['cases'][0]['projection']['layer_mean_methods'], 1):
+            sheet_name = '方法' + str(number) + '估算'
+            cells = book[sheet_name][1]
+            self.assertTrue(any(str(value).startswith('CSA/HCA/SWA算子下钻位置：CSA：第') for value in cells.values()))
+            for role, attention in (('main', 'CSA'), ('main', 'HCA'), ('draft', 'SWA')):
+                data = renderer._method_operator_data(method, role, attention)
+                self.assertTrue(data['available'], data['note'])
+                target = next(chart for chart in charts[sheet_name] if self.chart_title(chart).startswith(attention + '算子互斥覆盖与模型增减'))
+                cache = self.assert_bar_cache_matches_own_sheet(target, book, sheet_name)
+                self.assertEqual([values for _, values in cache], [[row[column] for row in data['target_rows']] for column in (1, 2)])
+                self.assertEqual(len(cache[0][0]), len(set(cache[0][0])))
+                self.assertTrue(all(len(label) < 100 for label in cache[0][0]))
+                self.assertNotIn('合计（闭合目标父类）', cache[0][0])
+                self.assertAlmostEqual(sum(sum(values) for _, values in cache), data['total_row'][3])
+                hotspot = next(chart for chart in charts[sheet_name] if self.chart_title(chart).startswith(attention + '源实测算子热点'))
+                raw_cache = self.assert_bar_cache_matches_own_sheet(hotspot, book, sheet_name)
+                self.assertEqual(raw_cache[0][1], [row[2] for row in data['kernel_rows']])
+                self.assertEqual(len(data['kernel_items']), 8)
+                # Same native name retains distinct shape/stream fingerprints.
+                self.assertEqual(len({row['name'] for row in data['kernel_items']}), 1)
+                self.assertGreater(len({(row['input_shapes'], row['stream_id']) for row in data['kernel_items']}), 1)
+                old = next(chart for chart in charts[sheet_name]
+                           if self.chart_title(chart).startswith(attention + '层内阶段展开'))
+                self.assertEqual(len(self.assert_bar_cache_matches_own_sheet(old, book, sheet_name)[0][1]), 10)
+                self.assertIn(data['total_row'][3], cells.values())
+            self.assertNotIn('SYNTHETIC_OPERATOR_SCOPE', ' '.join(map(str, cells.values())))
+            title = next(cell for cell, value in cells.items() if value == 'CSA算子下钻 · 目标贡献')
+            title_cell = book[sheet_name][0].find('.//{*}c[@r="' + title + '"]')
+            self.assertEqual(int(title_cell.get('s')), renderer.xlsx_writer.STYLE_IDS['section'])
+            self.assertEqual(book[sheet_name][0].find('.//{*}row[@r="' + title[1:] + '"]').get('ht'), '30')
+        preview = out.with_suffix('.html').read_text(encoding='utf-8')
+        self.assertEqual(preview.count('class="operator-drilldown"'), 6)
+        self.assertEqual(preview.count('class="operator-chart"'), 12)
+        self.assertIn('关键路径及优化收益尚未验证', preview)
+        self.assertIn('SYNTHETIC_OPERATOR_SCOPE', preview)
+        self.assertIn('SYNTHETIC_SAME_NATIVE_NAME_' + 'long_component_' * 12, preview)
+        self.assertNotRegex(preview, r'width:-')
+        svgs = [ET.fromstring(svg) for svg in re.findall(r'<svg\b.*?</svg>', preview, re.DOTALL)]
+        rectangles = [node for svg in svgs for node in svg.findall('{*}rect')]
+        self.assertTrue(rectangles)
+        self.assertTrue(all(float(node.get('width')) >= 0 for node in rectangles))
+
+    def test_operator_missing_conflicting_or_partial_evidence_suppresses_only_new_class_charts(self):
+        for invalid in ('old_json', 'status', 'rounds', 'references', 'source_sum', 'delta', 'total', 'share',
+                        'duplicate', 'member_shape', 'member_instances', 'example', 'gap_neighbors', 'kernel_count'):
+            report = operator_drilldown_report()
+            method = report['cases'][0]['projection']['layer_mean_methods'][0]
+            group = next(row for row in method['target_stage_breakdowns'] if row['attention'] == 'CSA')
+            breakdown = group['stage_rows'][1]['operator_breakdown']
+            item = breakdown['rows'][0]
+            if invalid == 'old_json':
+                group['stage_rows'][1].pop('operator_breakdown')
+            elif invalid == 'status':
+                breakdown['status'] = 'PARTIAL'
+            elif invalid == 'rounds':
+                breakdown['rounds'] += 1
+            elif invalid == 'references':
+                breakdown['reference_layers'] = [0, 1]
+            elif invalid == 'source_sum':
+                item.update(source_ms=item['source_ms'] + 1, target_ms=item['target_ms'] + 1,
+                            target_total_ms=item['target_total_ms'] + group['target_layers'])
+                item['cycle_share'] = item['target_total_ms'] / method['cycle_ms']
+            elif invalid in ('delta', 'total', 'share'):
+                item[{'delta': 'delta_ms', 'total': 'target_total_ms', 'share': 'cycle_share'}[invalid]] += 1
+            elif invalid == 'duplicate':
+                breakdown['rows'].append(copy.deepcopy(item))
+            elif invalid == 'member_shape':
+                item['members'][0]['input_shapes'] = 'SYNTHETIC_WRONG_SHAPE'
+            elif invalid == 'member_instances':
+                item['members'][0]['instances'] = 2
+            elif invalid == 'example':
+                item['example']['rank'] = 'SYNTHETIC_OTHER_RANK'
+            elif invalid == 'gap_neighbors':
+                next(row for row in breakdown['rows'] if row['kind'] == 'gap')['example'].pop('before')
+            else:
+                breakdown['kernels'][0]['calls_mean'] += 10
+            with self.subTest(invalid=invalid):
+                data = renderer._method_operator_data(method, 'main', 'CSA')
+                self.assertFalse(data['available'])
+                self.assertIn('未绘图', data['note'])
+                self.assertTrue(renderer._method_operator_data(method, 'main', 'HCA')['available'])
+                self.assertIsNotNone(renderer._target_layer_expansion_data(method, 'main', 'CSA', 'CSA')['series'])
+                if invalid == 'old_json':
+                    self.assertIn('请用新版核心重算', data['note'])
+                    out, (book, _) = self.build(report)
+                    by_sheet = self.chart_parts_by_sheet(out, book)['方法1估算']
+                    self.assertFalse(any(self.chart_title(chart).startswith('CSA算子互斥覆盖') for chart in by_sheet))
+                    self.assertTrue(any(self.chart_title(chart).startswith('CSA层内阶段展开') for chart in by_sheet))
+                    self.assertIn('请用新版核心重算', out.with_suffix('.html').read_text())
 
     def test_sal_only_cases_hide_unused_rate_column_and_keep_legacy_declared_rates(self):
         # Synthetic normalized core reports: the second case never declares a rate.

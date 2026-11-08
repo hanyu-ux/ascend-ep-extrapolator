@@ -148,13 +148,22 @@ class TargetStageTests(unittest.TestCase):
         method = attach(report, native)[0]
         ranks = {row["rank"]: row for row in method["per_rank"]}
         self.assertEqual(method["selected_rank"], "dp1")
-        self.assertEqual(method["target_stage_breakdowns"], ranks["dp1"]["target_stage_breakdowns"])
+        parent_groups = copy.deepcopy(method["target_stage_breakdowns"])
+        for group in parent_groups:
+            for stage in group["stage_rows"]:
+                self.assertIn("operator_breakdown", stage)
+                stage.pop("operator_breakdown")
+        self.assertEqual(parent_groups, ranks["dp1"]["target_stage_breakdowns"])
+        self.assertTrue(all("operator_breakdown" not in stage for rank in ranks.values()
+                            for group in rank["target_stage_breakdowns"] for stage in group["stage_rows"]))
         self.assertEqual(groups(method)["main", "HCA"]["rounds"], 2)
         for rank in ranks.values():
             self.assert_closes(rank)
             for cycle in rank["rounds"]:
                 self.assert_closes(cycle)
                 self.assertTrue(all(row["rounds"] == 1 for row in cycle["target_stage_breakdowns"]))
+                self.assertTrue(all("operator_breakdown" not in stage
+                    for group in cycle["target_stage_breakdowns"] for stage in group["stage_rows"]))
         dp0 = stages(groups(ranks["dp0"])["main", "HCA"])
         dp1 = stages(groups(ranks["dp1"])["main", "HCA"])
         self.assertAlmostEqual(dp0["dispatch"]["source_ms"], 1.)

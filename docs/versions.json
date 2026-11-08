@@ -7,15 +7,15 @@
   },
   "components": {
     "profile_ep128.py": {
-      "version": "20261106.4.per_case_spec_params",
-      "sha256": "37a129073f647f71954a916f5bc7b32c1ebf1da57d9335c59595694442c88779",
+      "version": "20261108.1.operator_drilldown",
+      "sha256": "34c14fe377b4b8045dd77ef2b033640515d09ce1eda000d1e48fa7140760a92b",
       "imported_version": "20261103.12.native_stages",
       "imported_sha256": "035f0c6312354ca0937361f1ab301452ed61c68239845b2c0c76f08653f9d7f7",
       "matches_imported_source": false
     },
     "build_ep128_leadership_excel.py": {
-      "version": "20261106.3.per_case_spec_params",
-      "sha256": "8d57b695d092f828a1fdd0c89475df928a2f8af2d777a2cf82094971ef1924c7",
+      "version": "20261108.1.operator_drilldown",
+      "sha256": "76205cbfb3e7465cb7e892611b5b23b7961548f9a9fdbcf5335a15aca1a1721e",
       "imported_version": "20261104.2.bs_inventory",
       "imported_sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
       "matches_imported_source": false
@@ -61,11 +61,12 @@
     "U charts can combine a verified all-round UNRESOLVED whole window with matched stages while preserving measured totals, counts, reasons and explicit partial-identification labels. Final Norm recognition accepts only a single explicit Index/Gather row-selection shape chain; ambiguous or insufficient evidence remains unresolved with bounded shape diagnostics. Core cycle, TPOT, throughput and target-layer estimates are unchanged.",
     "Context-KV stages accept a shared positive num_context prefix of padded fused features while preserving hidden, projection, payload, slots and in-place cache checks. Packed UINT8 aliases compare by semantic dtype; bounded summary examples retain full per-round failure details in the stages CSV. Original cycle and extrapolation formulas are unchanged.",
     "Independent cases can mix speculative-token counts and synthetic output lengths under an explicit mean accepted-draft fraction. Normalize num_speculative_tokens as the draft_tokens alias per configuration layer; case output policies override inherited fixed lengths and declared rates must agree with Neff=1+S*r. The template uses 60% instead of fixed Neff5.2. CSV, Excel and HTML display per-case parameters; existing timing formulas and BS grouping are unchanged.",
-    "Each case can supply only num_speculative_tokens and synthetic_acceptance_length; synthetic_acception_length is a compatible alias. Explicit case SAL replaces inherited fixed lengths and, when no case rate is declared, clears inherited rate policy. Same-case contradictory declarations remain errors and SAL stays within [1,S+1]. The template no longer requires acceptance rates; all-no-rate Excel/HTML reports hide the unused rate column. Legacy explicit Neff/rate configurations and timing formulas remain supported."
+    "Each case can supply only num_speculative_tokens and synthetic_acceptance_length; synthetic_acception_length is a compatible alias. Explicit case SAL replaces inherited fixed lengths and, when no case rate is declared, clears inherited rate policy. Same-case contradictory declarations remain errors and SAL stays within [1,S+1]. The template no longer requires acceptance rates; all-no-rate Excel/HTML reports hide the unused rate column. Legacy explicit Neff/rate configurations and timing formulas remain supported.",
+    "Final selected-rank CSA/HCA/SWA stages add optional operator drill-downs. Integer-nanosecond, all-stream clipped sweeps retain named parallel multiplicities and no-record gaps; source means use the parent reference layers and retained rounds, including zero for proven absent fingerprints. Native names, shapes, dtypes, streams and original row examples remain traceable. Existing Dispatch/Combine/GMM deltas are separate signed model entries; original cycle, TPOT, throughput, rank selection and ten-stage/U accounting are unchanged. Method1/2 sheets and HTML show closed Top-N coverage/model ledgers and separate nonadditive source-kernel hotspots, with readable labels, explicit aggregate remainders and old-report fallback. Only final selected-rank groups export operator detail, with source aggregation cached across methods; no private capture or detailed analysis is included."
   ],
   "validation": {
-    "discovered_tests": 303,
-    "passed": 293,
+    "discovered_tests": 325,
+    "passed": 315,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,
@@ -95,5 +96,5 @@
       "added_at": "2026-11-05"
     }
   },
-  "updated_at": "2026-11-06"
+  "updated_at": "2026-11-08"
 }

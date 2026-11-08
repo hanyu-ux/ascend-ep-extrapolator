@@ -492,6 +492,64 @@ raise SystemExit(p.main())
             self.assertNotIn('cycle_breakdown', diagnostic)
             self.assertNotIn('host_summary', diagnostic)
 
+    def test_native_attention_csv_adds_operator_evidence_without_changing_estimates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            cases = manifest(base)
+            document = json.loads(cases.read_text())
+            document['communication_reference'] = str(HERE / 'examples/communication-reference.synthetic.csv')
+            cases.write_text(json.dumps(document))
+            baseline_out, expanded_out = base / 'baseline', base / 'expanded'
+            baseline_run = self.invoke(cases, baseline_out)
+            self.assertEqual(baseline_run.returncode, 0, baseline_run.stdout + baseline_run.stderr)
+            source = Path(document['cases'][0]['inputs'][0]['path'])
+            with source.open(encoding='utf-8-sig', newline='') as stream:
+                rows = list(csv.DictReader(stream))
+            for row in rows:
+                row['Task Type'] = 'AI_CORE'
+                if row['Type'] != 'Attention':
+                    continue
+                layer = ((p.a_ns(row['Start Time(us)']) - EPOCH_NS) % 1_100_000) // 100_000
+                kind = ('SparseAttnSharedkv' if layer >= 8 else
+                        'SparseFlashAttention' if MODEL['compress_ratios'][layer] == 4 else
+                        'MixedQuantSparseFlashMla')
+                # Change only operator metadata, preserving every timestamp,
+                # duration and HC boundary from the baseline capture.
+                row.update(Name='aclnn' + kind + '_' + kind, Type=kind)
+            fields = list(dict.fromkeys(key for row in rows for key in row))
+            with source.open('w', encoding='utf-8', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader(); writer.writerows(rows)
+            expanded_run = self.invoke(cases, expanded_out, '--excel')
+            self.assertEqual(expanded_run.returncode, 0, expanded_run.stdout + expanded_run.stderr)
+            before = json.loads((baseline_out / 'model_architecture_report.json').read_text())
+            after = json.loads((expanded_out / 'model_architecture_report.json').read_text())
+            self.assertEqual(after['failures'], [])
+            old_methods = p.displayed_methods(before['cases'][0])
+            new_methods = p.displayed_methods(after['cases'][0])
+            self.assertEqual(len(new_methods), 2)
+            for old, new in zip(old_methods, new_methods):
+                self.assertEqual(new['status'], 'LAYER_MEAN_ESTIMATE', new['reasons'])
+                for field in ('cycle_ms', 'tpot_ms', 'per_device_tokens_s', 'global_tokens_s',
+                              'selected_rank', 'class_means', 'role_details', 'source_partition', 'breakdown'):
+                    self.assertEqual(new[field], old[field], (new['id'], field))
+                self.assertEqual(len(new['target_stage_breakdowns']), 3)
+                for group in new['target_stage_breakdowns']:
+                    self.assertEqual(group['status'], 'MATCHED', group['reason'])
+                    self.assertEqual(len(group['stage_rows']), 10)
+                    for stage in group['stage_rows']:
+                        ledger = stage['operator_breakdown']
+                        self.assertEqual(ledger['status'], 'MATCHED', ledger.get('reason'))
+                        self.assertAlmostEqual(sum(row['source_ms'] for row in ledger['rows']), stage['source_ms'])
+                        self.assertAlmostEqual(sum(row['target_total_ms'] for row in ledger['rows']),
+                                               stage['target_total_ms'])
+                        self.assertTrue(all(kernel['task_type'] == 'AI_CORE' for kernel in ledger['kernels']))
+            self.assertEqual((baseline_out / '最终结果.csv').read_bytes(),
+                             (expanded_out / '最终结果.csv').read_bytes())
+            html = (expanded_out / '10T模型推理估算.html').read_text(encoding='utf-8')
+            self.assertEqual(html.count('class="operator-drilldown"'), 6)
+            self.assertTrue((expanded_out / '10T模型推理估算.xlsx').is_file())
+
     def test_input_listing_and_inventory_do_not_analyze_cycles_or_scan_trace(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
