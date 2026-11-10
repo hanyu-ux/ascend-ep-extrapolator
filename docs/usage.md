@@ -90,6 +90,18 @@ python -u profile_ep128.py cases.local.json --out ep128_report --excel
 
 Windows 可以使用 `py -3 -u` 替换 `python -u`。日志会显示进度、所用文件、版本和具体失败原因。U 阶段诊断会读取同次设备记录；有 trace 时还会扫描 Host 事件并核对来源，因此耗时可能明显高于仅解析 CSV。
 
+多个 case 默认按 case 粒度使用最多2个独立进程；单个 case 直接运行，其内部的 rank 仍顺序处理。需要调整并行数时使用：
+
+```bash
+python -u profile_ep128.py cases.local.json --out ep128_report --excel --workers 4
+```
+
+`--workers 1` 是串行对照。自动预算受有效 case 数、CPU 及内存约束：探测到可用内存不足4 GiB时降为1个进程；探测不到内存时最多2个。显式设置的正整数只按有效 case 数封顶，低内存时会提示，但不会自动改小。不会同时再按 rank 创建子进程。
+
+每个 case 完成测量后立即计算方法1/方法2，释放临时算子数据，避免积压到所有 case 都读完。并行子进程将已汇总结果写入私有临时目录，主进程读取后删除；大结果不经进程管道复制。各 case 的明细文件路径独立，最终表格仍按配置顺序排列；某 case 失败会保留原因，不自动重新跑一次。所有 rank、逐轮证据、PMU 缺失处理和外推公式均保留。
+
+大采样的单个进程可能使用数 GiB 内存，证据 CSV 也可能比原始文件大；进程数增加不保证等比例提速，尤其是共享慢盘时。日志为 case 与 rank 加标识，并显示测量、估算、导出阶段。不同命令应使用不同 `--out`，避免互相覆盖。已在运行的旧进程会继续使用原代码；这些参数适用于之后启动的命令。
+
 核心输出为 `ep128_report/model_architecture_report.json`、`最终结果.csv`，以及逐 rank、逐轮、层区间、组件、U 阶段等证据 CSV。开启 `--excel` 时另生成 `10T模型推理估算.xlsx` 和同名 HTML。
 
 ## 4. 方法2的真实通信参考

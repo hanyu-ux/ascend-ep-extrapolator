@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261110.1.u_focus_step_pmu"
+PROFILE_VERSION = "20261110.2.parallel_analysis"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -104,12 +104,16 @@ def a_alias(row, names, label, normalize=None):
 
 
 def a_ns(value, label="timestamp", missing=False):
-    if value is None or str(value).strip() in ("", "N/A", "None"):
+    # Trace JSON already supplies exact Decimal timestamps. Retain the number
+    # instead of formatting and reparsing it for every timed event. Other
+    # types keep the original conversion and Decimal-context rounding rules.
+    decimal_value = type(value) is Decimal
+    if not decimal_value and (value is None or str(value).strip() in ("", "N/A", "None")):
         if missing:
             return None
         raise ValueError(label + " is missing")
     try:
-        number = Decimal(str(value).strip())
+        number = value if decimal_value else Decimal(str(value).strip())
         if not number.is_finite():
             raise ValueError(label + " must be finite")
         return int((number * 1000).to_integral_value())
@@ -160,35 +164,59 @@ def _a_pmu_header(header):
     return None
 
 
+class _ANativePmu(dict):
+    """Parser-validated native counters, with no extra serialized fields.
+
+    A capture is read completely (including duplicate conflicts) before its
+    tasks enter the immutable indexed analysis. Reuse those validated values
+    instead of copying/revalidating every counter in every clipped stage.
+    Manually constructed task dictionaries still take the validation path.
+    """
+    __slots__ = ()
+
+
+@lru_cache(maxsize=8192)
+def _a_pmu_value(raw, unit, factor):
+    """Pure bounded cache for recurring zero/missing/ratio CSV strings."""
+    text = raw.strip()
+    if text.lower() in ("", "n/a", "none", "null", "--", "-"):
+        return None, False
+    text = text.replace("％", "%")
+    percent = text.endswith("%")
+    try:
+        if percent and unit != "ratio":
+            raise ValueError("percent suffix is only valid for optional PMU ratios")
+        value = float(text[:-1].strip() if percent else text)
+        value *= .01 if percent else factor
+        if (not math.isfinite(value) or value < 0 or unit == "ratio" and value > 1
+                or unit in ("count", "cycles") and not value.is_integer()):
+            raise ValueError("invalid optional PMU value")
+        return value, False
+    except (ValueError, TypeError, OverflowError):
+        return None, True
+
+
 def _a_read_pmu(row, columns):
     values, invalid = {}, set()
     for header, field, factor in columns:
         raw = row.get(header)
-        if raw is None or str(raw).strip().lower() in ("", "n/a", "none", "null", "--", "-"):
+        if raw is None:
             continue
-        try:
-            text = str(raw).strip().replace("％", "%")
-            percent = text.endswith("%")
-            if percent and _A_PMU_FIELDS[field] != "ratio":
-                raise ValueError("percent suffix is only valid for optional PMU ratios")
-            value = float(text[:-1].strip() if percent else text)
-            value *= .01 if percent else factor
-            if (not math.isfinite(value) or value < 0
-                    or _A_PMU_FIELDS[field] == "ratio" and value > 1
-                    or _A_PMU_FIELDS[field] in ("count", "cycles") and not value.is_integer()):
-                raise ValueError("invalid optional PMU value")
+        value, invalid_value = _a_pmu_value(raw if isinstance(raw, str) else str(raw),
+                                           _A_PMU_FIELDS[field], factor)
+        if invalid_value:
+            invalid.add(field)
+        elif value is not None:
             if field in values and not math.isclose(values[field], value, rel_tol=1e-9, abs_tol=1e-12):
                 invalid.add(field)
             else:
                 values[field] = value
-        except (ValueError, TypeError, OverflowError):
-            invalid.add(field)
     for field in invalid:
         values.pop(field, None)
     if not values and not invalid:
         return {}
-    return {"metrics": values, "invalid_fields": sorted(invalid),
-            "core_type": str(row.get("Accelerator Core") or row.get("Task Type") or "").strip()}
+    return _ANativePmu(metrics=values, invalid_fields=sorted(invalid),
+                      core_type=str(row.get("Accelerator Core") or row.get("Task Type") or "").strip())
 
 
 def _a_merge_pmu(left, right):
@@ -202,8 +230,9 @@ def _a_merge_pmu(left, right):
             metrics[field] = value
     for field in invalid:
         metrics.pop(field, None)
-    return {"metrics": metrics, "invalid_fields": sorted(invalid),
-            "core_type": left.get("core_type") or right.get("core_type") or ""}
+    constructor = _ANativePmu if isinstance(left, _ANativePmu) and isinstance(right, _ANativePmu) else dict
+    return constructor(metrics=metrics, invalid_fields=sorted(invalid),
+                       core_type=left.get("core_type") or right.get("core_type") or "")
 
 
 
@@ -1174,31 +1203,37 @@ def analyze_case(case, model, target, base, reference_rows=None):
     required = {role: shape['target']['num_experts_per_tok'] != shape['source']['num_experts_per_tok']
                 for role, shape in shapes.items()} if not source_errors else {}
     excluded = set(case.get('exclude_target_layers', [0]))
-    for path, rank in zip(files, names):
+    for rank_number, (path, rank) in enumerate(zip(files, names), 1):
+        rank_started = stage_started = time.perf_counter()
         for info in path.parent.parent.glob('profiler_info*.json'):
             common = json.loads(info.read_text(encoding='utf-8-sig')).get('config', {}).get('common_config', {})
             if common.get('with_stack') is True or common.get('with_modules') is True:
                 raise ValueError(f'{info}: enabled stack/modules capture conflicts with timing baseline')
-        print('  读取 ' + rank + ': ' + str(path), flush=True)
+        print(f'  读取 {rank}（{rank_number}/{len(names)}）: {path}', flush=True)
         capture = read_capture(path, rank)
+        print(f'  {rank} CSV/PMU读取完成：{len(capture["tasks"])}条任务，'
+              f'{time.perf_counter() - stage_started:.2f}s；开始HC周期识别', flush=True)
+        stage_started = time.perf_counter()
         if capture['sha256'] in capture_hashes:
             raise ValueError('Identical CSV content was selected as different global ranks: '
                              + capture_hashes[capture['sha256']] + ' and ' + rank)
         capture_hashes[capture['sha256']] = rank
         measured = measure_capture(capture, model, case, base)
+        print(f'  {rank} HC周期识别完成：{len(measured["rounds"])}轮，'
+              f'{time.perf_counter() - stage_started:.2f}s；开始层内阶段统计', flush=True)
         trace_path = next((item.get('trace_path') for item in case.get('inputs', [])
                            if item.get('rank') == rank), None)
         if trace_path is not None:
             trace_path = Path(trace_path).expanduser()
             if not trace_path.is_absolute():
                 trace_path = Path(base) / trace_path
-        print('  HC周期剩余区间统计：' + rank, flush=True)
         try:
             # The CLI always supplies its output directory. Direct API callers
             # still receive base measurements without writing beside inputs or
             # returning references to deleted temporary detail files.
             with (nullcontext(residual_dir) if residual_dir is not None else
                   tempfile.TemporaryDirectory(prefix='ep128-residual-')) as detail_dir:
+                stage_started = time.perf_counter()
                 try:
                     measured['layer_diagnostics'], measured['swa_diagnostics'] = layer_analyze_capture(
                         capture, measured, detail_dir, with_swa_compat=True)
@@ -1206,9 +1241,14 @@ def analyze_case(case, model, target, base, reference_rows=None):
                     for field in ('layer_diagnostics', 'swa_diagnostics'):
                         measured[field] = {'status': 'ERROR', 'reason': str(error),
                                            'layer_summary': [], 'stage_summary': [], 'stages_csv': None}
+                print(f'  {rank} 层内阶段统计结束：{time.perf_counter() - stage_started:.2f}s；'
+                      '开始HC剩余区间/Host来源统计', flush=True)
+                stage_started = time.perf_counter()
                 measured['step_residuals'] = residual_analyze_capture(
                     capture, measured, detail_dir, trace_path=trace_path, case=case,
                     progress=lambda message: print('    ' + message, flush=True))
+                print(f'  {rank} HC剩余区间/Host来源统计结束：'
+                      f'{time.perf_counter() - stage_started:.2f}s', flush=True)
         except (OSError, ValueError, TypeError, ArithmeticError) as error:
             measured['step_residuals'] = {'status': 'ERROR', 'windows': [], 'summary': [],
                                           'trace': {'status': 'ERROR', 'reason': str(error)}}
@@ -1227,6 +1267,8 @@ def analyze_case(case, model, target, base, reference_rows=None):
         measurements.append(measured)
         captures.append({key: capture.get(key) for key in ('rank', 'path', 'sha256', 'device_id', 'duplicate_rows')})
         if not source_errors:
+            print(f'  {rank} 开始逐轮算子/PMU汇总', flush=True)
+            stage_started = time.perf_counter()
             try:
                 starts = [task.start_ns for task in capture['tasks']]
                 time_index = ATimeIndex(capture['tasks'])
@@ -1235,6 +1277,8 @@ def analyze_case(case, model, target, base, reference_rows=None):
                                                   rank=rank) for cycle in measured['rounds']]
             except (ValueError, KeyError, TypeError, ArithmeticError) as error:
                 source_errors.append(str(error))
+            print(f'  {rank} 逐轮算子/PMU汇总结束：{time.perf_counter() - stage_started:.2f}s', flush=True)
+        print(f'  {rank} 分析结束：共{time.perf_counter() - rank_started:.2f}s', flush=True)
     reasons = [message for item in measurements for message in item.get('warnings', [])]
     if not case['_rank_coverage_complete']:
         reasons.append(f'RANK_COVERAGE: captured {len(names)}/{case["expected_ranks"]}; only captured ranks are estimated')
@@ -3412,16 +3456,19 @@ def _lm_operator_pmu_observation(task, start, end, scope):
     # intersect multiple reference intervals, but must not bias its PMU mean.
     identity = tuple(scope.get(field) for field in ("rank",)) + tuple(getattr(task, field, None)
         for field in ("row_index", "start_ns", "end_ns", "stream_id", "task_id"))
-    metrics = {}
-    raw_metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {}
-    for field, value in raw_metrics.items():
-        if field not in _A_PMU_FIELDS or isinstance(value, bool) or not isinstance(value, (int, float)):
-            continue
-        if math.isfinite(value) and value >= 0 and (_A_PMU_FIELDS[field] != "ratio" or value <= 1):
-            metrics[field] = value
-    invalid = [field for field in raw.get("invalid_fields", ()) or () if field in _A_PMU_FIELDS]
-    for field in invalid:
-        metrics.pop(field, None)
+    if isinstance(raw, _ANativePmu):
+        metrics, invalid = raw["metrics"], raw["invalid_fields"]
+    else:
+        metrics = {}
+        raw_metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {}
+        for field, value in raw_metrics.items():
+            if field not in _A_PMU_FIELDS or isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if math.isfinite(value) and value >= 0 and (_A_PMU_FIELDS[field] != "ratio" or value <= 1):
+                metrics[field] = value
+        invalid = [field for field in raw.get("invalid_fields", ()) or () if field in _A_PMU_FIELDS]
+        for field in invalid:
+            metrics.pop(field, None)
     return {"identity": identity, "duration_ns": task.end_ns - task.start_ns,
             "clipped": start != task.start_ns or end != task.end_ns,
             "metrics": metrics, "invalid_fields": invalid,
@@ -4566,6 +4613,245 @@ def build_cli_excel(report, out, expected_method_set):
 
 
 
+class _CaseProgressStream:
+    """Label existing rank progress without changing the analysis API."""
+    def __init__(self, stream, name):
+        self.stream = stream
+        self.prefix = '[case ' + str(name).replace('\n', ' ').replace('\r', ' ') + '] '
+        self.at_line_start = True
+
+    def write(self, message):
+        for part in message.splitlines(keepends=True):
+            if self.at_line_start and part:
+                self.stream.write(self.prefix)
+            self.stream.write(part)
+            self.at_line_start = part.endswith(('\n', '\r'))
+        return len(message)
+
+    def flush(self):
+        self.stream.flush()
+
+
+def _cli_case_cgroups(controller):
+    """Locate the process cgroup and visible ancestors, including remounted hierarchies."""
+    root_path = Path('/sys/fs/cgroup')
+    groups = [(root_path, root_path, True), (root_path / controller, root_path / controller, False)]
+    try:
+        memberships = [line.split(':', 2) for line in Path('/proc/self/cgroup').read_text().splitlines()]
+        for line in Path('/proc/self/mountinfo').read_text().splitlines():
+            left, right = line.split(' - ', 1)
+            fields, mounted = left.split(), right.split()
+            unified = mounted[0] == 'cgroup2'
+            if not unified and not (mounted[0] == 'cgroup' and controller in mounted[2].split(',')):
+                continue
+            decode = lambda value: re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), value)
+            root, mount = Path(decode(fields[3])), Path(decode(fields[4]))
+            for hierarchy, controllers, member in memberships:
+                if (unified and hierarchy == '0' and not controllers) or (not unified and controller in controllers.split(',')):
+                    try:
+                        relative = Path(member).relative_to(root)
+                    except ValueError:
+                        continue
+                    if '..' not in relative.parts:
+                        groups.append((mount / relative, mount, unified))
+    except (OSError, ValueError, IndexError):
+        pass
+    visited, output = set(), []
+    for directory, mount, unified in groups:
+        while (directory, unified) not in visited:
+            visited.add((directory, unified))
+            output.append((directory, unified))
+            if directory == mount or mount not in directory.parents:
+                break
+            directory = directory.parent
+    return output
+
+
+def _cli_case_memory_available():
+    """Best-effort host and current/ancestor cgroup memory headroom."""
+    import os
+    available = []
+    try:
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            if line.startswith('MemAvailable:'):
+                available.append(int(line.split()[1]) * 1024)
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    if not available:
+        try:
+            available.append(os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'))
+        except (AttributeError, OSError, ValueError):
+            pass
+    # On Windows use the standard-library ctypes interface when available.
+    if not available and sys.platform == 'win32':
+        try:
+            import ctypes
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [('length', ctypes.c_ulong), ('load', ctypes.c_ulong)] + [
+                    (name, ctypes.c_ulonglong) for name in ('total_phys', 'avail_phys', 'total_page',
+                    'avail_page', 'total_virtual', 'avail_virtual', 'avail_extended')]
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                available.append(status.avail_phys)
+        except (AttributeError, OSError, ValueError):
+            pass
+    for directory, unified in _cli_case_cgroups('memory'):
+        try:
+            limit_name, usage_name = ('memory.max', 'memory.current') if unified else ('memory.limit_in_bytes', 'memory.usage_in_bytes')
+            limit = int((directory / limit_name).read_text().strip())
+            usage = int((directory / usage_name).read_text().strip())
+            if 0 < limit < 1 << 60 and usage >= 0:
+                available.append(max(0, limit - usage))
+        except (OSError, ValueError):
+            pass
+    return min(available) if available else None
+
+
+def _cli_case_cpu_budget():
+    """Honor affinity and v1/v2 CPU quota, not only the host's reported CPU count."""
+    import os
+    cpu = max(1, os.cpu_count() or 1)
+    try:
+        cpu = min(cpu, max(1, len(os.sched_getaffinity(0))))
+    except (AttributeError, OSError):
+        pass
+    for directory, unified in _cli_case_cgroups('cpu'):
+        try:
+            if unified:
+                quota, period = (directory / 'cpu.max').read_text().split()
+            else:
+                quota = (directory / 'cpu.cfs_quota_us').read_text().strip()
+                period = (directory / 'cpu.cfs_period_us').read_text().strip()
+            quota, period = int(quota), int(period)
+            if quota > 0 and period > 0:
+                cpu = min(cpu, max(1, math.ceil(quota / period)))
+        except (OSError, ValueError):
+            pass
+    return cpu
+
+
+def _cli_case_workers(requested, case_count):
+    """Conservative automatic budget; explicit requests only receive resource warnings."""
+    cpu = _cli_case_cpu_budget()
+    memory = _cli_case_memory_available()
+    low_memory = memory is not None and memory < 4 * 1024 ** 3
+    automatic = min(2, cpu, max(1, case_count))
+    if low_memory:
+        automatic = 1
+    workers = min(requested if requested is not None else automatic, max(1, case_count))
+    memory_label = '未知' if memory is None else f'{memory / 1024 ** 3:.2f} GiB'
+    print(f'执行粒度：case；进程数={workers}；CPU预算={cpu}；可用内存/容器余量={memory_label}；'
+          + ('自动选择' if requested is None else '显式指定'), flush=True)
+    if requested is not None and requested > automatic:
+        print(f'并行提示：当前自动建议上限为{automatic}；按显式请求执行，更多进程会增加内存、磁盘争用。', flush=True)
+    return workers
+
+
+def _cli_case_complete(index, case, model, target, base, reference_rows):
+    """Finalize one case before releasing its potentially large prepared evidence."""
+    from contextlib import redirect_stdout
+    start = time.perf_counter()
+    with redirect_stdout(_CaseProgressStream(sys.stdout, case['name'])):
+        print('开始读取与统计；本case内各rank顺序执行', flush=True)
+        result = analyze_case(case, model, target, base, reference_rows)
+        print(f'测量完成（{time.perf_counter() - start:.2f}s）；开始方法1/方法2估算', flush=True)
+        partial = {'cases': [result], 'communication_reference': {'rows': reference_rows}}
+        attach_layer_mean_report(partial)
+        print(f'统计与估算完成（共{time.perf_counter() - start:.2f}s）', flush=True)
+    return {'index': index, 'result': result, 'contract': partial['contract']}
+
+
+def _cli_case_worker(job, spool_directory):
+    """Only file identity crosses IPC; large finalized results stay on local disk."""
+    import pickle
+    index, case, model, target, base, reference_rows = job
+    try:
+        payload = _cli_case_complete(index, case, model, target, base, reference_rows)
+    except (ValueError, KeyError, OSError, ArithmeticError, TypeError, re.error) as error:
+        payload = {'index': index, 'failure': {'case': str(case['name']), 'error': str(error)}}
+        print('[case ' + str(case['name']) + '] FAILED: ' + str(error), flush=True)
+    destination = Path(spool_directory) / ('case-' + str(index) + '.pickle')
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile('wb', dir=spool_directory, prefix='.case-', delete=False) as stream:
+            temporary = Path(stream.name)
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary.replace(destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return index, str(destination)
+
+
+def _cli_run_case_jobs(jobs, workers):
+    """Run one parallel level, restore input order, isolate failures, and clean spools."""
+    import multiprocessing
+    import pickle
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    output = {}
+    def failed(job, failure):
+        index, case = job[:2]
+        known = isinstance(failure, (ValueError, KeyError, OSError, ArithmeticError, TypeError, re.error))
+        message = str(failure) if known else 'CASE_WORKER_ERROR: ' + type(failure).__name__ + ': ' + str(failure)
+        output[index] = {'index': index, 'failure': {'case': str(case['name']), 'error': message}}
+        print('[case ' + str(case['name']) + '] FAILED: ' + message + '；不自动重跑', flush=True)
+    if workers <= 1 or len(jobs) <= 1:
+        for job in jobs:
+            try:
+                payload = _cli_case_complete(*job)
+            except Exception as error:
+                failed(job, error)
+            else:
+                output[job[0]] = payload
+        return [output[index] for index in sorted(output)]
+    with tempfile.TemporaryDirectory(prefix='ep128-case-results-') as spool_directory:
+        def collect(job, outcome=None, error=None):
+            index, case = job[:2]
+            try:
+                if error is not None:
+                    raise error
+                expected = Path(spool_directory) / ('case-' + str(index) + '.pickle')
+                # Do not load paths supplied by input configuration or arbitrary worker output.
+                if outcome != (index, str(expected)):
+                    raise ValueError('case worker returned an unexpected result file identity')
+                with expected.open('rb') as stream:
+                    payload = pickle.load(stream)
+                expected.unlink()
+                if payload.get('index') != index:
+                    raise ValueError('case result index does not match its submitted job')
+                output[index] = payload
+            except Exception as failure:
+                failed(job, failure)
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context('spawn')) as executor:
+            pending = {}
+            for job in jobs:
+                try:
+                    pending[executor.submit(_cli_case_worker, job, spool_directory)] = job
+                except Exception as error:
+                    collect(job, error=error)
+            for future in as_completed(pending):
+                job = pending[future]
+                try:
+                    outcome = future.result()
+                except Exception as error:
+                    collect(job, error=error)
+                else:
+                    collect(job, outcome=outcome)
+    return [output[index] for index in sorted(output)]
+
+
+def _cli_positive_workers(value):
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('--workers需要正整数') from error
+    if number <= 0:
+        raise argparse.ArgumentTypeError('--workers需要正整数')
+    return number
+
+
 def main():
     parser = argparse.ArgumentParser(description='按HC层均值外推目标周期与单卡吞吐；标准库离线统计')
     parser.add_argument('cases', nargs='?', type=Path, help='原采样cases配置')
@@ -4575,6 +4861,8 @@ def main():
     parser.add_argument('--comm-reference', type=Path, help='原通信参考表')
     parser.add_argument('--list-inputs', action='store_true', help='只核对输入文件，不读取CSV')
     parser.add_argument('--inventory', type=Path, help='查看少量CSV的字段和设备任务数量')
+    parser.add_argument('--workers', type=_cli_positive_workers, default=None,
+                        help='按case并行的进程数；默认最多2，低内存自动用1；--workers 1串行')
     args = parser.parse_args()
     print('统计脚本：' + str(Path(__file__).resolve()) + '（' + PROFILE_VERSION + '）', flush=True)
     if args.inventory:
@@ -4626,8 +4914,8 @@ def main():
               'contract': {'source_depth': '8 main + 3 draft', 'timestamps': 'integer ns', 'timings': 'ms',
                            'throughput': 'new output token/s/physical card',
                            'projection': 'exclude main0 reference; per-rank per-round attention means, rank means then maximum'}}
-    seen = set()
-    for item in config['cases']:
+    seen, jobs, failed = set(), [], {}
+    for index, item in enumerate(config['cases']):
         name = item.get('name', 'unnamed') if isinstance(item, dict) else 'invalid'
         print('统计 ' + str(name), flush=True)
         try:
@@ -4640,11 +4928,21 @@ def main():
             case['_step_residual_dir'] = str((args.out / 'step_residual_details' / (slug + '-' + suffix)).resolve())
             case_target = referenced_object(case['target_model'], base, 'case.target_model') if case.get('target_model') is not None else target
             validate_models(model, case_target)
-            report['cases'].append(analyze_case(case, model, case_target, base, reference_rows))
+            jobs.append((index, case, model, case_target, base, reference_rows))
         except (ValueError, KeyError, OSError, ArithmeticError, TypeError, re.error) as error:
-            report['failures'].append({'case': str(name), 'error': str(error)})
+            failed[index] = {'case': str(name), 'error': str(error)}
             print('  FAILED: ' + str(error), flush=True)
-    attach_layer_mean_report(report)
+    workers = _cli_case_workers(args.workers, len(jobs))
+    for payload in _cli_run_case_jobs(jobs, workers):
+        if 'failure' in payload:
+            failed[payload['index']] = payload['failure']
+        else:
+            report['cases'].append(payload['result'])
+            report['contract'].update(payload['contract'])
+    report['failures'] = [failed[index] for index in sorted(failed)]
+    if not report['cases']:
+        # Keep the contract identical even when no case reached finalization.
+        attach_layer_mean_report(report)
     for result in report['cases']:
         print_case_result(result)
     export_report(report, args.out, reference_rows, progress=lambda message: print(message, flush=True))
