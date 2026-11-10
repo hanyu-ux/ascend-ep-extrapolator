@@ -7,15 +7,15 @@
   },
   "components": {
     "profile_ep128.py": {
-      "version": "20261108.1.operator_drilldown",
-      "sha256": "34c14fe377b4b8045dd77ef2b033640515d09ce1eda000d1e48fa7140760a92b",
+      "version": "20261110.1.u_focus_step_pmu",
+      "sha256": "113853c1f1e4fac69fd4799648e2d7ef2a1df8b4df02e66e588d720b890bdb17",
       "imported_version": "20261103.12.native_stages",
       "imported_sha256": "035f0c6312354ca0937361f1ab301452ed61c68239845b2c0c76f08653f9d7f7",
       "matches_imported_source": false
     },
     "build_ep128_leadership_excel.py": {
-      "version": "20261108.2.full_operator_labels",
-      "sha256": "efdb0a1ba6d9d83a90fb33937b36e64abe3886afec9dab47d1e92242a9212c61",
+      "version": "20261110.1.u_focus_step_pmu",
+      "sha256": "bab5227133d55b44a8a953d94d184cf3d4d8826f4551ca8cc1dabd5b78ed36b5",
       "imported_version": "20261104.2.bs_inventory",
       "imported_sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
       "matches_imported_source": false
@@ -63,11 +63,12 @@
     "Independent cases can mix speculative-token counts and synthetic output lengths under an explicit mean accepted-draft fraction. Normalize num_speculative_tokens as the draft_tokens alias per configuration layer; case output policies override inherited fixed lengths and declared rates must agree with Neff=1+S*r. The template uses 60% instead of fixed Neff5.2. CSV, Excel and HTML display per-case parameters; existing timing formulas and BS grouping are unchanged.",
     "Each case can supply only num_speculative_tokens and synthetic_acceptance_length; synthetic_acception_length is a compatible alias. Explicit case SAL replaces inherited fixed lengths and, when no case rate is declared, clears inherited rate policy. Same-case contradictory declarations remain errors and SAL stays within [1,S+1]. The template no longer requires acceptance rates; all-no-rate Excel/HTML reports hide the unused rate column. Legacy explicit Neff/rate configurations and timing formulas remain supported.",
     "Final selected-rank CSA/HCA/SWA stages add optional operator drill-downs. Integer-nanosecond, all-stream clipped sweeps retain named parallel multiplicities and no-record gaps; source means use the parent reference layers and retained rounds, including zero for proven absent fingerprints. Native names, shapes, dtypes, streams and original row examples remain traceable. Existing Dispatch/Combine/GMM deltas are separate signed model entries; original cycle, TPOT, throughput, rank selection and ten-stage/U accounting are unchanged. Method1/2 sheets and HTML show closed Top-N coverage/model ledgers and separate nonadditive source-kernel hotspots, with readable labels, explicit aggregate remainders and old-report fallback. Only final selected-rank groups export operator detail, with source aggregation cached across methods; no private capture or detailed analysis is included.",
-    "Operator labels in both method sheets and HTML retain complete parent-stage and operator type names, input shapes and streams with explicit wrapping. Full native names, output shapes and dtypes stay visible in source columns. Table and chart heights follow text length; continuation rows preserve long evidence and charts retain their original values. This renderer-only update can redraw existing operator-bearing JSON without resampling or changing core estimates, rankings or Top-N limits."
+    "Operator labels in both method sheets and HTML retain complete parent-stage and operator type names, input shapes and streams with explicit wrapping. Full native names, output shapes and dtypes stay visible in source columns. Table and chart heights follow text length; continuation rows preserve long evidence and charts retain their original values. This renderer-only update can redraw existing operator-bearing JSON without resampling or changing core estimates, rankings or Top-N limits.",
+    "Method1/2 sheets add fine main_inputs/main_metadata device-interval ledgers, pinned static function-entry references and one fixed selected-rank HC-round line chart with missing values preserved. New CSV exports retain every captured rank and original HC identity. Source Top8 kernels add whole-call Duration-weighted optional PMU counters, per-metric coverage and conservative AIC/AIV/MIX bound evidence without changing old timings, rankings, parent boundaries or extrapolation. Unknown counters remain unknown; non-ratio percent units and incomplete active-core time evidence cannot produce false bound diagnoses. Standard-library runtime and legacy JSON rendering remain supported; all private captures and generated reports remain local."
   ],
   "validation": {
-    "discovered_tests": 326,
-    "passed": 316,
+    "discovered_tests": 356,
+    "passed": 346,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,
@@ -97,5 +98,5 @@
       "added_at": "2026-11-05"
     }
   },
-  "updated_at": "2026-11-08"
+  "updated_at": "2026-11-10"
 }

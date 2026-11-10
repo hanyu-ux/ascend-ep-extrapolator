@@ -205,6 +205,40 @@ python build_ep128_leadership_excel.py --report ep128_report/model_architecture_
 
 **U 子阶段只展开父阶段，所有子段含在原来的 U 中。** 不能把父段和子段重复相加，不能将 U 中的工作移入层区间后宣称周期已经缩短。
 
+### 下一主准备阶段的细项与逐 step 变化
+
+方法1和方法2在原 U 15父阶段表图之后，追加 `main_inputs`、`main_metadata` 的细项、函数对应和逐 step 变化，保留原有15父阶段、level=1子阶段及估算公式。`measurements[].step_residuals.focus_diagnostics` 保存各 rank 的新增证据。
+
+- 细项采用原始整数纳秒区间，在父段内合并所有可见 stream 的时间边界，分为单算子覆盖、具名并发组合、无设备记录间隙。各项互斥且覆盖父段，完整证据缺失时不编造函数归属。
+- 函数表给出设备入口、对应 Python 包装入口、相对源码路径、版本依据和原始 CSV 行号。它表示静态源码对应，不表示 trace 已测得该 Python 函数的入口到返回耗时。间隙没有足够来源证据时保留未知，不归成某个 CPU 函数。
+- 逐 step 图沿用每种方法按完整周期均值选出的 rank；同一张图中两段、所有点都属于这个 rank。分类保留原始 HC `round_id`，另列保留序号；不是 `ProfilerStep` 或墙钟采样序号。
+- 表中均值、P50、P90、最大值及匹配数量说明波动。缺失 step 留空并标原因，折线断开；不能用0代替，也不借用别的 rank 或前后 step。
+- 细分表的分母是对应父段，细项相加等于父段；不得再把细项加到 U、完整周期、TPOT 或吞吐中。
+
+`step_residual_focus_steps.csv` 导出所有已采集 rank 的父段逐步数据；`step_residual_focus_summary.csv` 导出细项均值和函数证据。每 rank 的关注区间明细 CSV 保留精确起止和源任务行。旧报告没有该结构时显示“未采集”，需要重新处理原 CSV；不要求为了软件更新重新采样。
+
+### Top8 热点的 PMU 与 bound
+
+每类层的源实测 Top8 热点保持原排序，在两方法页追加对应的 PMU 表、方向判断和高级指标详情。PMU 仅描述源采样中的完整原生 kernel 调用，不是目标 10T 估算的硬件指标。
+
+| 字段 | 含义 |
+| --- | --- |
+| `aic_mac_ratio` | AIC 矩阵乘加流水活跃周期占比 |
+| `aiv_vec_ratio` | AIV 向量流水活跃周期占比 |
+| `aic/aiv_scalar_ratio` | 对应核的标量、地址和控制处理流水活跃占比 |
+| `aic/aiv_mte2_ratio` | 从外部存储层级读入数据的搬运流水活跃占比 |
+| `aic/aiv_mte3_ratio` | 向外部存储层级写出数据的搬运流水活跃占比 |
+| `aic_mte1_ratio` / `aic_fixpipe_ratio` | 片内输入搬运和结果搬运流水活跃占比 |
+| `aicore_time` / `aiv_time` | PMU 按分核周期推导的核内时间，不能与任务 Duration 的差值直接等同等待 |
+| `Block Num` / `Mix Block Num` | 算子启动分核配置，不是实测吞吐利用率 |
+| `icache_miss_rate` / `cube_utilization` | 指令缓存未命中和导出的 Cube 指标；后者不等同 FLOPs/硬件峰值定义的 MFU |
+
+汇总使用每次原生调用的完整 Duration 加权，保留逐指标已知样本数、总样本数和已知 Duration 覆盖率。未知、非法、冲突或未导出值不补0；观测到的0继续保留。一个原生调用与多个阶段相交时，引用的是同次完整 PMU，不能当作各阶段独立采集或把这些指标相加。
+
+流水可以同时工作，因此比例不能堆叠成100%或相加为总时间。MIX 算子联合考虑 AIC/AIV，两侧比例分母不同；向量算子的 AIC 零值不能判作低效。高计算占用、高搬运占用、标量突出、通信/同步复合任务、短任务以及核内时间与任务跨度差异分别处理。表中给出的 bound 是保守方向和置信度，不证明带宽饱和、因果关键路径或优化收益。确证需要真实有效行数、硬件精度/频率、实际访存和依赖信息。
+
+输入 CSV 中已有 PMU 列即可使用；字段缺失时继续生成其他结果并明确提示。只有补采硬件 PMU 才能获得原采样未记录的指标，不能靠重绘补齐。
+
 ### CSA、HCA、SWA 10 段与同 rank 对照
 
 报告 JSON 的 `measurements[].layer_diagnostics` 保存 CSA、HCA、SWA 的源层内阶段诊断；`layer_stage_summary.csv` 给出每 case、每 rank、每层的汇总，`*-layer-stages.csv` 保留逐轮 stage 边界与状态，位于 `step_residual_details/` 相应 case/rank 的证据目录。原有 `swa_stage_summary.csv`、`*-swa-stages.csv` 和 SWA 诊断字段继续保留兼容。源诊断读取旧 JSON 时，若只有 SWA 证据，就只展示可用的 SWA，主模型 CSA/HCA 保持不可用；方法页的目标阶段图另需新版核心提供 `target_stage_breakdowns`，不从这些源诊断反推。

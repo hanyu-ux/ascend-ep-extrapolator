@@ -489,7 +489,7 @@ class LayerMeanRendererTests(unittest.TestCase):
             self.assertEqual(preview.count('<p>' + line + '</p>'), 3)
         self.assertNotIn('Neff=6.399999', preview)
         self.assertIn('非实测', table)
-        self.assertTrue(renderer.RENDERER_VERSION.startswith('20261108.'))
+        self.assertTrue(renderer.RENDERER_VERSION.startswith('20261110.'))
 
     def test_operator_preview_closes_signed_models_and_keeps_largest_remaining_gap(self):
         report = operator_drilldown_report()

@@ -19,7 +19,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261108.2.full_operator_labels"
+RENDERER_VERSION = "20261110.1.u_focus_step_pmu"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -753,6 +753,7 @@ def _layer_mean_method_section(sheet, row, case, case_index, identity, method):
         row = _note(sheet, row, "；".join(method["reasons"]), warning=True, columns=12)
     row = _layer_mean_chart(sheet, row, method)
     row = _method_residual_section(sheet, row, case, method)
+    row = _method_focus_section(sheet, row, case, method)
     row = _method_stage_expansions(sheet, row, case, method)
     row = _table(sheet, row, ["采样rank", "周期均值(ms)", "主模型目标链(ms)", "草稿目标链(ms)", "轮次剩余区间(ms)", "核心选中"],
         [[item.get("rank"), _layer_mean_value(method, item.get("cycle_ms"), True),
@@ -1144,6 +1145,77 @@ OPERATOR_SCOPE = ("关键路径及优化收益尚未验证。目标互斥区间�
                   "具名并行组合不分摊给成员，无记录区间不等于CPU瓶颈。源kernel累计可重叠，不能当目标关键耗时或优化收益；"
                   "调用按段内相交记录统计，跨阶段不可机械累加调用数。完整指纹、成员及样例见核心JSON。")
 OPERATOR_KINDS = {"operator": "单算子覆盖", "parallel": "具名并行组合", "gap": "无设备记录区间", "model_delta": "模型增减（非原生执行）"}
+PMU_SCOPE = ("以下顺序与上方源实测Top8一一对应；PMU按原生整次调用Duration加权，保持源实测，不乘目标层数或外推倍率。"
+             "各流水可以同时工作，活动比不可相加为100%，也不是MFU或理论峰值利用率。"
+             "bound为流水活动证据支持的方向判断，不直接证明HBM带宽跑满、关键路径或优化收益。"
+             "若调用跨父阶段，PMU仍属于整次调用；同一调用在不同阶段引用不能相加。")
+PMU_METRICS = (("aic_mac_ratio", "AIC MAC\n矩阵计算"),
+               ("aic_mte2_ratio", "AIC MTE2\n读入搬运"), ("aic_mte3_ratio", "AIC MTE3\n写出搬运"),
+               ("aiv_vec_ratio", "AIV VEC\n向量计算"),
+               ("aiv_mte2_ratio", "AIV MTE2\n读入搬运"), ("aiv_mte3_ratio", "AIV MTE3\n写出搬运"))
+PMU_HEADERS = ["源热点编号 / 算子", *[label for _, label in PMU_METRICS], "Scalar\nAIC / AIV", "PMU证据覆盖", "bound方向 / 置信度"]
+PMU_SPANS = ((1, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 10), (11, 11), (12, 12))
+PMU_DETAIL_HEADERS = ["源热点编号 / 算子", "完整指纹与高级指标", "bound依据 / 限制"]
+PMU_DETAIL_SPANS = ((1, 3), (4, 8), (9, 12))
+
+
+def _pmu_metric_value(pmu, key):
+    item = (pmu.get("metrics") or {}).get(key)
+    return item["value"] if isinstance(item, dict) and _number(item.get("value")) else None
+
+
+def _pmu_metric_text(item):
+    if not isinstance(item, dict) or not _number(item.get("value")):
+        return "未采集"
+    value = format(item["value"], ".1%") if item.get("unit") == "ratio" else format(item["value"], ".6g") + " " + _text(item.get("unit") or "")
+    coverage = item.get("duration_coverage")
+    if _number(coverage) and coverage < 1 - 1e-9:
+        value += "\n覆盖" + format(coverage, ".1%")
+    return value
+
+
+def _pmu_label(kernel, number):
+    # Keep names complete without repeating a long shape in every PMU column.
+    return "K" + str(number) + " · " + _text(kernel.get("op_type") or kernel.get("name")) + "\n父阶段：" + _text(kernel.get("stage_label")) + "\nstream=" + _text(kernel.get("stream_id"))
+
+
+def _operator_pmu_data(kernels):
+    rows, details = [], []
+    for number, kernel in enumerate(kernels, 1):
+        pmu = kernel.get("pmu") or {}
+        metrics, coverage, bound = pmu.get("metrics") or {}, pmu.get("coverage") or {}, pmu.get("bound") or {}
+        coverage_text = (format(coverage["duration_coverage"], ".1%") + "原调用时长\n"
+            + _text(coverage.get("known_calls")) + "/" + _text(coverage.get("total_calls")) + "调用"
+            if _number(coverage.get("duration_coverage")) else "未采集")
+        if coverage.get("clipped_calls"):
+            coverage_text += "\n跨段引用=" + _text(coverage["clipped_calls"])
+        conclusion = _text(bound.get("label") or "证据不足") + "\n置信度：" + _text(bound.get("confidence") or "未提供")
+        label = _pmu_label(kernel, number)
+        rows.append([label, *[_pmu_metric_text(metrics.get(key)) for key, _ in PMU_METRICS],
+            _pmu_metric_text(metrics.get("aic_scalar_ratio")) + " / " + _pmu_metric_text(metrics.get("aiv_scalar_ratio")),
+            coverage_text, conclusion])
+        metric_details = []
+        for key, item in metrics.items():
+            if not isinstance(item, dict):
+                continue
+            metric_details.append(key + "=" + _pmu_metric_text(item).replace("\n", "；")
+                + "；调用=" + _text(item.get("known_calls")) + "/" + _text(item.get("total_calls")))
+        evidence = bound.get("evidence") or []
+        details.append([label, _operator_fingerprint_text(kernel) + "\n\n" + ("\n".join(metric_details) or "PMU未采集，请用新版脚本重新统计；不会以0替代。"),
+            conclusion + "\n" + "\n".join(_text(item) for item in evidence)
+            + "\n" + _text(pmu.get("scope_note") or "没有可用PMU证据，不推断bound。")])
+    return rows, details
+
+
+def _operator_pmu_section(sheet, row, attention, kernels, method):
+    row = _note(sheet, row, attention + "源实测Top8 · 流水活动与bound诊断")
+    row = _note(sheet, row, PMU_SCOPE)
+    records, details = _operator_pmu_data(kernels)
+    if not kernels or not any((kernel.get("pmu") or {}).get("metrics") for kernel in kernels):
+        row = _note(sheet, row, "PMU未采集，请重新统计；上方原热点排序与耗时保留，未知指标不补0。", warning=True)
+    row, _, _ = _operator_table(sheet, row, PMU_HEADERS, records, PMU_SPANS)
+    row, _, _ = _operator_table(sheet, row, PMU_DETAIL_HEADERS, details, PMU_DETAIL_SPANS)
+    return row
 
 
 def _operator_example_text(example):
@@ -1346,7 +1418,7 @@ def _method_operator_data(method, role, attention, limit=12, kernel_limit=8):
     return result
 
 
-def _operator_table(sheet, row, headers, records, spans, percent=False):
+def _operator_table(sheet, row, headers, records, spans, percent=False, *, percent_columns=()):
     header, written, expanded = row, [], []
     widths = [max(8, int(sum(WIDTHS[first - 1:last]) - 4)) for first, last in spans]
     for number, record in enumerate(records, 1):
@@ -1371,8 +1443,9 @@ def _operator_table(sheet, row, headers, records, spans, percent=False):
         lines = max((len(_operator_svg_label_lines(value, width=widths[index]))
                      for index, value in enumerate(record) if isinstance(value, str)), default=1)
         sheet.row_height(actual, min(409, max(42, 14 * lines + 12)))
-        if percent and _number(record[4]):
-            sheet.write(actual, 10, record[4], "percent")
+        for column in ((4,) if percent else percent_columns):
+            if _number(record[column]):
+                sheet.write(actual, spans[column][0], record[column], "percent")
     return row, header, written if len(expanded) == len(records) else []
 
 
@@ -1420,9 +1493,10 @@ def _method_operator_section(sheet, row, method, role, attention):
         "ms/目标同类全部层；含有符号模型修正，非优化收益")
     row = _note(sheet, row, attention + "源实测算子热点；相交调用/单层均值，段内单次均值/P90；不加到互斥账本")
     row, header, written = _operator_table(sheet, row, OPERATOR_KERNEL_HEADERS, data["kernel_rows"], OPERATOR_KERNEL_SPANS)
-    return _operator_bar(sheet, row, attention + "源实测算子热点 · " + _layer_mean_name(method),
+    row = _operator_bar(sheet, row, attention + "源实测算子热点 · " + _layer_mean_name(method),
         OPERATOR_KERNEL_HEADERS, data["kernel_rows"], OPERATOR_KERNEL_SPANS, header, written, (2,),
         "源段内kernel累计(ms/参考单层均值)；可重叠，不是目标贡献")
+    return _operator_pmu_section(sheet, row, attention, data["kernel_items"], method)
 
 
 def _write_method_expansion(sheet, row, group, method):
@@ -1467,6 +1541,189 @@ def _method_stage_expansions(sheet, row, case, method):
             row = _method_operator_section(sheet, row, method, role, attention)
     sheet.write(index_row, 1, "CSA/HCA/SWA算子下钻位置：" + "；".join(positions), "note")
     return row
+
+
+FOCUS_KEYS = (("main_inputs", "下一主模型KV与输入准备"), ("main_metadata", "下一主metadata及输入映射准备"))
+FOCUS_SCOPE = ("保持一个固定rank，逐项使用原保留HC轮次，不逐轮挑最大rank、不拼接rank。"
+               "横轴是原HC轮次ID，不是已验证的业务请求step或ProfilerStep；缺失/未识别轮次留空断线。"
+               "设备细项按任务起止切成互斥区间，并行任务保留组合、无设备记录区间独立列出；这些细项已含在父段和完整周期内，不额外相加。"
+               "源码函数入口是静态对照，不是CPU函数实测时间；没有Host调用关联时不能把间隙归因给某个Python函数。")
+FOCUS_PARENT_HEADERS = ["父阶段（已含于U）", "均值(ms)", "P50(ms)", "P90(ms)", "最大(ms)", "观测 / 保留轮次", "状态"]
+FOCUS_PARENT_SPANS = ((1, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 10), (11, 12))
+FOCUS_STEP_HEADERS = ["保留序号", "原HC轮次ID", "KV与输入(ms)", "metadata(ms)", "KV设备记录(ms)", "KV无记录(ms)",
+                      "metadata设备记录(ms)", "metadata无记录(ms)", "状态 / 原始边界"]
+FOCUS_STEP_SPANS = ((1, 1), (2, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 12))
+FOCUS_COMPONENT_HEADERS = ["细项（已含）", "均值(ms)", "P50(ms)", "P90(ms)", "最大(ms)", "占父段", "出现轮次", "类型 / 映射状态"]
+FOCUS_COMPONENT_SPANS = ((1, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 12))
+FOCUS_FUNCTION_HEADERS = ["细项（与上表对应）", "设备算子 / 完整形状 / 原行", "对应源码入口（静态对照）", "映射证据 / 范围"]
+FOCUS_FUNCTION_SPANS = ((1, 3), (4, 6), (7, 10), (11, 12))
+FOCUS_KINDS = {"single_operator": "单算子覆盖", "concurrent_operators": "并行算子组合", "no_device_record": "无设备记录区间"}
+
+
+def _focus_function_text(mapping):
+    if not isinstance(mapping, dict):
+        return "未能对应源码入口"
+    path = _text(mapping.get("path") or "未提供路径")
+    if mapping.get("line") is not None:
+        path += ":" + _text(mapping["line"])
+    text = _text(mapping.get("function") or "未知函数") + "\n" + path
+    if mapping.get("version_basis"):
+        text += "\n源码基准：" + _text(mapping["version_basis"])
+    if mapping.get("call_chain"):
+        text += "\n调用链：" + " → ".join(_text(value) for value in mapping["call_chain"])
+    return text
+
+
+def _focus_component_label(item, index):
+    return "C" + str(index).zfill(2) + " · " + _text(item.get("label") or item.get("component_key"))
+
+
+def _method_focus_data(case, method):
+    """Display a single core-selected rank; never turn missing observations into zeros."""
+    selected = method.get("focus_selected_rank", method.get("selected_rank"))
+    result = dict(rank=selected, available=False, note="", stages=[], parent_rows=[], step_rows=[], series=[], categories=[])
+    captures = [item for item in case.get("measurements") or [] if item.get("rank") == selected]
+    if selected is None or len(captures) != 1:
+        result["note"] = "所选rank缺少唯一采样；逐step与额外下钻未采集，请重新统计。"
+        return result
+    residual = captures[0].get("step_residuals") or {}
+    focus = residual.get("focus_diagnostics")
+    if not isinstance(focus, dict):
+        result["note"] = "逐step与额外下钻未采集，请用新版脚本重新统计；原两父阶段耗时与原展开保留，未知值不补0。"
+        return result
+    if focus.get("rank") != selected or residual.get("rank", selected) != selected:
+        result["note"] = "focus_diagnostics的rank与所选rank不一致，停止绘制本区，避免跨rank拼接。"
+        return result
+    groups = focus.get("stages")
+    if not isinstance(groups, list):
+        result["note"] = "focus_diagnostics未提供阶段列表，请重新统计。"
+        return result
+    operators, step_order, per_stage_steps = focus.get("operators") or {}, {}, {}
+    for key, fallback in FOCUS_KEYS:
+        found = [item for item in groups if isinstance(item, dict) and item.get("stage_key") == key]
+        if len(found) != 1:
+            result["note"] = "focus_diagnostics缺少唯一的" + fallback + "；停止绘制本区。"
+            return result
+        source, components, functions = found[0], [], []
+        summaries = source.get("summary") or []
+        component_values = [item.get("duration_ms_mean") for item in summaries]
+        valid = (_number(source.get("duration_ms_mean")) and source["duration_ms_mean"] >= 0
+            and all(_number(value) and value >= 0 for value in component_values)
+            and (bool(summaries) or source["duration_ms_mean"] == 0)
+            and math.isclose(math.fsum(component_values), source["duration_ms_mean"], rel_tol=1e-9, abs_tol=1e-8))
+        for index, item in enumerate(summaries, 1):
+            label = _focus_component_label(item, index)
+            kind = FOCUS_KINDS.get(item.get("kind"), _text(item.get("kind") or "未分类"))
+            components.append([label, *[item.get(field) if _number(item.get(field)) else None for field in
+                ("duration_ms_mean", "duration_ms_p50", "duration_ms_p90", "duration_ms_max")],
+                item.get("share_of_parent") if _number(item.get("share_of_parent")) else None,
+                item.get("observed_steps"), kind + "\n" + _text(item.get("mapping_status") or "unknown")])
+            details, mappings, basis = [], [], []
+            for mapping in item.get("source_function_mapping") or []:
+                mappings.append(_focus_function_text(mapping))
+                if isinstance(mapping, dict) and mapping.get("evidence"):
+                    basis.append(_text(mapping["evidence"]))
+            for operator_id in item.get("operator_ids") or []:
+                operator = operators.get(operator_id) or {}
+                details.append(_text(operator.get("op_type") or operator.get("name") or operator_id)
+                    + "\nnative=" + _text(operator.get("name")) + "；stream=" + _text(operator.get("stream_id"))
+                    + "\nin=" + _text(operator.get("input_shapes")) + "\nout=" + _text(operator.get("output_shapes"))
+                    + "\n原行示例=" + _text(operator.get("example_row_indices")))
+                for mapping in operator.get("source_function_mapping") or []:
+                    mappings.append(_focus_function_text(mapping))
+                    if isinstance(mapping, dict) and mapping.get("evidence"):
+                        basis.append(_text(mapping["evidence"]))
+            if item.get("kind") == "no_device_record":
+                for field, boundary in (("previous_operator_ids", "前界任务"), ("following_operator_ids", "后界任务")):
+                    for operator_id in item.get(field) or []:
+                        operator = operators.get(operator_id) or {}
+                        details.append(boundary + "（仅用于定位间隙）=" + _text(operator.get("op_type") or operator.get("name") or operator_id)
+                            + "\nstream=" + _text(operator.get("stream_id")) + "；in=" + _text(operator.get("input_shapes"))
+                            + "\n原行示例=" + _text(operator.get("example_row_indices")))
+            functions.append([label, "\n\n".join(details) or "没有同时段设备记录；不能据此判断CPU在执行哪个函数。",
+                "\n\n".join(dict.fromkeys(mappings)) or "未知；没有可确认的函数入口，不补造归因。",
+                "静态对照\n" + _text(item.get("mapping_status") or "unknown") + "\n" + "\n".join(dict.fromkeys(basis))])
+        label = source.get("label") or fallback
+        result["parent_rows"].append([label, *[source.get(field) if _number(source.get(field)) else None for field in
+            ("duration_ms_mean", "duration_ms_p50", "duration_ms_p90", "duration_ms_max")],
+            _text(source.get("observed_steps")) + "/" + _text(source.get("rounds")), source.get("status") or "未提供"])
+        result["stages"].append(dict(key=key, label=label, rows=components, functions=functions,
+            closed=valid, note="细项均值之和闭合父段；出现轮次不足时，未出现的该细项在已识别父段中计0。" if valid else
+            "细项未与父段均值闭合或数值缺失，保留原表并停止该细项柱状图；不补0。"))
+        steps = {}
+        for step in source.get("per_step") or []:
+            identity = (step.get("step_index"), _text(step.get("round_id")))
+            if identity in steps:
+                result["note"] = label + "出现重复的原轮次标识，停止绘制逐step，避免重复计时。"
+                return result
+            steps[identity] = step
+            step_order.setdefault(identity, len(step_order))
+        per_stage_steps[key] = steps
+    identities = sorted(step_order, key=lambda item: (item[0] if type(item[0]) is int else step_order[item], step_order[item]))
+    for identity in identities:
+        pair = [per_stage_steps[key].get(identity) or {} for key, _ in FOCUS_KEYS]
+        def value(step, field):
+            item = step.get(field)
+            return item if step.get("status") == "MATCHED" and _number(item) and item >= 0 else None
+        states = []
+        for (key, label), step in zip(FOCUS_KEYS, pair):
+            states.append(label + "：" + _text(step.get("status") or "缺失")
+                + ("\n原因：" + _text(step["reason"]) if step.get("reason") else "")
+                + ("\n边界ns=" + _text(step.get("start_ns")) + " → " + _text(step.get("end_ns")) if step else ""))
+        result["step_rows"].append([identity[0], identity[1], *[value(step, "duration_ms") for step in pair],
+            value(pair[0], "recorded_busy_ms"), value(pair[0], "no_recorded_ms"),
+            value(pair[1], "recorded_busy_ms"), value(pair[1], "no_recorded_ms"), "\n".join(states)])
+    result.update(available=True, categories=[row[1] for row in result["step_rows"]],
+        series=[(label, [row[2 + index] for row in result["step_rows"]], color)
+            for index, ((_, label), color) in enumerate(zip(FOCUS_KEYS, ("168B8D", "D4793A")))],
+        note="rank=" + _text(selected) + "；" + _text(focus.get("scope") or "本方法selected_rank（最大完整周期均值rank）")
+            + "；完整细分区间=" + _text(focus.get("segments_csv")) + "；逐轮CSV=" + _text(focus.get("steps_csv")))
+    return result
+
+
+def _method_focus_section(sheet, row, case, method):
+    data = _method_focus_data(case, method)
+    row = _note(sheet, row, "两项U重点诊断 · 固定rank逐轮变化与函数入口对照")
+    row = _note(sheet, row, data["note"], warning=not data["available"])
+    if not data["available"]:
+        return row
+    row = _note(sheet, row, FOCUS_SCOPE)
+    row, header, written = _operator_table(sheet, row, FOCUS_PARENT_HEADERS, data["parent_rows"], FOCUS_PARENT_SPANS)
+    if all(_number(record[1]) and record[1] >= 0 for record in data["parent_rows"]):
+        row = _operator_bar(sheet, row, "两项U父阶段均值 · rank=" + _text(data["rank"]),
+            FOCUS_PARENT_HEADERS, data["parent_rows"], FOCUS_PARENT_SPANS, header, written, (1,),
+            "源实测ms/HC轮次；已含于U，不额外相加")
+    row = _note(sheet, row, "同一rank不同原HC轮次的阶段耗时；P50/P90/最大为核心原值，缺失轮次不画0")
+    # Reserve the overview before the potentially long per-round table. Range
+    # references are bound after the table has its final physical row numbers.
+    line_row = row
+    if data["step_rows"]:
+        row += 24
+    row, _, written = _operator_table(sheet, row, FOCUS_STEP_HEADERS, data["step_rows"], FOCUS_STEP_SPANS)
+    if written and len(written) == len(data["step_rows"]):
+        reference = "'" + sheet.name.replace("'", "''") + "'!"
+        series = [dict(name=label, values=values, color=color,
+            values_ref=reference + cell_reference(written[0], 4 + index, True) + ":" + cell_reference(written[-1], 4 + index, True))
+            for index, (label, values, color) in enumerate(data["series"])]
+        sheet.add_line_chart("两项U逐轮耗时变化 · 固定rank=" + _text(data["rank"]),
+            categories=data["categories"], series=series, anchor=(line_row, 1, line_row + 22, 12),
+            categories_ref=reference + cell_reference(written[0], 2, True) + ":" + cell_reference(written[-1], 2, True),
+            x_axis_title="原HC轮次ID（等距；非ProfilerStep）", y_axis_title="源实测阶段跨度(ms)")
+    elif data["step_rows"]:
+        row = _note(sheet, row, "逐轮表出现长文本续行，保留完整明细，折线未绘制。", warning=True)
+    else:
+        row = _note(sheet, row, "逐step未采集，请重新统计；均值细分不代替逐轮数据。", warning=True)
+    for stage in data["stages"]:
+        row = _note(sheet, row, stage["label"] + " · 设备互斥细项（源实测）")
+        row = _note(sheet, row, stage["note"], warning=not stage["closed"])
+        row, header, written = _operator_table(sheet, row, FOCUS_COMPONENT_HEADERS, stage["rows"], FOCUS_COMPONENT_SPANS,
+            percent_columns=(5,))
+        if stage["closed"] and stage["rows"]:
+            row = _operator_bar(sheet, row, stage["label"] + " · 互斥细项均值 · rank=" + _text(data["rank"]),
+                FOCUS_COMPONENT_HEADERS, stage["rows"], FOCUS_COMPONENT_SPANS, header, written, (1,), "源实测ms/HC轮次；细项之和等于父段")
+        row = _note(sheet, row, stage["label"] + " · 算子定位与源码函数入口（静态对照，不是函数实测耗时）")
+        row, _, _ = _operator_table(sheet, row, FOCUS_FUNCTION_HEADERS, stage["functions"], FOCUS_FUNCTION_SPANS)
+    return row + 1
 
 
 def _residual_stage_rows(stages, window_summary=None):
@@ -1791,6 +2048,41 @@ def _method_residual_html(case, method):
     return ''.join(parts)
 
 
+def _method_focus_html(case, method):
+    esc = lambda value: html.escape(_text(value), quote=True)
+    data = _method_focus_data(case, method)
+    parts = ['<section class="u-focus"><h4>两项U重点诊断 · 固定rank逐轮变化与函数入口对照</h4><p>'
+             + esc(data["note"]) + '</p>']
+    if not data["available"]:
+        return ''.join(parts) + '</section>'
+    parts.append('<p>' + esc(FOCUS_SCOPE) + '</p>' + _html_table(FOCUS_PARENT_HEADERS, data["parent_rows"]))
+    if all(_number(record[1]) and record[1] >= 0 for record in data["parent_rows"]):
+        parts.append(_operator_svg('两项U父阶段均值 · rank=' + _text(data["rank"]),
+            [record[0] for record in data["parent_rows"]],
+            [('源实测均值', [record[1] for record in data["parent_rows"]], '168B8D')], 'ms/HC轮次；已含于U'))
+    if data["step_rows"]:
+        parts.append(_bs_svg('两项U逐轮耗时变化 · 固定rank=' + _text(data["rank"]), data["categories"], data["series"],
+            '源实测阶段跨度(ms)', x_axis_title='原HC轮次ID（等距；非ProfilerStep）', category_name='原HC轮次ID',
+            description='一个固定rank的原保留HC轮次；缺少或未识别结果时断线，不以0替代。', max_labels=14))
+        parts.append('<details><summary>展开全部原HC轮次、设备记录与无记录区间</summary>'
+            + _html_table(FOCUS_STEP_HEADERS, [['' if value is None else value for value in row] for row in data["step_rows"]])
+            + '</details>')
+    else:
+        parts.append('<p>逐step未采集，请重新统计；均值细分不代替逐轮数据。</p>')
+    for stage in data["stages"]:
+        parts.append('<h5>' + esc(stage["label"] + ' · 设备互斥细项（源实测）') + '</h5><p>' + esc(stage["note"]) + '</p>')
+        records = [[format(value, '.3%') if index == 5 and _number(value) else value for index, value in enumerate(row)]
+            for row in stage["rows"]]
+        parts.append(_html_table(FOCUS_COMPONENT_HEADERS, records))
+        if stage["closed"] and stage["rows"]:
+            parts.append(_operator_svg(stage["label"] + ' · 互斥细项均值 · rank=' + _text(data["rank"]),
+                [record[0] for record in stage["rows"]], [('源实测均值', [record[1] for record in stage["rows"]], '168B8D')],
+                'ms/HC轮次；细项之和等于父段，已经计入完整周期'))
+        parts.append('<h5>' + esc(stage["label"] + ' · 算子定位与源码函数入口（静态对照）') + '</h5>'
+            + _html_table(FOCUS_FUNCTION_HEADERS, stage["functions"]))
+    return ''.join(parts) + '</section>'
+
+
 def _operator_svg_label_lines(value, width=68):
     """Fit mixed CJK/ASCII labels into the fixed SVG label column."""
     lines, line, used = [], "", 0
@@ -1881,6 +2173,13 @@ def _method_operator_html(method, role, attention):
         parts.append(_operator_svg(attention + '源实测算子热点', [row[0] for row in data["kernel_rows"]],
             [(OPERATOR_KERNEL_HEADERS[2], [row[2] for row in data["kernel_rows"]], "168B8D")],
             '源段内kernel累计，可重叠；不是目标贡献或critical time'))
+    pmu_rows, pmu_details = _operator_pmu_data(data["kernel_items"])
+    parts.append('<h5>' + esc(attention + '源实测Top8 · 流水活动与bound诊断') + '</h5><p>' + esc(PMU_SCOPE) + '</p>')
+    if not any((kernel.get("pmu") or {}).get("metrics") for kernel in data["kernel_items"]):
+        parts.append('<p>PMU未采集，请重新统计；原热点排序与耗时保留，未知指标不补0。</p>')
+    parts.append('<div class="pmu-metrics">' + _html_table(PMU_HEADERS, pmu_rows) + '</div>')
+    parts.append('<details><summary>展开完整指纹、高级PMU指标及bound依据</summary>'
+                 + _html_table(PMU_DETAIL_HEADERS, pmu_details) + '</details>')
     parts.append('<details><summary>本页源热点的完整指纹与原行/轮/层示例（全部明细见核心JSON）</summary><pre>'
         + esc(json.dumps({"core_basis_notes": data.get("basis_notes"), "target_preview": data["target_items"], "kernel_hotspots": data["kernel_items"]},
                          ensure_ascii=False, indent=2)) + '</pre></details></section>')
@@ -1969,7 +2268,8 @@ def _swa_html(diagnostic, rank):
             '<p>逐轮SWA阶段锚点和形状证据：<code>' + esc(diagnostic.get("stages_csv")) + '</code></p></section>')
 
 
-def _bs_svg(title, categories, series, unit):
+def _bs_svg(title, categories, series, unit, *, x_axis_title="BS（每DP请求数）", category_name="BS",
+            description="横轴为按数值升序的等距BS档位；缺少结果时断线。", max_labels=None):
     """Offline line preview; missing observations split the visible line."""
     esc = lambda value: html.escape(str(value), quote=True)
     observed = [value for _, values, _ in series for value in values if value is not None]
@@ -1981,7 +2281,7 @@ def _bs_svg(title, categories, series, unit):
     y = lambda value: bottom - (bottom - top) * value / maximum
     parts = ['<figure class="bs-trend"><figcaption>' + esc(title) + '</figcaption>',
         '<svg viewBox="0 0 1120 420" role="img" aria-label="' + esc(title + '；' + unit) + '">',
-        '<title>' + esc(title) + '</title><desc>横轴为按数值升序的等距BS档位；缺少结果时断线。</desc>',
+        '<title>' + esc(title) + '</title><desc>' + esc(description) + '</desc>',
         '<text x="16" y="24">' + esc(unit) + '</text>']
     for tick in range(5):
         value = maximum * tick / 4
@@ -1990,8 +2290,10 @@ def _bs_svg(title, categories, series, unit):
             f'<text x="{left - 12}" y="{position + 5:.3f}" text-anchor="end">{value:.4g}</text>')
     parts.append(f'<path d="M {left},{top} V {bottom} H {right}" fill="none" stroke="#687f94"/>')
     for index, category in enumerate(categories):
+        if max_labels and index % max(1, math.ceil(len(categories) / max_labels)) and index != len(categories) - 1:
+            continue
         parts.append(f'<text x="{x(index):.3f}" y="{bottom + 26}" text-anchor="middle">{esc(category)}</text>')
-    parts.append('<text x="580" y="382" text-anchor="middle">BS（每DP请求数）</text>')
+    parts.append('<text x="580" y="382" text-anchor="middle">' + esc(x_axis_title) + '</text>')
     for series_index, (label, values, color) in enumerate(series):
         segments, segment = [], []
         for index, value in enumerate(values):
@@ -2008,7 +2310,7 @@ def _bs_svg(title, categories, series, unit):
             parts.append(f'<polyline points="{points}" fill="none" stroke="#{color}" stroke-width="2.5"/>')
             for index, value in segment:
                 parts.append(f'<circle cx="{x(index):.3f}" cy="{y(value):.3f}" r="4" fill="#{color}">'
-                    + '<title>' + esc(f'{label}；BS={categories[index]}；{value} {unit}') + '</title></circle>')
+                    + '<title>' + esc(f'{label}；{category_name}={categories[index]}；{value} {unit}') + '</title></circle>')
         legend_x = 22 + series_index * (1080 / max(1, len(series)))
         parts.append(f'<line x1="{legend_x:.3f}" y1="410" x2="{legend_x + 23:.3f}" y2="410" stroke="#{color}" stroke-width="3"/>'
             f'<text x="{legend_x + 30:.3f}" y="415">{esc(label)}</text>')
@@ -2062,6 +2364,7 @@ def _html_preview(report, out):
              '<p><a href="' + esc(Path(out).name) + '">打开Excel（9个工作表）</a>；来源：' + esc(report.get('source_kind')) + '</p>']
     parts.append('<style>.bs-table{overflow-x:auto}.bs-table table{min-width:1200px}.bs-table th,.bs-table td{white-space:pre-line}.bs-trend{margin:28px 0;max-width:1120px}.bs-trend svg{display:block;width:100%;font:14px system-ui}.bs-trend figcaption{font-weight:600}</style>')
     parts.append('<style>.operator-chart svg{width:100%;font:12px system-ui;display:block;margin:24px 0}.operator-drilldown table{table-layout:fixed;font-size:13px}.operator-drilldown th:first-child{width:34%}.operator-drilldown th:last-child{width:29%}.operator-drilldown td{overflow-wrap:anywhere;white-space:pre-line}.operator-drilldown pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>')
+    parts.append('<style>.u-focus table{table-layout:fixed;font-size:13px}.u-focus td,.u-focus th{white-space:pre-line;overflow-wrap:anywhere}.u-focus th:first-child{width:25%}.u-focus th:last-child{width:25%}.pmu-metrics{overflow-x:auto}.pmu-metrics table{min-width:1500px}.pmu-metrics th:first-child{width:20%}.pmu-metrics th:last-child{width:14%}details>summary{cursor:pointer;font-weight:600;padding:12px;background:#edf2f7}</style>')
     parameter_headers, parameter_rows, _ = _case_parameter_table(report)
     parts.append('<section class="case-parameters"><h2>' + esc(CASE_PARAMETERS_TITLE) + '</h2><p>'
                  + esc(CASE_PARAMETERS_SCOPE) + '</p>'
@@ -2080,6 +2383,7 @@ def _html_preview(report, out):
             parts.append(_html_table(LAYER_MEAN_MATRIX_HEADERS, _layer_mean_matrix_rows(method)))
             parts.append(_html_table(["整轮闭合/单卡指标", "核心原值", "说明"], _layer_mean_closure_rows(method)))
             parts.append(_method_residual_html(case, method))
+            parts.append(_method_focus_html(case, method))
             parts.append(_method_stage_expansions_html(case, method))
             parts.append('<p><code>' + esc(method.get("formula")) + '</code></p><p>' + esc(_explanation(method)) + '</p></section>')
         for capture in case.get("measurements") or []:
