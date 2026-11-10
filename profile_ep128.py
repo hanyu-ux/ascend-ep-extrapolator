@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261110.2.parallel_analysis"
+PROFILE_VERSION = "20261110.3.rank_parallel"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -1192,93 +1192,132 @@ def read_reference(path):
 
 
 
-def analyze_case(case, model, target, base, reference_rows=None):
+def _case_analysis_plan(case, model, target, base):
     files, names = case_inputs(case, base)
     case = {**case, '_rank_coverage_complete': rank_coverage(names, case)}
     residual_dir = case.pop('_step_residual_dir', None)
-    captures, measurements, capture_hashes, prepared = [], [], {}, {}
     schedule, _, errors = b_schedule(model, case, target)
     shapes, shape_errors = b_shapes(model, target, case)
     source_errors = errors + shape_errors
     required = {role: shape['target']['num_experts_per_tok'] != shape['source']['num_experts_per_tok']
                 for role, shape in shapes.items()} if not source_errors else {}
     excluded = set(case.get('exclude_target_layers', [0]))
-    for rank_number, (path, rank) in enumerate(zip(files, names), 1):
-        rank_started = stage_started = time.perf_counter()
-        for info in path.parent.parent.glob('profiler_info*.json'):
-            common = json.loads(info.read_text(encoding='utf-8-sig')).get('config', {}).get('common_config', {})
-            if common.get('with_stack') is True or common.get('with_modules') is True:
-                raise ValueError(f'{info}: enabled stack/modules capture conflicts with timing baseline')
-        print(f'  读取 {rank}（{rank_number}/{len(names)}）: {path}', flush=True)
-        capture = read_capture(path, rank)
-        print(f'  {rank} CSV/PMU读取完成：{len(capture["tasks"])}条任务，'
-              f'{time.perf_counter() - stage_started:.2f}s；开始HC周期识别', flush=True)
-        stage_started = time.perf_counter()
+    return {'case': case, 'model': model, 'target': target, 'base': base,
+            'files': files, 'names': names, 'residual_dir': residual_dir,
+            'schedule': schedule, 'required': required, 'excluded': excluded,
+            'source_errors': source_errors}
+
+
+def _analyze_case_rank(plan, rank_index, *, capture_hashes=None, prepare_source=True, context=None):
+    """Analyze a rank using the complete case context, without changing rank coverage."""
+    case, model, base = plan['case'], plan['model'], plan['base']
+    path, rank = plan['files'][rank_index], plan['names'][rank_index]
+    rank_number, names = rank_index + 1, plan['names']
+    residual_dir, schedule = plan['residual_dir'], plan['schedule']
+    excluded, required = plan['excluded'], plan['required']
+    prepared, source_errors = None, []
+    rank_started = stage_started = time.perf_counter()
+    for info in path.parent.parent.glob('profiler_info*.json'):
+        common = json.loads(info.read_text(encoding='utf-8-sig')).get('config', {}).get('common_config', {})
+        if common.get('with_stack') is True or common.get('with_modules') is True:
+            raise ValueError(f'{info}: enabled stack/modules capture conflicts with timing baseline')
+    print(f'  读取 {rank}（{rank_number}/{len(names)}）: {path}', flush=True)
+    capture = read_capture(path, rank)
+    capture_meta = {key: capture.get(key) for key in ('rank', 'path', 'sha256', 'device_id', 'duplicate_rows')}
+    if context is not None:
+        context['capture'] = capture_meta
+    print(f'  {rank} CSV/PMU读取完成：{len(capture["tasks"])}条任务，'
+          f'{time.perf_counter() - stage_started:.2f}s；开始HC周期识别', flush=True)
+    stage_started = time.perf_counter()
+    if capture_hashes is not None:
         if capture['sha256'] in capture_hashes:
             raise ValueError('Identical CSV content was selected as different global ranks: '
                              + capture_hashes[capture['sha256']] + ' and ' + rank)
         capture_hashes[capture['sha256']] = rank
-        measured = measure_capture(capture, model, case, base)
-        print(f'  {rank} HC周期识别完成：{len(measured["rounds"])}轮，'
-              f'{time.perf_counter() - stage_started:.2f}s；开始层内阶段统计', flush=True)
-        trace_path = next((item.get('trace_path') for item in case.get('inputs', [])
-                           if item.get('rank') == rank), None)
-        if trace_path is not None:
-            trace_path = Path(trace_path).expanduser()
-            if not trace_path.is_absolute():
-                trace_path = Path(base) / trace_path
-        try:
-            # The CLI always supplies its output directory. Direct API callers
-            # still receive base measurements without writing beside inputs or
-            # returning references to deleted temporary detail files.
-            with (nullcontext(residual_dir) if residual_dir is not None else
-                  tempfile.TemporaryDirectory(prefix='ep128-residual-')) as detail_dir:
-                stage_started = time.perf_counter()
-                try:
-                    measured['layer_diagnostics'], measured['swa_diagnostics'] = layer_analyze_capture(
-                        capture, measured, detail_dir, with_swa_compat=True)
-                except (OSError, ValueError, TypeError, ArithmeticError) as error:
-                    for field in ('layer_diagnostics', 'swa_diagnostics'):
-                        measured[field] = {'status': 'ERROR', 'reason': str(error),
-                                           'layer_summary': [], 'stage_summary': [], 'stages_csv': None}
-                print(f'  {rank} 层内阶段统计结束：{time.perf_counter() - stage_started:.2f}s；'
-                      '开始HC剩余区间/Host来源统计', flush=True)
-                stage_started = time.perf_counter()
-                measured['step_residuals'] = residual_analyze_capture(
-                    capture, measured, detail_dir, trace_path=trace_path, case=case,
-                    progress=lambda message: print('    ' + message, flush=True))
-                print(f'  {rank} HC剩余区间/Host来源统计结束：'
-                      f'{time.perf_counter() - stage_started:.2f}s', flush=True)
-        except (OSError, ValueError, TypeError, ArithmeticError) as error:
-            measured['step_residuals'] = {'status': 'ERROR', 'windows': [], 'summary': [],
-                                          'trace': {'status': 'ERROR', 'reason': str(error)}}
-            measured['warnings'].append('HC_RESIDUAL_DIAGNOSTIC_FAILED: ' + str(error))
-        finally:
-            if residual_dir is None:
-                for field in ('device_tasks_csv', 'host_events_csv', 'stages_csv', 'source_links_csv'):
-                    measured['step_residuals'][field] = None
-                focus = measured['step_residuals'].get('focus_diagnostics')
-                if isinstance(focus, dict):
-                    for field in ('segments_csv', 'steps_csv'):
-                        focus[field] = None
-                for field in ('layer_diagnostics', 'swa_diagnostics'):
-                    if isinstance(measured.get(field), dict):
-                        measured[field]['stages_csv'] = None
-        measurements.append(measured)
-        captures.append({key: capture.get(key) for key in ('rank', 'path', 'sha256', 'device_id', 'duplicate_rows')})
-        if not source_errors:
-            print(f'  {rank} 开始逐轮算子/PMU汇总', flush=True)
+    measured = measure_capture(capture, model, case, base)
+    print(f'  {rank} HC周期识别完成：{len(measured["rounds"])}轮，'
+          f'{time.perf_counter() - stage_started:.2f}s；开始层内阶段统计', flush=True)
+    trace_path = next((item.get('trace_path') for item in case.get('inputs', [])
+                       if item.get('rank') == rank), None)
+    if trace_path is not None:
+        trace_path = Path(trace_path).expanduser()
+        if not trace_path.is_absolute():
+            trace_path = Path(base) / trace_path
+    try:
+        # The CLI always supplies its output directory. Direct API callers
+        # still receive base measurements without writing beside inputs or
+        # returning references to deleted temporary detail files.
+        with (nullcontext(residual_dir) if residual_dir is not None else
+              tempfile.TemporaryDirectory(prefix='ep128-residual-')) as detail_dir:
             stage_started = time.perf_counter()
             try:
-                starts = [task.start_ns for task in capture['tasks']]
-                time_index = ATimeIndex(capture['tasks'])
-                prepared[rank] = [_lm_source_round(cycle, capture['tasks'], starts, model, case,
-                                                  schedule, excluded, required, time_index=time_index,
-                                                  rank=rank) for cycle in measured['rounds']]
-            except (ValueError, KeyError, TypeError, ArithmeticError) as error:
-                source_errors.append(str(error))
-            print(f'  {rank} 逐轮算子/PMU汇总结束：{time.perf_counter() - stage_started:.2f}s', flush=True)
-        print(f'  {rank} 分析结束：共{time.perf_counter() - rank_started:.2f}s', flush=True)
+                measured['layer_diagnostics'], measured['swa_diagnostics'] = layer_analyze_capture(
+                    capture, measured, detail_dir, with_swa_compat=True)
+            except (OSError, ValueError, TypeError, ArithmeticError) as error:
+                for field in ('layer_diagnostics', 'swa_diagnostics'):
+                    measured[field] = {'status': 'ERROR', 'reason': str(error),
+                                       'layer_summary': [], 'stage_summary': [], 'stages_csv': None}
+            print(f'  {rank} 层内阶段统计结束：{time.perf_counter() - stage_started:.2f}s；'
+                  '开始HC剩余区间/Host来源统计', flush=True)
+            stage_started = time.perf_counter()
+            measured['step_residuals'] = residual_analyze_capture(
+                capture, measured, detail_dir, trace_path=trace_path, case=case,
+                progress=lambda message: print('    ' + message, flush=True))
+            print(f'  {rank} HC剩余区间/Host来源统计结束：'
+                  f'{time.perf_counter() - stage_started:.2f}s', flush=True)
+    except (OSError, ValueError, TypeError, ArithmeticError) as error:
+        measured['step_residuals'] = {'status': 'ERROR', 'windows': [], 'summary': [],
+                                      'trace': {'status': 'ERROR', 'reason': str(error)}}
+        measured['warnings'].append('HC_RESIDUAL_DIAGNOSTIC_FAILED: ' + str(error))
+    finally:
+        if residual_dir is None:
+            for field in ('device_tasks_csv', 'host_events_csv', 'stages_csv', 'source_links_csv'):
+                measured['step_residuals'][field] = None
+            focus = measured['step_residuals'].get('focus_diagnostics')
+            if isinstance(focus, dict):
+                for field in ('segments_csv', 'steps_csv'):
+                    focus[field] = None
+            for field in ('layer_diagnostics', 'swa_diagnostics'):
+                if isinstance(measured.get(field), dict):
+                    measured[field]['stages_csv'] = None
+    if prepare_source and not plan['source_errors']:
+        print(f'  {rank} 开始逐轮算子/PMU汇总', flush=True)
+        stage_started = time.perf_counter()
+        try:
+            starts = [task.start_ns for task in capture['tasks']]
+            time_index = ATimeIndex(capture['tasks'])
+            prepared = [_lm_source_round(cycle, capture['tasks'], starts, model, case,
+                                         schedule, excluded, required, time_index=time_index,
+                                         rank=rank) for cycle in measured['rounds']]
+        except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+            source_errors.append(str(error))
+        print(f'  {rank} 逐轮算子/PMU汇总结束：{time.perf_counter() - stage_started:.2f}s', flush=True)
+    print(f'  {rank} 分析结束：共{time.perf_counter() - rank_started:.2f}s', flush=True)
+    return {'capture': capture_meta, 'measurement': measured,
+            'prepared': prepared, 'source_errors': source_errors}
+
+
+def _assemble_case_analysis(plan, rank_results):
+    """Replay original rank ordering, duplicate checks and first prepare-error semantics."""
+    case, model, target = plan['case'], plan['model'], plan['target']
+    names = plan['names']
+    captures, measurements, capture_hashes, prepared = [], [], {}, {}
+    source_errors = list(plan['source_errors'])
+    for result in rank_results:
+        capture = result.get('capture')
+        if capture is not None:
+            if capture['sha256'] in capture_hashes:
+                raise ValueError('Identical CSV content was selected as different global ranks: '
+                                 + capture_hashes[capture['sha256']] + ' and ' + capture['rank'])
+            capture_hashes[capture['sha256']] = capture['rank']
+        if 'failure' in result:
+            raise ValueError(result['failure'])
+        captures.append(capture)
+        measurements.append(result['measurement'])
+        if not source_errors:
+            source_errors.extend(result['source_errors'])
+            if result['prepared'] is not None:
+                prepared[capture['rank']] = result['prepared']
     reasons = [message for item in measurements for message in item.get('warnings', [])]
     if not case['_rank_coverage_complete']:
         reasons.append(f'RANK_COVERAGE: captured {len(names)}/{case["expected_ranks"]}; only captured ranks are estimated')
@@ -1291,6 +1330,19 @@ def analyze_case(case, model, target, base, reference_rows=None):
                 'Same-role boundaries and the cross-role/tail residual are retained once.',
                 'Per-card throughput divides configured system output by physical cards.']},
             '_prepared_layer_means': prepared, '_layer_mean_source_errors': source_errors}
+
+
+def analyze_case(case, model, target, base, reference_rows=None):
+    """Serial API; CLI rank parallelism uses the same rank analysis and assembly."""
+    plan = _case_analysis_plan(case, model, target, base)
+    results, capture_hashes = [], {}
+    source_errors = list(plan['source_errors'])
+    for rank_index in range(len(plan['names'])):
+        result = _analyze_case_rank(plan, rank_index, capture_hashes=capture_hashes,
+                                    prepare_source=not source_errors)
+        results.append(result)
+        source_errors.extend(result['source_errors'])
+    return _assemble_case_analysis(plan, results)
 
 
 
@@ -4732,7 +4784,7 @@ def _cli_case_cpu_budget():
     return cpu
 
 
-def _cli_case_workers(requested, case_count):
+def _cli_case_workers(requested, case_count, granularity='case'):
     """Conservative automatic budget; explicit requests only receive resource warnings."""
     cpu = _cli_case_cpu_budget()
     memory = _cli_case_memory_available()
@@ -4742,7 +4794,7 @@ def _cli_case_workers(requested, case_count):
         automatic = 1
     workers = min(requested if requested is not None else automatic, max(1, case_count))
     memory_label = '未知' if memory is None else f'{memory / 1024 ** 3:.2f} GiB'
-    print(f'执行粒度：case；进程数={workers}；CPU预算={cpu}；可用内存/容器余量={memory_label}；'
+    print(f'执行粒度：{granularity}；进程数={workers}；CPU预算={cpu}；可用内存/容器余量={memory_label}；'
           + ('自动选择' if requested is None else '显式指定'), flush=True)
     if requested is not None and requested > automatic:
         print(f'并行提示：当前自动建议上限为{automatic}；按显式请求执行，更多进程会增加内存、磁盘争用。', flush=True)
@@ -4842,6 +4894,141 @@ def _cli_run_case_jobs(jobs, workers):
     return [output[index] for index in sorted(output)]
 
 
+def _cli_rank_worker(job, spool_directory):
+    """One rank per job; preserve full case context and return only spool identity."""
+    import pickle
+    from contextlib import redirect_stdout
+    case_index, rank_index, plan = job
+    context = {}
+    name = str(plan['case']['name']) + ' / rank ' + str(plan['names'][rank_index])
+    with redirect_stdout(_CaseProgressStream(sys.stdout, name)):
+        try:
+            result = _analyze_case_rank(plan, rank_index, context=context)
+        except Exception as error:
+            known = isinstance(error, (ValueError, KeyError, OSError, ArithmeticError, TypeError, re.error))
+            message = str(error) if known else 'RANK_WORKER_ERROR: ' + type(error).__name__ + ': ' + str(error)
+            result = {'capture': context.get('capture'), 'failure': message}
+            print('FAILED: ' + message + '；不自动重跑', flush=True)
+    payload = {'case_index': case_index, 'rank_index': rank_index, 'result': result}
+    destination = Path(spool_directory) / f'case-{case_index}-rank-{rank_index}.pickle'
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile('wb', dir=spool_directory, prefix='.rank-', delete=False) as stream:
+            temporary = Path(stream.name)
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary.replace(destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return case_index, rank_index, str(destination)
+
+
+def _cli_run_rank_jobs(jobs, workers=None):
+    """Use a single global rank pool and finalize one complete case at a time."""
+    import multiprocessing
+    import pickle
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    output, plans, originals, pending_cases = {}, {}, {}, {}
+    rank_jobs = []
+
+    def failed(index, error):
+        name = str(originals[index][1]['name'])
+        output[index] = {'index': index, 'failure': {'case': name, 'error': str(error)}}
+        print('[case ' + name + '] FAILED: ' + str(error) + '；不自动重跑', flush=True)
+
+    for job in jobs:
+        index, case, model, target, base, reference_rows = job
+        originals[index] = job
+        try:
+            plan = _case_analysis_plan(case, model, target, base)
+        except Exception as error:
+            failed(index, error)
+            continue
+        plans[index], pending_cases[index] = plan, {}
+        # Keep each case's ranks contiguous so finished case spools can be
+        # consumed promptly, while all jobs share the same process budget.
+        rank_jobs.extend((index, rank_index, plan) for rank_index in range(len(plan['names'])))
+    worker_count = _cli_case_workers(workers, len(rank_jobs), granularity='rank')
+    if not rank_jobs:
+        return [output[index] for index in sorted(output)]
+
+    with tempfile.TemporaryDirectory(prefix='ep128-rank-results-') as spool_directory:
+        def destination(index, rank_index):
+            return Path(spool_directory) / f'case-{index}-rank-{rank_index}.pickle'
+
+        def finalize(index):
+            plan, identities = plans[index], pending_cases[index]
+            rank_results = []
+            try:
+                for rank_index in range(len(plan['names'])):
+                    outcome, error = identities[rank_index]
+                    if error is not None:
+                        rank_results.append({'failure': 'RANK_WORKER_ERROR: ' + type(error).__name__ + ': ' + str(error)})
+                        continue
+                    expected = destination(index, rank_index)
+                    try:
+                        if outcome != (index, rank_index, str(expected)):
+                            raise ValueError('rank worker returned an unexpected result file identity')
+                        with expected.open('rb') as stream:
+                            payload = pickle.load(stream)
+                        if payload.get('case_index') != index or payload.get('rank_index') != rank_index:
+                            raise ValueError('rank result identity does not match its submitted job')
+                        rank_results.append(payload['result'])
+                    except Exception as error:
+                        rank_results.append({'failure': 'RANK_WORKER_ERROR: ' + type(error).__name__ + ': ' + str(error)})
+                    finally:
+                        expected.unlink(missing_ok=True)
+                result = _assemble_case_analysis(plan, rank_results)
+                # The assembler and the estimate temporarily share prepared
+                # lists. Drop rank wrappers before attaching/releasing them.
+                rank_results.clear()
+                partial = {'cases': [result], 'communication_reference': {'rows': originals[index][5]}}
+                print('[case ' + str(plan['case']['name']) + '] 全部rank完成；开始方法1/方法2估算', flush=True)
+                attach_layer_mean_report(partial)
+                output[index] = {'index': index, 'result': result, 'contract': partial['contract']}
+                print('[case ' + str(plan['case']['name']) + '] 统计与估算完成', flush=True)
+            except Exception as error:
+                failed(index, error)
+            finally:
+                rank_results.clear()
+                for rank_index in range(len(plan['names'])):
+                    destination(index, rank_index).unlink(missing_ok=True)
+                del pending_cases[index]
+                del plans[index]
+
+        def collect(job, outcome=None, error=None):
+            index, rank_index, _ = job
+            pending_cases[index][rank_index] = (outcome, error)
+            if len(pending_cases[index]) == len(plans[index]['names']):
+                finalize(index)
+
+        if worker_count <= 1 or len(rank_jobs) <= 1:
+            for job in rank_jobs:
+                try:
+                    outcome = _cli_rank_worker(job, spool_directory)
+                except Exception as error:
+                    collect(job, error=error)
+                else:
+                    collect(job, outcome=outcome)
+        else:
+            with ProcessPoolExecutor(max_workers=worker_count, mp_context=multiprocessing.get_context('spawn')) as executor:
+                pending = {}
+                for job in rank_jobs:
+                    try:
+                        pending[executor.submit(_cli_rank_worker, job, spool_directory)] = job
+                    except Exception as error:
+                        collect(job, error=error)
+                for future in as_completed(pending):
+                    job = pending[future]
+                    try:
+                        outcome = future.result()
+                    except Exception as error:
+                        collect(job, error=error)
+                    else:
+                        collect(job, outcome=outcome)
+    return [output[index] for index in sorted(output)]
+
+
 def _cli_positive_workers(value):
     try:
         number = int(value)
@@ -4862,7 +5049,9 @@ def main():
     parser.add_argument('--list-inputs', action='store_true', help='只核对输入文件，不读取CSV')
     parser.add_argument('--inventory', type=Path, help='查看少量CSV的字段和设备任务数量')
     parser.add_argument('--workers', type=_cli_positive_workers, default=None,
-                        help='按case并行的进程数；默认最多2，低内存自动用1；--workers 1串行')
+                        help='总分析进程数；默认最多2，低内存自动用1；--workers 1串行')
+    parser.add_argument('--parallel', choices=('case', 'rank'), default='case',
+                        help='并行任务粒度；case按case并行（默认），rank用一个全局池处理各case的rank')
     args = parser.parse_args()
     print('统计脚本：' + str(Path(__file__).resolve()) + '（' + PROFILE_VERSION + '）', flush=True)
     if args.inventory:
@@ -4932,8 +5121,12 @@ def main():
         except (ValueError, KeyError, OSError, ArithmeticError, TypeError, re.error) as error:
             failed[index] = {'case': str(name), 'error': str(error)}
             print('  FAILED: ' + str(error), flush=True)
-    workers = _cli_case_workers(args.workers, len(jobs))
-    for payload in _cli_run_case_jobs(jobs, workers):
+    if args.parallel == 'rank':
+        outcomes = _cli_run_rank_jobs(jobs, args.workers)
+    else:
+        workers = _cli_case_workers(args.workers, len(jobs))
+        outcomes = _cli_run_case_jobs(jobs, workers)
+    for payload in outcomes:
         if 'failure' in payload:
             failed[payload['index']] = payload['failure']
         else:
