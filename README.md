@@ -38,7 +38,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-三个运行脚本应放在同一目录。当前版本：统计 `20261110.1.u_focus_step_pmu`、Excel 生成器 `20261110.1.u_focus_step_pmu`、写入器 `20261104.1.line_charts`。
+三个运行脚本应放在同一目录。当前版本：统计 `20261110.2.parallel_analysis`、Excel 生成器 `20261110.1.u_focus_step_pmu`、写入器 `20261104.1.line_charts`。
 
 ## 快速运行
 
@@ -87,6 +87,14 @@ ascend-ep-extrapolator/
    ```
 
    `--list-inputs` 只查找文件，不读取 CSV 内容。退出码为 0 不代表目标硬件性能已经验证；有 case 失败或主方法结果不可用时，统计命令会返回非零并保留具体原因。
+
+多个 case 默认采用进程并行，自动最多同时运行2个 case；只处理1个 case 时直接运行。可显式调整：
+
+```bash
+python -u profile_ep128.py cases.local.json --out ep128_report --excel --workers 4
+```
+
+`--workers 1` 使用串行。自动预算会考虑 CPU 与可用内存；探测到可用内存不足4 GiB时自动使用1个进程。显式设置仅受有效 case 数量限制，不会按内存自动改小。每个进程内部的 rank 仍顺序处理，不创建嵌套进程池。大采样每个进程可能使用数 GiB 内存，同时输出较大的证据 CSV；增加进程数须结合机器内存和磁盘吞吐。每个 case 完成后立即汇总并释放临时算子数据，最终结果和失败项仍按配置顺序排列；统计口径及各 rank 的证据不变。日志会标明 case、rank 和阶段，便于确认当前耗时位置。不同运行应使用不同 `--out` 目录。
 
 ### 已有 JSON，只重绘 Excel
 
