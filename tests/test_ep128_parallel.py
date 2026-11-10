@@ -28,12 +28,50 @@ class ParallelCaseTests(unittest.TestCase):
         # Some report fields and CSV cells contain serialized JSON, so Windows
         # separators may appear raw, JSON-escaped, or escaped a second time.
         prefixes = {str(output), output.as_posix()}
+        if isinstance(output, Path):
+            resolved = output.resolve()
+            # Windows temporary paths can use RUNNER~1 while runtime detail
+            # paths resolve to the long directory name, e.g. runneradmin.
+            prefixes.update((str(resolved), resolved.as_posix()))
         for _ in range(2):
             prefixes.update(json.dumps(prefix, ensure_ascii=ascii_only)[1:-1]
                             for prefix in tuple(prefixes) for ascii_only in (False, True))
         for prefix in sorted(prefixes, key=len, reverse=True):
             value = value.replace(prefix, '<OUTPUT>')
         return value
+
+    def report_differences(self, left, right):
+        """Report a few exact field paths instead of dumping two large reports."""
+        differences = []
+        def brief(value):
+            if isinstance(value, dict):
+                return '<dict with ' + str(len(value)) + ' keys>'
+            if isinstance(value, list):
+                return '<list with ' + str(len(value)) + ' items>'
+            return repr(value)[:180]
+        def visit(a, b, location):
+            if len(differences) >= 6:
+                return
+            if type(a) is not type(b):
+                differences.append(location + ': ' + brief(a) + ' != ' + brief(b))
+            elif isinstance(a, dict):
+                for key in a.keys() | b.keys():
+                    if key not in a or key not in b:
+                        differences.append(location + '.' + key + ': key missing from '
+                                           + ('serial' if key not in a else 'parallel'))
+                        if len(differences) >= 6:
+                            return
+                for key in a.keys() & b.keys():
+                    visit(a[key], b[key], location + '.' + key)
+            elif isinstance(a, list):
+                if len(a) != len(b):
+                    differences.append(location + ': lengths ' + str(len(a)) + ' != ' + str(len(b)))
+                for index, (first, second) in enumerate(zip(a, b)):
+                    visit(first, second, location + '[' + str(index) + ']')
+            elif a != b:
+                differences.append(location + ': ' + brief(a) + ' != ' + brief(b))
+        visit(left, right, '$')
+        return '\n'.join(differences)
 
     def normalize_output(self, value, output):
         if isinstance(value, dict):
@@ -75,7 +113,11 @@ class ParallelCaseTests(unittest.TestCase):
             a = json.loads((serial_dir / 'model_architecture_report.json').read_text())
             b = json.loads((parallel_dir / 'model_architecture_report.json').read_text())
             self.assertEqual([item['name'] for item in b['cases']], ['ZETA_FIRST', 'ALPHA_SECOND'])
-            self.assertEqual(self.normalize_output(a, serial_dir), self.normalize_output(b, parallel_dir))
+            normalized_a = self.normalize_output(a, serial_dir)
+            normalized_b = self.normalize_output(b, parallel_dir)
+            if normalized_a != normalized_b:
+                self.fail('Serial/parallel report fields differ:\n'
+                          + self.report_differences(normalized_a, normalized_b))
             for case in b['cases']:
                 self.assertEqual({method['id']: method['status'] for method in core.displayed_methods(case)},
                                  {'method1': 'LAYER_MEAN_ESTIMATE', 'method2': 'LAYER_MEAN_ESTIMATE'})
