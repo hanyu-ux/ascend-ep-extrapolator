@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261108.1.operator_drilldown"
+PROFILE_VERSION = "20261110.1.u_focus_step_pmu"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -65,6 +65,7 @@ class ATask:
     op_state: str | None
     row_indices: list = field(default_factory=list)
     wait_available: bool = True
+    pmu: dict = field(default_factory=dict)
 
     @property
     def label(self):
@@ -125,6 +126,86 @@ def a_exact_ns(value, label):
     raise ValueError(label + " must be an exact integer nanosecond string or integer")
 
 
+_A_PMU_FIELDS = {
+    "aicore_time_us": "us", "aiv_time_us": "us",
+    "aic_total_cycles": "cycles", "aiv_total_cycles": "cycles",
+    "aic_icache_miss_rate": "ratio", "aiv_icache_miss_rate": "ratio",
+    "cube_utilization": "ratio", "block_num": "count", "mix_block_num": "count",
+}
+for _pmu_core, _pmu_pipes in (("aic", ("mac", "vec", "scalar", "mte1", "mte2", "mte3", "fixpipe")),
+                              ("aiv", ("mac", "vec", "scalar", "mte1", "mte2", "mte3", "fixpipe"))):
+    for _pmu_pipe in _pmu_pipes:
+        _A_PMU_FIELDS[_pmu_core + "_" + _pmu_pipe + "_ratio"] = "ratio"
+        _A_PMU_FIELDS[_pmu_core + "_" + _pmu_pipe + "_time_us"] = "us"
+del _pmu_core, _pmu_pipes, _pmu_pipe
+
+
+def _a_pmu_header(header):
+    """Resolve optional hardware counters without changing timed-row parsing."""
+    raw = str(header).lower().replace("μ", "u").replace("µ", "u").replace("％", "%")
+    normalized = re.sub(r"[^a-z0-9]", "", raw)
+    if normalized in ("aictime", "aictimeus", "aictimemicroseconds"):
+        return "aicore_time_us", 1.
+    for field, unit in _A_PMU_FIELDS.items():
+        base = re.sub(r"[^a-z0-9]", "", field[:-3] if unit == "us" else field)
+        if unit == "us":
+            if normalized in (base, base + "us", base + "microseconds"):
+                return field, 1.
+            if normalized == base + "ns":
+                return field, .001
+            if normalized == base + "ms":
+                return field, 1000.
+        elif normalized in (base, base + "percent", base + "percentage", base + "pct"):
+            return field, .01 if unit == "ratio" and ("%" in raw or normalized != base or field == "cube_utilization") else 1.
+    return None
+
+
+def _a_read_pmu(row, columns):
+    values, invalid = {}, set()
+    for header, field, factor in columns:
+        raw = row.get(header)
+        if raw is None or str(raw).strip().lower() in ("", "n/a", "none", "null", "--", "-"):
+            continue
+        try:
+            text = str(raw).strip().replace("％", "%")
+            percent = text.endswith("%")
+            if percent and _A_PMU_FIELDS[field] != "ratio":
+                raise ValueError("percent suffix is only valid for optional PMU ratios")
+            value = float(text[:-1].strip() if percent else text)
+            value *= .01 if percent else factor
+            if (not math.isfinite(value) or value < 0
+                    or _A_PMU_FIELDS[field] == "ratio" and value > 1
+                    or _A_PMU_FIELDS[field] in ("count", "cycles") and not value.is_integer()):
+                raise ValueError("invalid optional PMU value")
+            if field in values and not math.isclose(values[field], value, rel_tol=1e-9, abs_tol=1e-12):
+                invalid.add(field)
+            else:
+                values[field] = value
+        except (ValueError, TypeError, OverflowError):
+            invalid.add(field)
+    for field in invalid:
+        values.pop(field, None)
+    if not values and not invalid:
+        return {}
+    return {"metrics": values, "invalid_fields": sorted(invalid),
+            "core_type": str(row.get("Accelerator Core") or row.get("Task Type") or "").strip()}
+
+
+def _a_merge_pmu(left, right):
+    """Duplicate native events remain one event, even with optional counters."""
+    metrics = dict(left.get("metrics", {}))
+    invalid = set(left.get("invalid_fields", ())) | set(right.get("invalid_fields", ()))
+    for field, value in right.get("metrics", {}).items():
+        if field in metrics and not math.isclose(metrics[field], value, rel_tol=1e-9, abs_tol=1e-12):
+            invalid.add(field)
+        else:
+            metrics[field] = value
+    for field in invalid:
+        metrics.pop(field, None)
+    return {"metrics": metrics, "invalid_fields": sorted(invalid),
+            "core_type": left.get("core_type") or right.get("core_type") or ""}
+
+
 
 def read_capture(path, rank):
     """Keep original row references and metadata; deduplicate identical events."""
@@ -138,6 +219,8 @@ def read_capture(path, rank):
             raise ValueError(str(path) + ": duplicate CSV header")
         reader.fieldnames = normalized_headers
         headers = set(normalized_headers)
+        pmu_columns = [(header, *resolved) for header in normalized_headers
+                       if (resolved := _a_pmu_header(header)) is not None]
         for alternatives in (("Name", "Op Name"), ("Start Time(us)", "Start Time (us)"),
                              ("Duration(us)", "Duration (us)")):
             if not headers.intersection(alternatives):
@@ -185,11 +268,13 @@ def read_capture(path, rank):
                           else str(row["Task Type"]).strip(),
                           op_state=a_alias(row, ("OP State", "Op State"), "op_state"))
             key = tuple(values.items())
+            pmu = _a_read_pmu(row, pmu_columns)
             if key in seen:
                 duplicates += 1
                 seen[key].row_indices.append(index)
+                seen[key].pmu = _a_merge_pmu(seen[key].pmu, pmu)
             else:
-                task = ATask(row_index=index, row_indices=[index], **values)
+                task = ATask(row_index=index, row_indices=[index], pmu=pmu, **values)
                 seen[key] = task
                 tasks.append(task)
     if len(devices) > 1:
@@ -1132,6 +1217,10 @@ def analyze_case(case, model, target, base, reference_rows=None):
             if residual_dir is None:
                 for field in ('device_tasks_csv', 'host_events_csv', 'stages_csv', 'source_links_csv'):
                     measured['step_residuals'][field] = None
+                focus = measured['step_residuals'].get('focus_diagnostics')
+                if isinstance(focus, dict):
+                    for field in ('segments_csv', 'steps_csv'):
+                        focus[field] = None
                 for field in ('layer_diagnostics', 'swa_diagnostics'):
                     if isinstance(measured.get(field), dict):
                         measured[field]['stages_csv'] = None
@@ -2125,6 +2214,246 @@ def diagnostic_metrics(tasks, left, right):
             "top_kernels": top[:5], "top_gaps": gap_rows}
 
 
+RESIDUAL_FOCUS_SCOPE = (
+    "源采样同rank逐保留step的父段内设备时间覆盖；所有单算子、具名并发组合和无设备记录间隙互斥闭合父段。"
+    "step_index为保留样本顺序，round_id保留原HC周期标识；未获得调度器业务step编号。"
+    "均值以全部保留step为分母：某组件在已识别step未出现计0；父段缺失保持未知，不按0补齐。"
+    "source_function_mapping仅为固定版本源码入口的静态对应，不是实测Python函数耗时；"
+    "同名metadata可来自不同KV组/层/窗口，不由出现顺序猜测具体builder。"
+    "无设备记录不等于CPU忙时或设备空闲；原15父阶段、level1及周期/TPOT/吞吐保持原口径。")
+
+
+def residual_focus_source_mapping(task):
+    """Auditable static kernel-to-entry references, never inferred CPU timings."""
+    ascend = "vllm-ascend@66b5a5eaca3dbf97aa4022e0d6170ba7ba53dc9f"
+    upstream = "vllm@6e448d0ea9bf3d88d898b65449ca6dc2aec170ac (peer source reference)"
+
+    def entry(path, function, line, basis, evidence, **extra):
+        return {"path": path, "function": function, "line": line,
+                "version_basis": basis, "evidence": evidence,
+                "measurement_scope": "static source_function_mapping; runtime entry and Python duration unverified", **extra}
+
+    input_path = "vllm/v1/worker/gpu/input_batch.py"
+    known = {
+        "_expand_idx_mapping_kernel": ("展开请求与token映射", [entry(input_path, "expand_idx_mapping", 634, upstream,
+            "exact Triton kernel launch in wrapper; Ascend GPUModelRunner.prepare_inputs calls wrapper")]),
+        "_prepare_pos_seq_lens_kernel": ("准备位置与序列长度", [entry(input_path, "prepare_pos_seq_lens", 304, upstream,
+            "exact Triton kernel launch in wrapper; Ascend GPUModelRunner.prepare_inputs calls wrapper")]),
+        "_combine_sampled_and_draft_tokens_kernel": ("拼接采样与草稿token", [entry(input_path,
+            "combine_sampled_and_draft_tokens", 386, upstream,
+            "exact Triton kernel launch; writes input_ids and logits_indices")]),
+        "_apply_write_kernel": ("应用暂存的状态/块表写入", [
+            entry("vllm/v1/worker/gpu/buffer_utils.py", "StagedWriteTensor.apply_write", 174, upstream,
+                  "same kernel used for staged tensor writes; tensor ownership cannot be inferred from kernel name"),
+            entry("vllm/v1/worker/gpu/buffer_utils.py", "FusedStagedWriter.apply", 225, upstream,
+                  "multi-group staged writes also launch this kernel; not necessarily KV payload copying")]),
+        "_gather_block_tables_kernel": ("聚合本批请求KV块表", [entry("vllm/v1/worker/gpu/block_table.py",
+            "BlockTables.gather_block_tables", 134, upstream, "exact kernel launch with per-group and padded request grid")]),
+        "_compute_slot_mappings_kernel": ("计算token到KV槽位映射", [entry("vllm_ascend/worker/v2/block_table.py",
+            "AscendBlockTables.compute_slot_mappings", 82, ascend, "Ascend override launches same-named Triton slot kernel")]),
+        "_zero_kv_blocks_kernel": ("KV块清零", [
+            entry("vllm_ascend/worker/utils.py", "AscendKVBlockZeroer.zero_block_ids", 350, ascend,
+                  "Ascend zeroer launches same-named kernel; v2 AscendV2KVBlockZeroer delegates by cache kind"),
+            entry("vllm/v1/worker/utils.py", "KVBlockZeroer.zero_block_ids", 192, upstream,
+                  "upstream zeroer can also launch this name; exact implementation needs runtime trace/source check")]),
+    }
+    if task.name in known:
+        label, entries = known[task.name]
+        return label, "STATIC_KERNEL_NAME_MATCH", entries
+    name = str(getattr(task, "op_type", "")) + " " + task.name
+    if re.search(r"QuantLightningIndexer(?:V\d+)?Metadata", name, re.I):
+        return "Indexer执行计划metadata", "STATIC_KERNEL_FAMILY_MATCH", [entry(
+            "vllm_ascend/attention/dsa_v1.py", "AscendDSAMetadataBuilder._build_qli_metadata", 1012, ascend,
+            "native metadata op is called by this helper; layer/cache-group identity is not present in kernel name",
+            call_chain=["worker/v2/attn_utils.py:build_attn_metadata", "AscendDSAMetadataBuilder.build",
+                        "AscendDSAMetadataBuilder.build_req_metadata", "AscendDSAMetadataBuilder._build_qli_metadata"])]
+    if re.search(r"SparseAttnSharedkvMetadata|MixedQuantSparseFlashMlaMetadata", name, re.I):
+        return "Attention执行计划metadata", "STATIC_KERNEL_FAMILY_MATCH", [entry(
+            "vllm_ascend/attention/dsa_v1.py", "AscendDSAMetadataBuilder._build_sas_metadata", 944, ascend,
+            "KV plan supplies sparse-attention metadata op; same family serves different ratios, cache groups and windows",
+            call_chain=["worker/v2/attn_utils.py:build_attn_metadata", "AscendDSAMetadataBuilder.build",
+                        "AscendDSAMetadataBuilder.build_req_metadata", "AscendDSAMetadataBuilder._build_sas_metadata"])]
+    # Generic Cast/Copy/Gather/Mul/Div names occur in many functions.  Their
+    # position between metadata calls is not a unique Python attribution.
+    return str(getattr(task, "op_type", "") or task.name), "UNMAPPED", []
+
+
+def residual_focus_partition(parent, tasks, operators=None):
+    """Sweep half-open device intervals into an exact, all-stream wall partition.
+
+    Returns compact components plus locateable per-segment CSV evidence. A
+    kernel crossing the parent boundary is clipped; same-name concurrent calls
+    retain multiplicity. No anchor or optional kernel is required.
+    """
+    operators = operators if operators is not None else {}
+    left, right = int(parent["start_ns"]), int(parent["end_ns"])
+    if right <= left:
+        raise ValueError("focus parent must have a positive interval")
+    events, task_ids = collections.defaultdict(list), {}
+    for number, task in enumerate(sorted((task for task in tasks if task.start_ns < right
+            and task.end_ns > left and task.end_ns > task.start_ns),
+            key=lambda task: (task.start_ns, task.end_ns, task.row_index))):
+        signature = tuple(str(getattr(task, field, "") or "") for field in
+                          ("name", "op_type", "stream_id", "input_shapes", "output_shapes", "task_type"))
+        operator_id = "op_" + hashlib.sha256(json.dumps(signature, ensure_ascii=False).encode()).hexdigest()[:16]
+        if operator_id not in operators:
+            label, mapping_status, mapping = residual_focus_source_mapping(task)
+            operators[operator_id] = dict(zip(("name", "op_type", "stream_id", "input_shapes", "output_shapes", "task_type"), signature))
+            operators[operator_id].update(label=label, mapping_status=mapping_status,
+                source_function_mapping=mapping, example_row_indices=[])
+        examples = operators[operator_id]["example_row_indices"]
+        if task.row_index not in examples and len(examples) < 3:
+            examples.append(task.row_index)
+        task_ids[number] = (task, operator_id)
+        events[max(left, task.start_ns)].append((1, number))
+        events[min(right, task.end_ns)].append((-1, number))
+    events[left]
+    events[right]
+    active, components, segments, cursor = {}, {}, [], left
+    for point in sorted(events):
+        if point > cursor:
+            counts = collections.Counter(operator_id for _, operator_id in active.values())
+            signature = tuple(sorted(counts.items()))
+            previous = [task_ids[number] for direction, number in events[cursor] if direction < 0] if not active else []
+            following = [task_ids[number] for direction, number in events[point] if direction > 0] if not active else []
+            previous_ids = sorted({operator_id for _, operator_id in previous})
+            following_ids = sorted({operator_id for _, operator_id in following})
+            # Distinguish where each unrecorded gap sits. Combining every gap
+            # into a single bucket hides the actionable handoff that grew.
+            identity = ("active", signature) if active else ("gap", previous_ids, following_ids)
+            component_key = "coverage_" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:16]
+            if component_key not in components:
+                kind = "no_device_record" if not active else "single_operator" if len(active) == 1 else "concurrent_operators"
+                labels = [operators[key]["label"] + (" ×" + str(count) if count > 1 else "") for key, count in signature]
+                gap_label = ((" + ".join(operators[key]["label"] for key in previous_ids) or "父段开始")
+                             + " → " + (" + ".join(operators[key]["label"] for key in following_ids) or "父段结束")
+                             + "之间无设备记录（来源未知）")
+                mappings = []
+                for key, _ in signature:
+                    for mapping in operators[key]["source_function_mapping"]:
+                        if mapping not in mappings:
+                            mappings.append(mapping)
+                components[component_key] = {"component_key": component_key,
+                    "label": gap_label if not active else " + ".join(labels)
+                        + ("（并发）" if len(active) > 1 else ""),
+                    "kind": kind, "operator_ids": [key for key, _ in signature],
+                    "operator_multiplicity": dict(signature), "source_function_mapping": mappings,
+                    "previous_operator_ids": previous_ids, "following_operator_ids": following_ids,
+                    "mapping_status": "UNMAPPED" if not active or any(operators[key]["mapping_status"] == "UNMAPPED"
+                        for key in counts) else "STATIC_SOURCE_MAPPING", "duration_ns": 0, "segment_count": 0}
+            component = components[component_key]
+            component["duration_ns"] += point - cursor
+            component["segment_count"] += 1
+            segments.append({"component_key": component_key, "kind": component["kind"], "label": component["label"],
+                "start_ns": str(cursor), "end_ns": str(point), "duration_ns": point - cursor,
+                "duration_ms": (point - cursor) / 1e6,
+                "row_indices": sorted({row for task, _ in active.values()
+                    for row in (getattr(task, "row_indices", None) or [task.row_index])}),
+                "previous_row_indices": sorted({row for task, _ in previous
+                    for row in (getattr(task, "row_indices", None) or [task.row_index])}),
+                "following_row_indices": sorted({row for task, _ in following
+                    for row in (getattr(task, "row_indices", None) or [task.row_index])}),
+                "operator_ids": component["operator_ids"]})
+        # End events precede start events at the same timestamp. All events are
+        # applied before measuring the next nonempty interval.
+        for direction, number in sorted(events[point]):
+            if direction < 0:
+                active.pop(number, None)
+            else:
+                active[number] = task_ids[number]
+        cursor = point
+    if sum(row["duration_ns"] for row in segments) != right - left:
+        raise ValueError("focus coverage does not close to parent")
+    return {"components": list(components.values()), "segments": segments,
+            "closure_error_ns": sum(row["duration_ns"] for row in segments) - (right - left)}
+
+
+def residual_focus_diagnostics(stages, windows, index, rank, directory, prefix):
+    """Preserve source-rank per-step changes and an additive fine breakdown."""
+    tail_windows = [window for window in windows if window["window_key"] == "draft_to_nextmain"]
+    operators, stage_reports, step_export = {}, [], []
+    segment_path = Path(directory) / (prefix + "-focus-segments.csv")
+    step_path = Path(directory) / (prefix + "-focus-steps.csv")
+    segment_fields = ("rank", "step_index", "round_id", "stage_key", "component_key", "kind", "label",
+                      "start_ns", "end_ns", "duration_ns", "duration_ms", "row_indices", "operator_ids",
+                      "previous_row_indices", "following_row_indices")
+    with residual_csv(segment_path, segment_fields) as writer:
+        for stage_key, label in (("main_inputs", "下一主模型KV与输入准备"),
+                                 ("main_metadata", "下一主metadata及输入映射准备")):
+            parents = [row for row in stages if row.get("level") == 0 and row["stage_key"] == stage_key]
+            by_round = collections.defaultdict(list)
+            for parent in parents:
+                by_round[parent.get("round_id")].append(parent)
+            samples, component_catalog, component_values = [], {}, collections.defaultdict(dict)
+            for step_number, window in enumerate(tail_windows, 1):
+                # Timestamp containment disambiguates repeated or missing IDs.
+                candidates = [row for row in by_round[window.get("round_id")] if
+                    int(window["start_ns"]) <= int(row["start_ns"]) < int(row["end_ns"]) <= int(window["end_ns"])]
+                parent = candidates[0] if len(candidates) == 1 and candidates[0]["status"] == "MATCHED" else None
+                reason = None
+                if not candidates:
+                    reason = "missing " + stage_key + " parent interval in retained step"
+                    if window.get("stage_reason"):
+                        reason += "; window: " + str(window["stage_reason"])
+                elif len(candidates) > 1:
+                    reason = "ambiguous " + stage_key + " parent intervals: observed " + str(len(candidates))
+                elif parent is None:
+                    reason = "parent status=" + str(candidates[0].get("status")) + "; " + str(
+                        candidates[0].get("reason") or "no parser reason provided")
+                sample = {"step_index": step_number, "round_id": window.get("round_id"),
+                          "status": "MATCHED" if parent else "UNAVAILABLE", "reason": reason,
+                          "start_ns": None, "end_ns": None,
+                          "duration_ms": None, "recorded_busy_ms": None, "no_recorded_ms": None,
+                          "kernel_sum_ms": None, "task_count": None, "component_durations_ms": {}}
+                if parent is not None:
+                    left, right = int(parent["start_ns"]), int(parent["end_ns"])
+                    tasks = index.overlapping(left, right)
+                    partition = residual_focus_partition(parent, tasks, operators)
+                    sample.update({field: parent.get(field) for field in
+                        ("start_ns", "end_ns", "duration_ms", "recorded_busy_ms", "no_recorded_ms", "kernel_sum_ms", "task_count")})
+                    sample["closure_error_ns"] = partition["closure_error_ns"]
+                    for component in partition["components"]:
+                        key = component["component_key"]
+                        component_catalog[key] = component
+                        component_values[key][step_number] = component["duration_ns"] / 1e6
+                        sample["component_durations_ms"][key] = component["duration_ns"] / 1e6
+                    for segment in partition["segments"]:
+                        writer.writerow({"rank": rank, "step_index": step_number, "round_id": window.get("round_id"),
+                            "stage_key": stage_key, **{key: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                                if isinstance(value, (dict, list)) else value for key, value in segment.items()}})
+                samples.append(sample)
+                step_export.append({"rank": rank, "stage_key": stage_key, **sample})
+            complete = bool(samples) and all(sample["status"] == "MATCHED" for sample in samples)
+            summary = []
+            parent_total = sum(sample["duration_ms"] for sample in samples if sample["duration_ms"] is not None)
+            for key, component in component_catalog.items():
+                values = [component_values[key].get(sample["step_index"], 0.) for sample in samples
+                          if sample["status"] == "MATCHED"]
+                summary.append({field: value for field, value in component.items() if field not in ("duration_ns", "segment_count")} | {
+                    "rounds": len(samples), "observed_steps": len(component_values[key]),
+                    "duration_ms_mean": statistics.fmean(values) if complete else None,
+                    "duration_ms_p50": statistics.median(values) if complete else None,
+                    "duration_ms_p90": quantile(values, .9) if complete else None,
+                    "duration_ms_max": max(values) if complete else None,
+                    "share_of_parent": sum(values) / parent_total if complete and parent_total else None})
+            summary.sort(key=lambda row: (-(row["duration_ms_mean"] or 0.), row["label"], row["component_key"]))
+            stage_report = {"stage_key": stage_key, "label": label, "rounds": len(samples),
+                "observed_steps": sum(sample["status"] == "MATCHED" for sample in samples),
+                "status": "MATCHED" if complete else "PARTIAL" if any(sample["status"] == "MATCHED" for sample in samples) else "UNAVAILABLE",
+                "per_step": samples, "summary": summary,
+                "duration_ms_p50": statistics.median(sample["duration_ms"] for sample in samples) if complete else None,
+                "duration_ms_p90": quantile([sample["duration_ms"] for sample in samples], .9) if complete else None,
+                "duration_ms_max": max(sample["duration_ms"] for sample in samples) if complete else None}
+            for field in ("duration_ms", "recorded_busy_ms", "no_recorded_ms"):
+                values = [sample[field] for sample in samples]
+                stage_report[field + "_mean"] = statistics.fmean(values) if complete and all(value is not None for value in values) else None
+            stage_reports.append(stage_report)
+    write_csv(step_path, step_export)
+    return {"version": "1", "rank": rank, "scope": RESIDUAL_FOCUS_SCOPE,
+            "status": "MATCHED" if stage_reports and all(stage["status"] == "MATCHED" for stage in stage_reports) else "PARTIAL",
+            "stages": stage_reports, "operators": operators, "segments_csv": str(segment_path), "steps_csv": str(step_path)}
+
+
 def residual_focus_substages(parents, tasks):
     """Refine observed input and metadata paths; never invent missing anchors."""
     result = []
@@ -2835,6 +3164,7 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
         for row in windows + stages:
             row.update(dict.fromkeys(RESIDUAL_DMA_NUMBERS), trace_dma_status="UNAVAILABLE")
     stage_path = directory / (prefix + "-stages.csv")
+    focus = residual_focus_diagnostics(stages, windows, index, rank, directory, prefix)
     residual_progress(progress, "按有序执行阶段导出过渡耗时，核对逐窗口闭合")
     fields = tuple(key for key in stages[0] if not key.startswith("_"))
     with residual_csv(stage_path, ("rank", *fields)) as writer:
@@ -2856,6 +3186,7 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
             "windows": windows, "summary": summary, "device_tasks_csv": str(device), "host_events_csv": host_path,
             "stages_csv": str(stage_path), "stage_summary": residual_stage_summary(stages, windows, 0),
             "substage_summary": residual_stage_summary(stages, windows, 1), "stage_basis": RESIDUAL_STAGE_BASIS,
+            "focus_diagnostics": focus,
             **sources,
             "trace": trace, "residual_ms_mean": statistics.fmean(windows[index]["cycle_residual_ms"] for index in range(0, len(windows), 2))}
 
@@ -3061,6 +3392,209 @@ _LM_OPERATOR_NOTE = (
     "目标仅保留源覆盖并另列父估算的具名模型增减项，不向单个kernel分摊；负增量保留，非实测优化收益。"
 )
 
+_LM_PMU_NOTE = (
+    "PMU仅为源采样实际kernel整次调用的指标，按整次Duration加权；不乘目标层数、通信或TopK倍率。"
+    "阶段裁剪只改变耗时账本，不能测出该子区间的局部PMU；跨阶段引用同次调用时不可相加。"
+    "覆盖率分母为本项实际相交的唯一原始调用及其整次Duration，逐指标另列已知/总样本；"
+    "未采集、非法或冲突值保持未知，观测到的0保留。流水可重叠，比例不能相加；"
+    "bound为保守的流水倾向，非因果证明；MTE高不等于HBM饱和，cube_utilization不是MFU。"
+)
+_LM_PMU_SOURCES = [
+    "https://github.com/mindstudio-docs/master/blob/master/msprof/docs/zh/user_guide/profile_data_file_references.md",
+    "https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/programug/Ascendcopdevg/atlas_ascendc_best_practices_10_0009.html",
+]
+
+
+def _lm_operator_pmu_observation(task, start, end, scope):
+    raw = getattr(task, "pmu", None)
+    raw = raw if isinstance(raw, dict) else {}
+    # Identity excludes the stage and clipping bounds: one native call may
+    # intersect multiple reference intervals, but must not bias its PMU mean.
+    identity = tuple(scope.get(field) for field in ("rank",)) + tuple(getattr(task, field, None)
+        for field in ("row_index", "start_ns", "end_ns", "stream_id", "task_id"))
+    metrics = {}
+    raw_metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {}
+    for field, value in raw_metrics.items():
+        if field not in _A_PMU_FIELDS or isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if math.isfinite(value) and value >= 0 and (_A_PMU_FIELDS[field] != "ratio" or value <= 1):
+            metrics[field] = value
+    invalid = [field for field in raw.get("invalid_fields", ()) or () if field in _A_PMU_FIELDS]
+    for field in invalid:
+        metrics.pop(field, None)
+    return {"identity": identity, "duration_ns": task.end_ns - task.start_ns,
+            "clipped": start != task.start_ns or end != task.end_ns,
+            "metrics": metrics, "invalid_fields": invalid,
+            "core_type": str(raw.get("core_type") or getattr(task, "task_type", None) or "")}
+
+
+def _lm_pmu_core_kind(core_type, metrics):
+    text = re.sub(r"[^A-Z0-9]", "", core_type.upper())
+    if "AICPU" in text:
+        return "aicpu"
+    if "MIX" in text:
+        return "mix"
+    if "VECTOR" in text or text in ("AIV", "AIVECTORCORE"):
+        return "aiv"
+    if text in ("AICORE", "AIC", "CUBE", "AICUBECORE"):
+        return "aic"
+    # Names alone do not prove the active accelerator. Positive exported
+    # counters can supply a conservative fallback; all-zero counters cannot.
+    aic = any(metrics.get("aic_" + pipe + "_ratio", 0) > 0 for pipe in ("mac", "scalar", "mte1", "mte2", "mte3", "fixpipe"))
+    aiv = any(metrics.get("aiv_" + pipe + "_ratio", 0) > 0 for pipe in ("vec", "scalar", "mte2", "mte3"))
+    return "mix" if aic and aiv else "aic" if aic else "aiv" if aiv else "unknown"
+
+
+def _lm_pmu_pipeline_direction(prefix, metrics):
+    """Conservative heuristics; these thresholds are not hardware limits."""
+    compute = prefix + ("_mac_ratio" if prefix == "aic" else "_vec_ratio")
+    moves = [prefix + "_" + pipe + "_ratio" for pipe in ("mte1", "mte2", "mte3", "fixpipe")]
+    scalar = prefix + "_scalar_ratio"
+    values = {field: metrics[field]["value"] for field in (compute, *moves, scalar) if field in metrics}
+    if not values or max(values.values()) == 0:
+        return "unknown", "未观察到有效流水活动", []
+    def shown(field):
+        return field + "=" + format(values[field] * 100, ".1f") + "%"
+    evidence = [shown(field) for field in sorted(values, key=values.get, reverse=True)[:3]]
+    comp = values.get(compute)
+    mover = max((field for field in moves if field in values), key=values.get, default=None)
+    transfer = values[mover] if mover else None
+    compute_name = "矩阵计算" if prefix == "aic" else "向量计算"
+    if comp is not None and transfer is not None and min(comp, transfer) >= .85 and abs(comp - transfer) < .10:
+        return "mixed", compute_name + "/搬运同时高占用", evidence
+    if (comp is not None and comp >= .90 and transfer is not None and comp - transfer >= .10
+            and comp >= values.get(scalar, 0) + .10):
+        return "compute", "偏" + compute_name + "流水限制", evidence
+    if (transfer is not None and transfer >= .75 and comp is not None and transfer - comp >= .15
+            and transfer >= values.get(scalar, 0) + .10):
+        name = ("读入搬运" if "mte2" in mover else "写出搬运" if "mte3" in mover else "片内搬运")
+        return "transfer", "偏" + name + "流水限制", evidence
+    if values.get(scalar, 0) >= .60 and values[scalar] - max(comp or 0, transfer or 0) >= .10:
+        return "scalar", "标量/控制流水突出", evidence
+    if comp is not None and comp >= .75:
+        return "busy_compute", compute_name + "流水偏忙，bound尚不确定", evidence
+    if transfer is not None and transfer >= .75:
+        return "busy_transfer", "搬运流水突出，bound尚不确定", evidence
+    return "unknown", "无单一流水显著主导，需核对依赖/分核/启动开销", evidence
+
+
+def _lm_operator_pmu_bound(member, metrics, coverage, samples):
+    label = " ".join(str(member.get(field) or "") for field in ("name", "op_type", "task_type")).upper()
+    result = {"code": "unknown", "label": "PMU证据不足，bound未知", "confidence": "低", "evidence": []}
+    evidence = result["evidence"]
+    if re.search(r"MOEDISTRIBUTE|HCCL|ALLTOALL|ALLGATHER|ALLREDUCE|REDUCESCATTER|SENDRECV", label):
+        result.update(code="communication_mixed", label="通信/路由/同步复合任务，PMU不能拆出通信瓶颈")
+        evidence.append("需结合跨rank时间线和通信明细；不能由MAC低推断HBM或CPU瓶颈")
+        return result
+    if member.get("record_kind") == "synchronization_control":
+        result.update(code="synchronization_control", label="同步/控制任务，计算搬运bound不适用")
+        return result
+    kinds = {_lm_pmu_core_kind(sample["core_type"], sample["metrics"]) for sample in samples}
+    if kinds == {"aicpu"}:
+        result.update(code="aicpu", label="AICPU任务，AIC/AIV流水不能判断服务器CPU瓶颈")
+        return result
+    cores = set()
+    if "mix" in kinds or "aic" in kinds:
+        cores.add("aic")
+    if "mix" in kinds or "aiv" in kinds:
+        cores.add("aiv")
+    directions = [(core, *_lm_pmu_pipeline_direction(core, metrics)) for core in sorted(cores)]
+    for field, title in (("aicore_time_us", "AIC核内时间"), ("aiv_time_us", "AIV核内时间")):
+        if field in metrics:
+            evidence.append(title + "=" + format(metrics[field]["value"], ".3f") + "μs（整调用Duration加权；非互斥墙钟时间）")
+    for core, _, message, values in directions:
+        evidence.append(core.upper() + "：" + message + ("；" + "，".join(values) if values else ""))
+    usable = [(core, code, message) for core, code, message, _ in directions if code != "unknown"]
+    if len(usable) == 1:
+        core, code, message = usable[0]
+        result.update(code=core + "_" + code, label=core.upper() + " " + message)
+    elif usable:
+        result.update(code="mixed_core", label="AIC/AIV联合任务：" + "；".join(core.upper() + " " + message for core, _, message in usable))
+        evidence.append("AIC与AIV的比例分母不同，不能直接相加或凭比例比较谁决定总时长")
+    elif directions and any(value["value"] > 0 for field, value in metrics.items() if field.endswith("_ratio")):
+        result["label"] = "流水无明确主导，需查依赖/分核/调度，bound待确认"
+    if usable:
+        result["confidence"] = "中"
+    relevant = [field for field in metrics if any(field.startswith(core + "_") for core in cores)
+                and field.endswith("_ratio")]
+    for core in sorted(cores):
+        required = [core + ("_mac_ratio" if core == "aic" else "_vec_ratio"), core + "_mte2_ratio", core + "_mte3_ratio"]
+        if any(field not in metrics for field in required):
+            evidence.append(core.upper() + " 计算/读入/写出指标未采齐，方向判断受限")
+            result["confidence"] = "低"
+    if coverage["duration_coverage"] < .8 or any(metrics[field]["duration_coverage"] < .8 for field in relevant):
+        evidence.append("PMU已知样本Duration覆盖不足80%；缺失指标未补0")
+        result["confidence"] = "低"
+    total = sum(sample["duration_ns"] for sample in samples)
+    short = sum(sample["duration_ns"] for sample in samples if sample["duration_ns"] <= 20000)
+    if total and short / total >= .5:
+        evidence.append("至少半数耗时来自≤20μs短任务，启动/调度/响应开销需单独核对")
+        result["confidence"] = "低"
+    gap = 0
+    for sample in samples:
+        duration_us = sample["duration_ns"] / 1000
+        kind = _lm_pmu_core_kind(sample["core_type"], sample["metrics"])
+        fields = {"aic": ("aicore_time_us",), "aiv": ("aiv_time_us",),
+                  "mix": ("aicore_time_us", "aiv_time_us")}.get(kind, ())
+        times = [sample["metrics"].get(field) for field in fields]
+        # An unrelated accelerator's time says nothing about the active core.
+        # A MIX task can spend its whole duration on the unobserved half; both
+        # core times are required before contrasting its task/core spans.
+        if not times or any(value is None for value in times):
+            continue
+        active = [value for value in times if value is not None and value > 0]
+        if active and max(active) < .65 * duration_us and duration_us - max(active) > 3:
+            gap += sample["duration_ns"]
+    if total and gap / total >= .5:
+        result.update(code="task_core_time_gap", label="任务跨度显著大于核内时间，需查调度/分核不均/同步", confidence="低")
+        evidence.append("aicore_time/aiv_time是按分核周期推导的时间，并非任务Duration；差值不能直接归因等待或CPU")
+    if any(metrics[field].get("max", 0) - metrics[field].get("min", 0) >= .35 for field in relevant):
+        evidence.append("同指纹调用的流水比例差异≥35个百分点，均值可能掩盖不同执行状态")
+        result["confidence"] = "低"
+    if coverage["clipped_calls"]:
+        evidence.append("存在跨父阶段裁剪：本表引用整次调用PMU，并非该阶段局部测量")
+    return result
+
+
+def _lm_operator_pmu_summary(member, observations):
+    # The same physical call can be encountered in two adjacent reference
+    # layers/stages. Deduplicate before weighting by its original Duration.
+    unique = {}
+    for item in observations:
+        if item["identity"] not in unique:
+            unique[item["identity"]] = dict(item)
+        else:
+            unique[item["identity"]]["clipped"] |= item["clipped"]
+    samples = list(unique.values())
+    total_ns = sum(sample["duration_ns"] for sample in samples)
+    known = [sample for sample in samples if any(field.endswith("_ratio") or field in ("aicore_time_us", "aiv_time_us")
+                                              for field in sample["metrics"])]
+    known_ns = sum(sample["duration_ns"] for sample in known)
+    coverage = {"known_calls": len(known), "total_calls": len(samples),
+                "known_duration_ms": known_ns / 1e6, "total_duration_ms": total_ns / 1e6,
+                "duration_coverage": known_ns / total_ns if total_ns else 0.,
+                "clipped_calls": sum(sample["clipped"] for sample in samples),
+                "invalid_calls": sum(bool(sample["invalid_fields"]) for sample in samples)}
+    metrics = {}
+    for field in _A_PMU_FIELDS:
+        available = [sample for sample in samples if field in sample["metrics"]]
+        if not available:
+            continue
+        duration_ns = sum(sample["duration_ns"] for sample in available)
+        if not duration_ns:
+            continue
+        values = [sample["metrics"][field] for sample in available]
+        metrics[field] = {"value": math.fsum(sample["metrics"][field] * sample["duration_ns"] / duration_ns for sample in available),
+            "unit": _A_PMU_FIELDS[field], "known_calls": len(available), "total_calls": len(samples),
+            "known_duration_ms": duration_ns / 1e6, "total_duration_ms": total_ns / 1e6,
+            "duration_coverage": duration_ns / total_ns if total_ns else 0., "min": min(values), "max": max(values)}
+    return {"metrics": metrics, "coverage": coverage,
+            "bound": _lm_operator_pmu_bound(member, metrics, coverage, samples),
+            "scope_note": _LM_PMU_NOTE, "sources": _LM_PMU_SOURCES,
+            "core_types": sorted({sample["core_type"] for sample in samples if sample["core_type"]}),
+            "aggregation": "native_whole_call_duration_weighted",
+            "heuristics": "方向阈值为审慎提示规则：计算≥90%且领先搬运≥10个百分点；搬运≥75%且领先计算≥15个百分点；非硬件bound认证"}
+
 
 def _lm_operator_member(task, time_index):
     values = tuple(getattr(task, field, None if field in ("stream_id", "task_type") else "")
@@ -3127,8 +3661,9 @@ def _lm_operator_stage(stage, time_index, scope):
             examples[key].append((a, b, _lm_operator_example(task, a, b, scope)))
             if key not in kernels:
                 kernels[key] = {"member": member, "durations_ns": [],
-                    "example": _lm_operator_example(task, a, b, scope)}
+                    "example": _lm_operator_example(task, a, b, scope), "pmu_observations": []}
             kernels[key]["durations_ns"].append(b - a)
+            kernels[key]["pmu_observations"].append(_lm_operator_pmu_observation(task, a, b, scope))
         active, rows = collections.Counter(), {}
         points = sorted(events)
         for index, a in enumerate(points):
@@ -3212,8 +3747,10 @@ def _lm_operator_source_means(source_rounds):
                         rows[row["key"]]["duration_ns"] += row["duration_ns"]
                     for key, kernel in stage["kernels"].items():
                         if key not in kernels:
-                            kernels[key] = {"member": kernel["member"], "durations_ns": [], "example": kernel["example"]}
+                            kernels[key] = {"member": kernel["member"], "durations_ns": [], "example": kernel["example"],
+                                            "pmu_observations": []}
                         kernels[key]["durations_ns"].extend(kernel["durations_ns"])
+                        kernels[key]["pmu_observations"].extend(kernel.get("pmu_observations", []))
                 item["rows"] = [{key: value for key, value in row.items() if key != "duration_ns"}
                                 | {"source_ms": row["duration_ns"] / denominator / 1e6} for row in rows.values()]
                 item["kernels"] = [dict(kernel["member"],
@@ -3221,7 +3758,8 @@ def _lm_operator_source_means(source_rounds):
                     kernel_sum_ms=sum(kernel["durations_ns"]) / denominator / 1e6,
                     duration_mean_ms=statistics.fmean(kernel["durations_ns"]) / 1e6,
                     duration_p90_ms=quantile(kernel["durations_ns"], .9) / 1e6,
-                    example=kernel["example"]) for kernel in kernels.values()]
+                    example=kernel["example"], pmu=_lm_operator_pmu_summary(kernel["member"], kernel["pmu_observations"]))
+                    for kernel in kernels.values()]
                 item["kernels"].sort(key=lambda row: (-row["kernel_sum_ms"], row["key"]))
                 item.update(status="MATCHED", layer_round_samples=denominator)
             except (ValueError, KeyError, TypeError, ArithmeticError) as error:
@@ -3843,6 +4381,20 @@ def iter_report_rows(report, kind):
                 diagnostic = capture.get('layer_diagnostics' if kind == 'layer_stage_summary' else 'swa_diagnostics') or {}
                 yield from ({'case': name, 'rank': capture['rank'], **item}
                             for item in diagnostic.get('stage_summary', []))
+        elif kind in ('step_residual_focus_steps', 'step_residual_focus_summary'):
+            for capture in case.get('measurements', []):
+                focus = (capture.get('step_residuals') or {}).get('focus_diagnostics') or {}
+                for stage in focus.get('stages', []):
+                    identity = {'case': name, 'rank': capture['rank'], 'step_kind': 'retained_hc_cycle',
+                                'parent_stage_key': stage.get('stage_key'), 'parent_label': stage.get('label')}
+                    if kind == 'step_residual_focus_steps':
+                        # Exact segment evidence lives in the per-capture CSV;
+                        # keep this table directly useful for step comparisons.
+                        yield from ({**identity, **{key: value for key, value in item.items()
+                                     if key not in ('components', 'component_durations_ms')}}
+                                    for item in stage.get('per_step', []))
+                    else:
+                        yield from ({**identity, **item} for item in stage.get('summary', []))
         elif kind in ('step_residual_windows', 'step_residual_summary', 'step_residual_sources',
                       'step_residual_stages', 'step_residual_substages'):
             for capture in case.get('measurements', []):
@@ -3951,6 +4503,9 @@ def export_report(report, out, reference_rows, progress=None):
     if any('step_residuals' in capture for case in report['cases'] for capture in case.get('measurements', [])):
         kinds += ['step_residual_windows', 'step_residual_summary', 'step_residual_sources',
                   'step_residual_stages', 'step_residual_substages']
+    if any((capture.get('step_residuals') or {}).get('focus_diagnostics')
+           for case in report['cases'] for capture in case.get('measurements', [])):
+        kinds += ['step_residual_focus_steps', 'step_residual_focus_summary']
     if any('swa_diagnostics' in capture for case in report['cases'] for capture in case.get('measurements', [])):
         kinds += ['swa_stage_summary']
     if any('layer_diagnostics' in capture for case in report['cases'] for capture in case.get('measurements', [])):

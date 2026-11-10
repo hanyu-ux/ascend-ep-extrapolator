@@ -38,7 +38,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-三个运行脚本应放在同一目录。当前版本：统计 `20261108.1.operator_drilldown`、Excel 生成器 `20261108.2.full_operator_labels`、写入器 `20261104.1.line_charts`。
+三个运行脚本应放在同一目录。当前版本：统计 `20261110.1.u_focus_step_pmu`、Excel 生成器 `20261110.1.u_focus_step_pmu`、写入器 `20261104.1.line_charts`。
 
 ## 快速运行
 
@@ -235,6 +235,12 @@ TPOT（ms/token） = R / Neff
 
 这些视图用于定位具体排查项，尚不证明真实关键路径或优化收益。通信、GMM增量沿用现有外推假设，单独展示；无任务记录的间隔不直接认定为CPU瓶颈。同名但不同形状或dtype的算子分别保留，不凭名称猜测Q/KV作用，也不拆分融合kernel内部耗时。旧JSON缺少算子证据时保留原阶段图并提示重新统计；必须用新版核心处理原CSV，单独重绘不能补出算子证据。详见[算子下钻的读取口径](docs/usage.md#算子下钻的读取口径)。
 
+方法1、方法2页还提供“下一主模型 KV 与输入准备”和“下一主 metadata 及输入映射准备”的额外细分：表格、横向柱状图和源码函数入口对应。细项按真实设备区间拆成单算子覆盖、具名并发组合和无记录间隙，合计等于原父段；函数入口是带版本依据的源码映射，不是 Python 函数实测耗时。
+
+两段的逐 step 表和折线使用本方法已选中的同一个 rank，展示各个保留 HC 周期的变化，并列均值、P50、P90和最大值。这里的 step 是保留周期及其原始 round_id，不冒充 trace 中的 `ProfilerStep`；不会逐点改选其他 rank。未识别 step 保留空值和原因，折线断开，不补0。
+
+CSA、HCA、SWA 的源实测 Top8 热点后增加 PMU 指标和 bound 方向表，包含矩阵/向量计算、标量、读入/写出及片内搬运流水、核内时间、分核数和指标覆盖率等。指标按源 kernel **完整调用 Duration 加权**，不乘目标层数或外推倍率；跨阶段裁剪仅定位耗时，不能测得局部 PMU。bound 是有证据说明及置信度的流水倾向，MTE2 高不等于 HBM 已饱和，`cube_utilization` 也不是 MFU。需要原 CSV 已含相应 PMU 列；没有采集的数据继续显示未知。更新后应重新运行核心统计，旧 JSON 只重绘不能补出这些证据。
+
 后两组 U 子阶段仍沿用源实测、保留一次，不乘目标层数。旧 JSON 缺少目标阶段估算时，需要用新版核心重新统计采样；仅重绘不能生成这些估算。
 
 - 当前外推直接使用同 BS、同 rank、同轮的 `U目标=U源`，不乘 EP 倍率，也不乘主层数；没有证明 EP 扩大后 U 一定不变。
@@ -261,9 +267,10 @@ Context-KV 的 `KvCompressEpilog` 在融合结果有 padding 时，允许各草�
 | `rank_estimates.csv` / `round_estimates.csv` | 逐 rank 与逐轮外推 |
 | `boundary_accounting.csv` / `compute_evidence.csv` | 边界计账与路由 GMM 证据 |
 | `step_residual_stages.csv` / `step_residual_substages.csv` | U15 父阶段与 Markov、下一主输入及 metadata 子阶段汇总 |
+| `step_residual_focus_steps.csv` / `step_residual_focus_summary.csv` | 两个下一主准备阶段的逐 rank、逐 HC 周期变化及互斥细分汇总 |
 | `swa_stage_summary.csv` | 每 case、rank、草稿层的 SWA 10 段统计 |
 | `layer_stage_summary.csv` | 每 case、rank、主/草稿层的 CSA/HCA/SWA 10 段统计 |
-| `step_residual_details/` | 各 rank 的原始设备明细、精确阶段边界、来源链及 `*-layer-stages.csv`、兼容的 `*-swa-stages.csv` |
+| `step_residual_details/` | 各 rank 的原始设备明细、精确阶段边界、来源链、两段关注区间的逐步与分段证据，以及 `*-layer-stages.csv`、兼容的 `*-swa-stages.csv` |
 
 Excel 的 BS 折线取 `config.bs` 数值排序；其他声明条件不同则分组。重复 BS 保留原值但不合并绘线；单点组只显示表格；未知值保留空白并断线，不补0。顶部索引列出全部采样组合，避免把单独分组误认为遗漏。
 
