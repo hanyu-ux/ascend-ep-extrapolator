@@ -19,7 +19,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261110.1.u_focus_step_pmu"
+RENDERER_VERSION = "20261110.2.bs_s_sweeps"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -299,7 +299,7 @@ def _breakdown_for_chart(method):
 
 
 BS_METRICS = (("per_device_tokens_s", "单卡吞吐", "token/s/物理卡"),
-              ("cycle_ms", "完整周期", "ms/轮次"), ("tpot_ms", "TPOT", "ms/token"))
+              ("cycle_ms", "完整周期（ITL代理）", "ms/轮次"), ("tpot_ms", "TPOT", "ms/token"))
 BS_PARTS = (("main_layer_envelopes", "主模型层区间", "168B8D"),
             ("main_internal_gaps", "主模型层间衔接", "DDA13A"),
             ("draft_layer_envelopes", "草稿层区间", "3975B8"),
@@ -320,6 +320,17 @@ BS_INDEX_HEADERS = ["配置BS\n（每DP请求数）", "BS对比组", "采样组�
 BS_INDEX_SPANS = ((1, 1), (2, 3), (4, 6), (7, 12))
 BS_COMPARISON_SCOPE = ("按报告已声明的非BS条件及观测rank集合分组；横轴取config.bs，按数值升序、等距展示档位。"
     "每个点沿用该BS、该方法核心选中的rank，rank可随BS改变；缺少结果留空并断线，不补0或插值。")
+SWEEP_METRICS = (BS_METRICS[0], BS_METRICS[2], BS_METRICS[1])
+ITL_PROXY_SCOPE = ("完整周期作为每轮输出间隔的ITL代理值（ms/轮），不是实测逐token发送间隔；"
+    "TPOT为周期/配置Neff（ms/token），单卡吞吐按物理卡均摊。")
+S_COMPARISON_SCOPE = ("固定BS，横轴取声明的草稿候选token数S，按数值升序、等距展示档位。"
+    "每点保留各自配置Neff和各方法原选rank；不从case名称猜S，不重选rank；缺失值留空断线。")
+S_OVERVIEW_HEADERS = ["投机步长S", "采样组合", "SAL / Neff\n（含bonus）", "方法一rank / 状态",
+    "方法一单卡吞吐\n(token/s/卡)", "方法一TPOT\n(ms/token)", "方法一ITL代理\n(ms/轮)",
+    "方法二rank / 状态", "方法二单卡吞吐\n(token/s/卡)", "方法二TPOT\n(ms/token)", "方法二ITL代理\n(ms/轮)"]
+S_OVERVIEW_SPANS = ((1, 1), (2, 3), *[(col, col) for col in range(4, 13)])
+SWEEP_PART_SPANS = S_OVERVIEW_SPANS
+SOURCE_METRIC_SPANS = ((1, 1), (2, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 12))
 CASE_PARAMETERS_TITLE = "采样配置对照"
 CASE_PARAMETERS_HEADERS = ["采样组合", "配置BS", "草稿S\n（num_speculative_tokens）", "SAL / Neff\n（含bonus）",
                            "声明的平均草稿接受比例\n（配置假设，非实测）"]
@@ -343,7 +354,7 @@ def _parameter_text(value):
 def _case_parameter_values(case):
     """Display declared inputs; the consistency check never supplies a rate."""
     config = case.get("config") or {}
-    bs, draft, effective = (config.get(key) for key in ("bs", "draft_tokens", "effective_tokens_per_round"))
+    bs, draft, effective = config.get("bs"), _s_value(case), config.get("effective_tokens_per_round")
     rate = config.get("acceptance")
     declared_rate = "未声明"
     if (config.get("acceptance_semantics") == "mean_accepted_draft_fraction"
@@ -419,6 +430,87 @@ def _bs_chart_reason(group):
         return "相同BS存在多条采样组合，未合并趋势；保留全部原值，不取首条、末条或平均。重复BS=" + _text(group["duplicate_bs"])
     if len(group["cases"]) < 2:
         return "本组仅有一个BS，保留单点表格；至少两个不同BS才能展示变化。"
+    return None
+
+
+def _s_value(case):
+    """Read only declared S, rejecting conflicting aliases and bool values."""
+    config = case.get("config") or {}
+    primary = config.get("draft_tokens")
+    alias = config.get("num_speculative_tokens")
+    if "draft_tokens" in config and "num_speculative_tokens" in config:
+        if type(primary) is not int or type(alias) is not int or primary != alias:
+            return None
+    value = primary if "draft_tokens" in config else alias
+    return value if type(value) is int and value >= 0 else None
+
+
+def _s_comparison_groups(report):
+    """Group fixed-BS S sweeps without silently treating Neff as measured acceptance."""
+    groups = {}
+    excluded = {"name", "path", "paths", "inputs", "target_model", "sample_model", "source_model",
+                "draft_tokens", "num_speculative_tokens", "effective_tokens_per_round",
+                "synthetic_acceptance_length", "synthetic_acception_length"}
+    for case in report["cases"]:
+        config = case.get("config") or {}
+        bs = config.get("bs")
+        valid_bs = type(bs) is int and bs > 0
+        rate = config.get("acceptance")
+        explicit_rate = (config.get("acceptance_semantics") == "mean_accepted_draft_fraction"
+                         and _number(rate) and 0 <= rate <= 1)
+        policy = "fixed_acceptance_fraction" if explicit_rate else "per_case_configured_neff"
+        ranks = sorted({str(item["rank"]) for item in case.get("captures") or case.get("measurements") or []
+                        if item.get("rank") is not None})
+        coverage = []
+        for identity in ("method1", "method2"):
+            original = _method(case, identity).get("coverage") or {}
+            fields = {key: original[key] for key in ("captured_ranks", "expected_ranks", "source_logical_devices", "complete")
+                      if key in original}
+            if "captured_rank_names" in original:
+                fields["captured_rank_names"] = sorted(original["captured_rank_names"])
+            coverage.append(fields)
+        signature = json.dumps({"source_model": case.get("source_model"), "target_model": case.get("target_model"),
+            "conditions": {key: value for key, value in config.items() if key not in excluded and not key.startswith("_")},
+            "output_policy": policy, "observed_ranks": ranks, "coverage": coverage,
+            # Missing BS never establishes a shared fixed-BS experiment.
+            "invalid_fixed_bs_case": None if valid_bs else case["name"]},
+            ensure_ascii=False, sort_keys=True, allow_nan=False)
+        groups.setdefault(signature, {"cases": [], "output_policy": policy})["cases"].append(case)
+    result = []
+    for number, group in enumerate(groups.values(), 1):
+        group["cases"] = sorted(group["cases"], key=lambda case:
+            (_s_value(case) if _s_value(case) is not None else math.inf, case["name"]))
+        counts = collections.Counter(_s_value(case) for case in group["cases"] if _s_value(case) is not None)
+        group["duplicate_s"] = sorted(value for value, count in counts.items() if count > 1)
+        group["invalid_s"] = [case["name"] for case in group["cases"] if _s_value(case) is None]
+        group["invalid_bs"] = [case["name"] for case in group["cases"]
+            if type((case.get("config") or {}).get("bs")) is not int or case["config"]["bs"] <= 0]
+        config = group["cases"][0].get("config") or {}
+        group["label"] = ("S对比组" + str(number) + " · " + _case_scope(group["cases"][0])
+            + "；固定BS=" + (_parameter_text(config.get("bs")) if not group["invalid_bs"] else "无效或未声明")
+            + "；S=" + _text([_s_value(case) for case in group["cases"]]))
+        if group["output_policy"] == "fixed_acceptance_fraction":
+            group["note"] = ("固定BS；声明的平均草稿接受比例r=" + _parameter_text(config.get("acceptance"))
+                + "（配置假设，非实测）；各S沿用case配置Neff，含bonus，不从Neff反推实测接受率。")
+        else:
+            group["note"] = ("固定BS，各S沿用case配置Neff；非固定接受率的单变量对照，"
+                "不能把变化仅归因于S；Neff含bonus，不从长度反推实测接受率。")
+        if group["invalid_bs"]:
+            group["note"] = "固定BS缺失或无效，不能建立固定BS的S趋势；保留全部配置原值。"
+        result.append(group)
+    return result
+
+
+def _s_chart_reason(group):
+    if group["invalid_bs"]:
+        return "固定BS缺失或无效，保留原表；不从采样组合名称推断BS，不绘制本组S趋势。"
+    if group["invalid_s"]:
+        return "存在缺失、无效或别名冲突的配置S，保留原表；不从采样组合名称推断S，不绘制本组趋势。"
+    if group["duplicate_s"]:
+        return ("相同S存在多条采样组合，未合并趋势；保留全部原值，不取首条、末条或平均。重复S="
+                + _text(group["duplicate_s"]))
+    if len(group["cases"]) < 2:
+        return "本组仅有一个S，保留单点表格；至少两个不同S才能展示变化。"
     return None
 
 
@@ -521,7 +613,7 @@ def _bs_overview_section(sheet, row, report):
         row = _table(sheet, row, ["统计失败、未纳入BS对比的采样组合", "失败原因"],
             [[item.get("case"), item.get("error")] for item in report["failures"]], spans=((1, 4), (5, 12)))
     row = _note(sheet, row, "不同BS的单卡吞吐、完整周期与TPOT变化")
-    row = _note(sheet, row, BS_COMPARISON_SCOPE)
+    row = _note(sheet, row, BS_COMPARISON_SCOPE + ITL_PROXY_SCOPE)
     for group in groups:
         row = _note(sheet, row, group["label"])
         records = _bs_overview_rows(group)
@@ -569,6 +661,187 @@ def _bs_method_section(sheet, row, report, identity):
             categories_ref=reference + "$A$" + str(written[0]) + ":$A$" + str(written[-1]),
             x_axis_title="BS（每DP请求数）", y_axis_title="ms/完整周期")
         row += 23
+    return row + 1
+
+
+def _s_groups(report):
+    # Single points remain in the configuration/BS tables; no repeated S tables.
+    return [group for group in _s_comparison_groups(report) if len(group["cases"]) >= 2]
+
+
+def _source_sweep(case):
+    from profile_ep128 import source_sweep_summary
+    return source_sweep_summary(case)
+
+
+def _source_sweep_notes(case, summary):
+    notes = [summary[key] for key in ("reason", "breakdown_reason") if summary[key]]
+    aggregate = _source(case)
+    captured, expected = aggregate.get("captured_ranks"), aggregate.get("expected_ranks")
+    if type(captured) is int and type(expected) is int and 0 <= captured < expected:
+        notes.append("源rank覆盖=" + str(captured) + "/" + str(expected)
+            + "；所选为已采rank中的周期均值最大值，未证明是全系统最慢rank。")
+    elif aggregate.get("rank_coverage_complete") is False:
+        notes.append("源rank覆盖不完整；所选最大值仅限已采rank。")
+    return notes
+
+
+def _s_overview_rows(group):
+    rows = []
+    for case in group["cases"]:
+        row = [_s_value(case), case["name"], (case.get("config") or {}).get("effective_tokens_per_round")]
+        for identity in ("method1", "method2"):
+            method = _method(case, identity)
+            row.extend([_rank_note(method) + "\n" + _layer_mean_status(method),
+                        *[_bs_value(method, field) for field, _, _ in SWEEP_METRICS]])
+        rows.append(row)
+    return rows
+
+
+def _s_method_rows(group, identity):
+    rows = []
+    for case in group["cases"]:
+        method = _method(case, identity)
+        parts = _bs_breakdown_values(method)
+        status = _layer_mean_status(method)
+        if _layer_mean_publishable(method) and parts is None:
+            status = "五项分解缺失或不闭合"
+        rows.append([_s_value(case), case["name"], (case.get("config") or {}).get("effective_tokens_per_round"),
+            method.get("selected_rank") if _layer_mean_publishable(method) else NA,
+            *(parts if parts is not None else [None] * 5), _bs_value(method, "cycle_ms"), status])
+    return rows
+
+
+def _sweep_part_headers(axis):
+    return ["投机步长S" if axis == "S" else "配置BS\n（每DP请求数）", "采样组合", "SAL / Neff\n（含bonus）",
+        "所选rank", *[label + "\n(ms)" for _, label, _ in BS_PARTS], "完整周期\n（ITL代理ms/轮）", "状态"]
+
+
+def _source_metric_rows(group, axis):
+    rows = []
+    for case in group["cases"]:
+        config, summary = case.get("config") or {}, _source_sweep(case)
+        rows.append([_s_value(case) if axis == "S" else config.get("bs"), case["name"],
+            config.get("bs") if axis == "S" else _s_value(case), config.get("effective_tokens_per_round"),
+            summary["selected_rank"], *[summary[field] for field, _, _ in SWEEP_METRICS], summary["status"]])
+    return rows
+
+
+def _source_parts_rows(group, axis):
+    rows = []
+    for case in group["cases"]:
+        summary, config = _source_sweep(case), case.get("config") or {}
+        parts = {item["key"]: item["value_ms"] for item in summary["breakdown"]}
+        rows.append([_s_value(case) if axis == "S" else config.get("bs"), case["name"],
+            config.get("effective_tokens_per_round"), summary["selected_rank"],
+            *[parts[key] for key, _, _ in BS_PARTS], summary["cycle_ms"],
+            "分解可用" if summary["breakdown_reason"] is None else "分解缺少证据；见组说明"])
+    return rows
+
+
+def _source_metric_headers(axis):
+    return ["投机步长S" if axis == "S" else "配置BS\n（每DP请求数）", "采样组合",
+        "固定BS" if axis == "S" else "固定S", "SAL / Neff\n（含bonus）", "源所选rank",
+        "源单卡吞吐\n(token/s/卡)", "源TPOT\n(ms/token)", "源ITL代理\n(ms/轮)", "状态"]
+
+
+def _sweep_axis(axis):
+    return "投机步长S（草稿候选token数）" if axis == "S" else "BS（每DP请求数）"
+
+
+def _sweep_excel_chart(sheet, row, title, records, written, specs, unit, axis):
+    """Use the exact table coordinates and preserve missing points as blanks."""
+    if written is None:
+        return _note(sheet, row, "表格含长文本续行，保留原表，不绘制本组趋势。")
+    if not any(_number(value) for _, values, _, _ in specs for value in values):
+        return _note(sheet, row, "本项没有可用数值，保留空值表格，不绘制趋势。")
+    reference = "'" + sheet.name.replace("'", "''") + "'!"
+    series = []
+    for label, values, color, column in specs:
+        letter = cell_reference(1, column)[:-1]
+        series.append(dict(name=label, values=values, color=color,
+            values_ref=reference + "$" + letter + "$" + str(written[0]) + ":$" + letter + "$" + str(written[-1])))
+    sheet.add_line_chart(title, categories=[str(record[0]) for record in records], series=series,
+        anchor=(row, 1, row + 19, 12),
+        categories_ref=reference + "$A$" + str(written[0]) + ":$A$" + str(written[-1]),
+        x_axis_title=_sweep_axis(axis), y_axis_title=unit)
+    return row + 21
+
+
+def _s_overview_section(sheet, row, report):
+    row = _note(sheet, row, "固定BS，不同投机步长S的单卡吞吐、TPOT与ITL代理变化")
+    row = _note(sheet, row, S_COMPARISON_SCOPE + ITL_PROXY_SCOPE)
+    groups = _s_groups(report)
+    if not groups:
+        return _note(sheet, row, "当前报告没有同一固定BS下的多条S采样；不生成跨条件曲线。")
+    for group in groups:
+        row = _note(sheet, row, group["label"])
+        row = _note(sheet, row, group["note"])
+        records = _s_overview_rows(group)
+        row, written = _bs_table(sheet, row, S_OVERVIEW_HEADERS, records, S_OVERVIEW_SPANS, (1, 3, 5, 6, 7, 9, 10, 11))
+        reason = _s_chart_reason(group)
+        if reason:
+            row = _note(sheet, row, reason, warning=True)
+            continue
+        for index, (_, label, unit) in enumerate(SWEEP_METRICS):
+            specs = [(_layer_mean_name({"id": identity}), [record[4 + index + shift] for record in records], color, 6 + index + shift)
+                for identity, shift, color in (("method1", 0, "168B8D"), ("method2", 4, "D4793A"))]
+            row = _sweep_excel_chart(sheet, row, label + "随S变化 · " + group["label"].split(" · ")[0],
+                                     records, written, specs, unit, "S")
+    return row + 1
+
+
+def _s_method_section(sheet, row, report, identity):
+    row = _note(sheet, row, "固定BS，不同投机步长S的整轮五项耗时构成 · " + _layer_mean_name({"id": identity}))
+    row = _note(sheet, row, S_COMPARISON_SCOPE + "五项之和须闭合完整周期；不再次追加通信或路由计算。")
+    for group in _s_groups(report):
+        row = _note(sheet, row, group["label"] + "。" + group["note"])
+        records = _s_method_rows(group, identity)
+        row, written = _bs_table(sheet, row, _sweep_part_headers("S"), records, SWEEP_PART_SPANS, (1, 3, 5, 6, 7, 8, 9, 10))
+        reason = _s_chart_reason(group)
+        if reason:
+            row = _note(sheet, row, reason, warning=True)
+            continue
+        specs = [(label, [record[4 + index] for record in records], color, 6 + index)
+                 for index, (_, label, color) in enumerate(BS_PARTS)]
+        row = _sweep_excel_chart(sheet, row, "整轮五项耗时构成随S变化 · " + group["label"].split(" · ")[0],
+                                 records, written, specs, "ms/完整周期", "S")
+    return row + 1
+
+
+def _source_sweeps_section(sheet, row, report):
+    row = _note(sheet, row, "源采样基线：固定S看BS、固定BS看S")
+    row = _note(sheet, row, ITL_PROXY_SCOPE + "吞吐和TPOT依赖配置Neff，属于条件换算。源采样沿用源aggregate选中的已采rank周期均值最大值，"
+        "每点rank可变化；五项使用该rank全部保留轮次的实际层边界（包含主模型第0层），不使用目标外推分解。")
+    for axis, groups in (("BS", _bs_comparison_groups(report)), ("S", _s_groups(report))):
+        for group in groups:
+            row = _note(sheet, row, group["label"])
+            if axis == "S":
+                row = _note(sheet, row, group["note"])
+            for case in group["cases"]:
+                summary = _source_sweep(case)
+                reasons = _source_sweep_notes(case, summary)
+                if reasons:
+                    row = _note(sheet, row, case["name"] + "：" + "；".join(reasons), warning=True)
+            reason = (_s_chart_reason if axis == "S" else _bs_chart_reason)(group)
+            records = _source_metric_rows(group, axis)
+            row, written = _bs_table(sheet, row, _source_metric_headers(axis), records, SOURCE_METRIC_SPANS,
+                                     (1, 3, 4, 6, 7, 8))
+            if reason:
+                row = _note(sheet, row, reason)
+            else:
+                for index, (_, label, unit) in enumerate(SWEEP_METRICS):
+                    specs = [("源采样基线", [record[5 + index] for record in records], "687F94", 7 + index)]
+                    row = _sweep_excel_chart(sheet, row, "源采样基线 · " + label + "随" + axis + "变化 · " + group["label"].split(" · ")[0],
+                                             records, written, specs, unit, axis)
+            records = _source_parts_rows(group, axis)
+            row, written = _bs_table(sheet, row, _sweep_part_headers(axis), records, SWEEP_PART_SPANS,
+                                     (1, 3, 5, 6, 7, 8, 9, 10))
+            if not reason:
+                specs = [(label, [record[4 + index] for record in records], color, 6 + index)
+                         for index, (_, label, color) in enumerate(BS_PARTS)]
+                row = _sweep_excel_chart(sheet, row, "源采样基线 · 整轮五项耗时构成随" + axis + "变化 · " + group["label"].split(" · ")[0],
+                                         records, written, specs, "ms/完整周期", axis)
     return row + 1
 
 
@@ -725,6 +998,7 @@ def _overview(book, report):
     headers, records, spans = _case_parameter_table(report)
     row = _table(sheet, row, headers, records, spans=spans)
     row = _bs_overview_section(sheet, row, report)
+    row = _s_overview_section(sheet, row, report)
     for case_index, case in enumerate(report["cases"]):
         row = _note(sheet, row, case["name"] + " · " + _case_scope(case), columns=12)
         row = _note(sheet, row, _case_parameters(case), columns=12)
@@ -768,7 +1042,7 @@ def _layer_mean_method_section(sheet, row, case, case_index, identity, method):
 def _source_sheet(book, report):
     sheet = _sheet(book, SHEETS[1], "源采样基线 · 外推输入与核对",
                    "源采样逐rank诊断；配置BS/Neff换算不等于实测有效吞吐。")
-    row = 5
+    row = _source_sweeps_section(sheet, 5, report)
     for case in report["cases"]:
         row = _note(sheet, row, case["name"] + " / " + _text(_source(case).get("scope")))
         row = _table(sheet, row, ["rank", "保留轮次", "单卡均摊条件值(token/s/card)", "本DP请求组条件输出率(token/s)",
@@ -1930,6 +2204,7 @@ def _method_sheet(book, report, identity, sheet_name):
                    "源实测与目标估算 · 主/草稿独立列；层内已有成本只追加增量。")
     sheet.result_rows, sheet.result_cells = {}, {}
     row = _bs_method_section(sheet, 5, report, identity)
+    row = _s_method_section(sheet, row, report, identity)
     for case_index, case in enumerate(report["cases"]):
         row = _layer_mean_method_section(sheet, row, case, case_index, identity, _method(case, identity))
     return sheet
@@ -2326,7 +2601,7 @@ def _bs_comparison_html(report):
     if report.get('failures'):
         parts.append(_html_table(['统计失败、未纳入BS对比的采样组合', '失败原因'],
             [[item.get('case'), item.get('error')] for item in report['failures']]))
-    parts.append('<h2>不同BS的变化对比</h2><p>' + esc(BS_COMPARISON_SCOPE) + '</p>')
+    parts.append('<h2>不同BS的变化对比</h2><p>' + esc(BS_COMPARISON_SCOPE + ITL_PROXY_SCOPE) + '</p>')
     for group in groups:
         parts.append('<h3>' + esc(group['label']) + '</h3><h4>单卡吞吐、完整周期与TPOT</h4>')
         overview = _bs_overview_rows(group)
@@ -2356,6 +2631,81 @@ def _bs_comparison_html(report):
     return ''.join(parts) + '</section>'
 
 
+def _sweep_html_table(headers, records):
+    return '<div class="bs-table">' + _html_table(headers,
+        [['' if value is None else value for value in row] for row in records]) + '</div>'
+
+
+def _sweep_html_chart(title, records, series, unit, axis):
+    if not any(_number(value) for _, values, _ in series for value in values):
+        return '<p>本项没有可用数值，保留空值表格，不绘制趋势。</p>'
+    return _bs_svg(title, [record[0] for record in records], series, unit, x_axis_title=_sweep_axis(axis),
+        category_name=axis, description="横轴为声明的" + axis + "数值升序等距档位；缺少结果时断线，不补0或插值。")
+
+
+def _s_comparison_html(report):
+    esc = lambda value: html.escape(_text(value), quote=True)
+    parts = ['<section class="s-comparison"><h2>固定BS，不同投机步长S的变化对比</h2><p>'
+        + esc(S_COMPARISON_SCOPE + ITL_PROXY_SCOPE) + '</p>']
+    groups = _s_groups(report)
+    if not groups:
+        parts.append('<p>当前报告没有同一固定BS下的多条S采样；不生成跨条件曲线。</p>')
+    for group in groups:
+        parts.append('<h3>' + esc(group['label']) + '</h3><p>' + esc(group['note']) + '</p>')
+        records = _s_overview_rows(group)
+        parts.append(_sweep_html_table(S_OVERVIEW_HEADERS, records))
+        reason = _s_chart_reason(group)
+        if reason:
+            parts.append('<p>' + esc(reason) + '</p>')
+        else:
+            for index, (_, label, unit) in enumerate(SWEEP_METRICS):
+                series = [(_layer_mean_name({'id': identity}), [record[4 + index + shift] for record in records], color)
+                    for identity, shift, color in (('method1', 0, '168B8D'), ('method2', 4, 'D4793A'))]
+                parts.append(_sweep_html_chart(label + '随S变化', records, series, unit, 'S'))
+        for identity in ('method1', 'method2'):
+            records = _s_method_rows(group, identity)
+            name = _layer_mean_name({'id': identity})
+            parts.append('<h4>' + esc(name + ' · 整轮五项耗时构成') + '</h4>')
+            parts.append(_sweep_html_table(_sweep_part_headers('S'), records))
+            if not reason:
+                series = [(label, [record[4 + index] for record in records], color)
+                          for index, (_, label, color) in enumerate(BS_PARTS)]
+                parts.append(_sweep_html_chart(name + ' · 整轮五项耗时构成随S变化', records, series, 'ms/完整周期', 'S'))
+    return ''.join(parts) + '</section>'
+
+
+def _source_sweeps_html(report):
+    esc = lambda value: html.escape(_text(value), quote=True)
+    parts = ['<section class="source-sweeps"><h2>源采样基线：固定S看BS、固定BS看S</h2><p>'
+        + esc(ITL_PROXY_SCOPE) + '吞吐和TPOT依赖配置Neff，属于条件换算。沿用源aggregate在已采rank中所选的最大均值rank，包含全部主层（含main0），不使用目标分解。</p>']
+    for axis, groups in (('BS', _bs_comparison_groups(report)), ('S', _s_groups(report))):
+        for group in groups:
+            parts.append('<h3>' + esc(group['label']) + '</h3>')
+            if axis == 'S':
+                parts.append('<p>' + esc(group['note']) + '</p>')
+            for case in group['cases']:
+                summary = _source_sweep(case)
+                reasons = _source_sweep_notes(case, summary)
+                if reasons:
+                    parts.append('<p>' + esc(case['name'] + '：' + '；'.join(reasons)) + '</p>')
+            reason = (_s_chart_reason if axis == 'S' else _bs_chart_reason)(group)
+            records = _source_metric_rows(group, axis)
+            parts.append(_sweep_html_table(_source_metric_headers(axis), records))
+            if reason:
+                parts.append('<p>' + esc(reason) + '</p>')
+            else:
+                for index, (_, label, unit) in enumerate(SWEEP_METRICS):
+                    series = [('源采样基线', [record[5 + index] for record in records], '687F94')]
+                    parts.append(_sweep_html_chart('源采样基线 · ' + label + '随' + axis + '变化', records, series, unit, axis))
+            records = _source_parts_rows(group, axis)
+            parts.append(_sweep_html_table(_sweep_part_headers(axis), records))
+            if not reason:
+                series = [(label, [record[4 + index] for record in records], color)
+                          for index, (_, label, color) in enumerate(BS_PARTS)]
+                parts.append(_sweep_html_chart('源采样基线 · 整轮五项耗时构成随' + axis + '变化', records, series, 'ms/完整周期', axis))
+    return ''.join(parts) + '</section>'
+
+
 def _html_preview(report, out):
     esc = lambda value: html.escape(_text(value), quote=True)
     parts = ['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
@@ -2370,6 +2720,8 @@ def _html_preview(report, out):
                  + esc(CASE_PARAMETERS_SCOPE) + '</p>'
                  + _html_table(parameter_headers, parameter_rows) + '</section>')
     parts.append(_bs_comparison_html(report))
+    parts.append(_s_comparison_html(report))
+    parts.append(_source_sweeps_html(report))
     for case in report["cases"]:
         parts.append('<h2>' + esc(case["name"]) + '</h2><p>' + esc(_case_scope(case)) + '</p>')
         parts.append('<p>' + esc(_case_parameters(case)) + '</p>')

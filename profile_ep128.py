@@ -29,7 +29,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261110.3.rank_parallel"
+PROFILE_VERSION = "20261110.4.bs_s_sweeps"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -1177,6 +1177,122 @@ def summarize_source(measurements, case):
                           'declared_rank_names_complete': case['_rank_coverage_complete'],
                           'formula': 'Q_device=(1000*sum(output_tokens)/sum(cycle_ms))*source_dp/source_devices; selected rank=max(mean cycle)'}}
 
+
+
+def source_sweep_summary(case):
+    """Derive source-only sweep display values from an existing report case.
+
+    Preserve the source aggregate's chosen rank and headline values. The five
+    measured parts include every source layer (including main0), never target
+    reference means. ITL here is explicitly a whole-round interval proxy, not
+    observed per-token delivery latency. No report objects are changed.
+    """
+    part_keys = ("main_layer_envelopes", "main_internal_gaps", "draft_layer_envelopes",
+                 "draft_internal_gaps", "residual_once")
+    result = {"selected_rank": None, "per_device_tokens_s": None, "cycle_ms": None,
+              "tpot_ms": None, "itl_proxy_ms": None,
+              "breakdown": [{"key": key, "value_ms": None} for key in part_keys],
+              "status": "UNAVAILABLE", "reason": None, "breakdown_reason": None}
+    case = case if isinstance(case, dict) else {}
+    source = case.get("source")
+    aggregate = source.get("aggregate") if isinstance(source, dict) else None
+    aggregate = aggregate if isinstance(aggregate, dict) else {}
+    problems = []
+
+    def number(value, minimum=0):
+        try:
+            return value if type(value) in (int, float) and math.isfinite(value) and value >= minimum else None
+        except OverflowError:
+            return None
+
+    rank = aggregate.get("selected_rank")
+    if isinstance(rank, str) and rank.strip():
+        result["selected_rank"] = rank
+    else:
+        problems.append("source aggregate has no selected rank")
+    result["per_device_tokens_s"] = number(aggregate.get("per_device_tokens_s"))
+    if result["per_device_tokens_s"] is None:
+        problems.append("source per-device throughput is unavailable")
+    cycle = number(aggregate.get("cycle_ms"))
+    if cycle is not None and cycle > 0:
+        result["cycle_ms"] = result["itl_proxy_ms"] = cycle
+    else:
+        problems.append("source cycle must be positive and finite")
+    config = case.get("config")
+    config = config if isinstance(config, dict) else {}
+    neff = number(config.get("effective_tokens_per_round"), minimum=1)
+    declared_s = [config[field] for field in ("draft_tokens", "num_speculative_tokens") if field in config]
+    # Truly old JSON may omit S. Either known alias constrains legal Neff;
+    # conflicting or invalid aliases must not silently validate a TPOT value.
+    if declared_s:
+        valid_s = all(type(value) is int and value >= 0 and value == declared_s[0] for value in declared_s)
+        if not valid_s or neff is not None and neff > declared_s[0] + 1:
+            neff = None
+    if neff is None:
+        problems.append("configured effective output length Neff is unavailable or invalid")
+    elif result["cycle_ms"] is not None:
+        result["tpot_ms"] = result["cycle_ms"] / neff
+    result["reason"] = "; ".join(problems) or None
+
+    try:
+        if result["selected_rank"] is None or result["cycle_ms"] is None:
+            raise ValueError("source rank and cycle are required for the five measured parts")
+        measurements = case.get("measurements")
+        if not isinstance(measurements, list):
+            raise ValueError("source measurements are unavailable")
+        matched = [item for item in measurements if isinstance(item, dict)
+                   and item.get("rank") == result["selected_rank"]]
+        if len(matched) != 1:
+            raise ValueError("selected source rank must have exactly one measurement")
+        measured, = matched
+        rounds = measured.get("rounds")
+        if not isinstance(rounds, list) or not rounds:
+            raise ValueError("selected source rank has no retained rounds")
+        for row in rounds:
+            if not isinstance(row, dict) or not isinstance(row.get("layers"), list) or not row["layers"]:
+                raise ValueError("source round layer boundaries are unavailable")
+            if any(not isinstance(layer, dict) for layer in row["layers"]):
+                raise ValueError("source layer boundary must be an object")
+            if "duration_ms" in row and (number(row["duration_ms"]) is None or row["duration_ms"] <= 0):
+                raise ValueError("source round duration must be positive and finite")
+        # Reuse exact-ns HC validation: ordered nonoverlapping rounds/layers,
+        # contiguous main then draft chains, and first main HCPre at cycle start.
+        residual_windows(measured)
+        parts, cycles = [], []
+        for row in rounds:
+            start, end = a_exact_ns(row["start_ns"], "source cycle start"), a_exact_ns(row["end_ns"], "source cycle end")
+            duration = end - start
+            role_bounds = {role: [] for role in ("main", "draft")}
+            for layer in row["layers"]:
+                left = a_exact_ns(layer["start_ns"], "source layer start")
+                right = a_exact_ns(layer["end_ns"], "source layer end")
+                if "wall_ms" in layer and (number(layer["wall_ms"]) is None or not math.isclose(
+                        layer["wall_ms"], (right - left) / 1e6, rel_tol=1e-12, abs_tol=1e-8)):
+                    raise ValueError("source layer wall disagrees with its exact boundaries")
+                role_bounds[layer["role"]].append((left, right))
+            values, chains = [], []
+            for role in ("main", "draft"):
+                bounds = sorted(role_bounds[role])
+                wall = sum(right - left for left, right in bounds)
+                chain = bounds[-1][1] - bounds[0][0]
+                values.extend((wall, chain - wall))
+                chains.append(chain)
+            values.append(duration - sum(chains))
+            if any(value < 0 for value in values) or sum(values) != duration:
+                raise ValueError("source five-part partition does not close to its exact cycle")
+            parts.append(values)
+            cycles.append(duration / 1e6)
+        means = [statistics.fmean(row[index] for row in parts) / 1e6 for index in range(len(part_keys))]
+        if (not math.isclose(statistics.fmean(cycles), result["cycle_ms"], rel_tol=1e-12, abs_tol=1e-8)
+                or not math.isclose(math.fsum(means), result["cycle_ms"], rel_tol=1e-12, abs_tol=1e-8)):
+            raise ValueError("source measured parts disagree with the aggregate selected-rank cycle")
+        result["breakdown"] = [{"key": key, "value_ms": value} for key, value in zip(part_keys, means)]
+    except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+        result["breakdown_reason"] = str(error)
+    present = any(result[field] is not None for field in ("per_device_tokens_s", "cycle_ms", "tpot_ms"))
+    result["status"] = ("AVAILABLE" if not result["reason"] and not result["breakdown_reason"]
+                        else "PARTIAL" if present else "UNAVAILABLE")
+    return result
 
 
 def read_reference(path):
