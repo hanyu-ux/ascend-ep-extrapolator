@@ -1694,6 +1694,11 @@ def _method_focus_section(sheet, row, case, method):
             FOCUS_PARENT_HEADERS, data["parent_rows"], FOCUS_PARENT_SPANS, header, written, (1,),
             "源实测ms/HC轮次；已含于U，不额外相加")
     row = _note(sheet, row, "同一rank不同原HC轮次的阶段耗时；P50/P90/最大为核心原值，缺失轮次不画0")
+    # Reserve the overview before the potentially long per-round table. Range
+    # references are bound after the table has its final physical row numbers.
+    line_row = row
+    if data["step_rows"]:
+        row += 24
     row, _, written = _operator_table(sheet, row, FOCUS_STEP_HEADERS, data["step_rows"], FOCUS_STEP_SPANS)
     if written and len(written) == len(data["step_rows"]):
         reference = "'" + sheet.name.replace("'", "''") + "'!"
@@ -1701,10 +1706,9 @@ def _method_focus_section(sheet, row, case, method):
             values_ref=reference + cell_reference(written[0], 4 + index, True) + ":" + cell_reference(written[-1], 4 + index, True))
             for index, (label, values, color) in enumerate(data["series"])]
         sheet.add_line_chart("两项U逐轮耗时变化 · 固定rank=" + _text(data["rank"]),
-            categories=data["categories"], series=series, anchor=(row, 1, row + 22, 12),
+            categories=data["categories"], series=series, anchor=(line_row, 1, line_row + 22, 12),
             categories_ref=reference + cell_reference(written[0], 2, True) + ":" + cell_reference(written[-1], 2, True),
             x_axis_title="原HC轮次ID（等距；非ProfilerStep）", y_axis_title="源实测阶段跨度(ms)")
-        row += 24
     elif data["step_rows"]:
         row = _note(sheet, row, "逐轮表出现长文本续行，保留完整明细，折线未绘制。", warning=True)
     else:

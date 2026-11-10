@@ -1,8 +1,10 @@
 """Fixed-rank U detail and native PMU display contracts using synthetic data only."""
 import copy
 from pathlib import Path
+import re
 import tempfile
 import unittest
+from unittest import mock
 from test_ep128_v2_excel import fixture, read_book, renderer
 import test_ep128_layer_mean_excel as layer_excel
 
@@ -78,7 +80,16 @@ class FocusExcelTests(unittest.TestCase):
 
     def test_both_methods_show_their_fixed_rank_original_ids_and_unscaled_pmu(self):
         report = focus_fixture()
-        out, book, page = self.export(report)
+        line_positions = {}
+        native_line = renderer.xlsx_writer.Worksheet.add_line_chart
+
+        def capture_line(sheet, title, *args, **kwargs):
+            if title.startswith("两项U逐轮耗时变化"):
+                line_positions[sheet.name] = (kwargs["anchor"], kwargs["series"][0]["values_ref"])
+            return native_line(sheet, title, *args, **kwargs)
+
+        with mock.patch.object(renderer.xlsx_writer.Worksheet, "add_line_chart", new=capture_line):
+            out, book, page = self.export(report)
         for name, rank, factor in (("方法1估算", "dp7", 1.), ("方法2估算", "dp3", 10.)):
             cells = book[name][1]
             text = "\n".join(str(value) for value in cells.values())
@@ -97,6 +108,9 @@ class FocusExcelTests(unittest.TestCase):
             lines = [root for root in roots if root.find(".//c:lineChart", CHART_NS) is not None
                      and "两项U逐轮耗时变化" in "".join(root.itertext())]
             self.assertEqual(len(lines), 1)
+            anchor, reference = line_positions[name]
+            first_data_row = int(re.search(r"!\$[A-Z]+\$(\d+):", reference).group(1))
+            self.assertLess(anchor[2], first_data_row - 1)  # Entire chart precedes even the table header.
             series = lines[0].findall(".//c:lineChart/c:ser", CHART_NS)
             for index, base in enumerate((1., 4.)):
                 categories = [point.findtext("c:v", namespaces=CHART_NS) for point in
