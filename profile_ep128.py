@@ -2,8 +2,9 @@
 """Offline HC layer means, two communication estimates and per-card throughput.
 
 Standard library only. Measure eight main and three draft layers from native
-kernel CSVs, exclude main0 from reference means, then select the maximum rank
-mean cycle. The renderer consumes these results without estimating again.
+kernel CSVs, exclude main0 from reference means, and select one shared rank by
+its source full-cycle mean before both estimates. The renderer consumes the
+results without estimating again.
 """
 import argparse
 from array import array
@@ -29,7 +30,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261110.4.bs_s_sweeps"
+PROFILE_VERSION = "20261110.5.shared_source_rank"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -1293,6 +1294,110 @@ def source_sweep_summary(case):
     result["status"] = ("AVAILABLE" if not result["reason"] and not result["breakdown_reason"]
                         else "PARTIAL" if present else "UNAVAILABLE")
     return result
+
+
+def _aligned_source_rank_stages(method, selected, rank):
+    """Keep method-specific parents; reuse only this method's same-rank evidence."""
+    groups = selected.get("target_stage_breakdowns") or []
+    stored = method.get("target_stage_breakdowns") or []
+    if method.get("selected_rank") != rank:
+        return groups
+    if not groups:
+        return stored
+    group_fields = ("role", "attention", "status", "reference_layers", "target_layers", "rounds",
+                    "source_wall_ms", "target_wall_ms", "target_total_ms")
+    stage_fields = ("stage_key", "stage_order", "source_ms", "delta_ms", "target_ms",
+                    "target_total_ms", "cycle_share")
+    output = []
+    for group in groups:
+        matches = [item for item in stored if all(item.get(key) == group.get(key) for key in group_fields)]
+        if len(matches) != 1:
+            output.append(group)
+            continue
+        stages = []
+        for stage in group.get("stage_rows") or []:
+            previous = [item for item in matches[0].get("stage_rows") or []
+                        if all(item.get(key) == stage.get(key) for key in stage_fields)]
+            if ("operator_breakdown" not in stage and len(previous) == 1
+                    and isinstance(previous[0].get("operator_breakdown"), dict)):
+                stage = dict(stage, operator_breakdown=previous[0]["operator_breakdown"])
+            stages.append(stage)
+        output.append(dict(group, stage_rows=stages))
+    return output
+
+
+def align_report_source_rank(report):
+    """Pure offline reselection from stored per-rank estimates, without CSV I/O.
+
+    Copy only changed containers, sharing untouched evidence as read-only data.
+    Every available method uses the source full-round mean rank chosen before
+    extrapolation. Missing operator/PMU data for that rank stays unavailable;
+    another method's modeled stage/operator rows are never borrowed.
+    """
+    if not isinstance(report, dict) or not isinstance(report.get("cases"), list):
+        raise ValueError("source-rank alignment requires a report with a cases list")
+    cases = []
+    for original in report["cases"]:
+        try:
+            selection = _lm_source_rank_selection(original)
+            rank = selection["selected_rank"]
+            projection = original.get("projection") or {}
+            methods = []
+            for method in projection.get("layer_mean_methods") or []:
+                aligned = dict(method, source_rank=rank, rank_selection=selection)
+                aligned.pop("focus_selected_rank", None)
+                if method.get("status") == LAYER_MEAN_STATUS and not method.get("reasons"):
+                    matches = [item for item in method.get("per_rank") or [] if item.get("rank") == rank]
+                    if len(matches) != 1:
+                        raise ValueError(str(method.get("id")) + " has no unique stored per_rank result for " + rank)
+                    selected, = matches
+                    for field in ("cycle_ms", "per_device_tokens_s", "global_tokens_s", "tpot_ms"):
+                        _lm_number(selected.get(field), "stored " + str(method.get("id")) + " " + field, True)
+                    if selected.get("source_cycle_ms") is not None and not math.isclose(
+                            _lm_number(selected["source_cycle_ms"], "stored source cycle", True),
+                            selection["selected_source_cycle_ms"], rel_tol=1e-12, abs_tol=1e-8):
+                        raise ValueError("stored method source cycle disagrees with the common source rank")
+                    for field in ("cycle_ms", "per_device_tokens_s", "global_tokens_s", "tpot_ms"):
+                        aligned[field] = selected.get(field)
+                    aligned.update(selected_rank=rank,
+                        source_cycle_ms=selected.get("source_cycle_ms", selection["selected_source_cycle_ms"]),
+                        aggregation="per_round_layer_type_means_on_shared_source_cycle_rank",
+                        class_means=selected.get("class_means") or [], role_details=selected.get("role_details") or [],
+                        source_partition=selected.get("source_partition") or {}, breakdown=selected.get("breakdown") or [],
+                        target_stage_breakdowns=_aligned_source_rank_stages(method, selected, rank))
+                else:
+                    # An unavailable estimate must not expose an old selected
+                    # rank or stale target diagnostics after the policy changes.
+                    matches = [item for item in method.get("per_rank") or [] if item.get("rank") == rank]
+                    selected = matches[0] if len(matches) == 1 else {}
+                    aligned.update(selected_rank=None, source_cycle_ms=selection["selected_source_cycle_ms"],
+                        cycle_ms=None, per_device_tokens_s=None,
+                        global_tokens_s=None, tpot_ms=None, class_means=selected.get("class_means") or [],
+                        role_details=selected.get("role_details") or [], source_partition=selected.get("source_partition") or {},
+                        breakdown=[], target_stage_breakdowns=[])
+                previous = method.get("source_rank_alignment")
+                previous = previous if isinstance(previous, dict) else {}
+                aligned["source_rank_alignment"] = {
+                    "mode": "offline_reselection_from_stored_per_rank",
+                    "stored_selected_rank": previous.get("stored_selected_rank", method.get("selected_rank")),
+                    "selected_source_rank": rank, "source_csv_read": False,
+                    "operator_scope": "same_method_same_rank_only; absent evidence is not reconstructed"}
+                methods.append(aligned)
+            source = original.get("source") or {}
+            aggregate = dict(source.get("aggregate") or {}, selected_rank=rank,
+                             cycle_ms=selection["selected_source_cycle_ms"])
+            cases.append(dict(original, source=dict(source, aggregate=aggregate),
+                projection=dict(projection, layer_mean_methods=methods, rank_selection=selection)))
+        except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+            name = original.get("name", "unknown") if isinstance(original, dict) else "unknown"
+            raise ValueError("case=" + str(name) + ": cannot align stored source rank: " + str(error)) from error
+    contract = dict(report.get("contract") or {})
+    contract["source_rank_alignment"] = "offline stored per_rank reselection; no CSV reread or new device evidence"
+    if "projection" in contract:
+        contract.setdefault("source_rank_alignment_previous_projection", contract["projection"])
+        contract["projection"] = ("select shared rank by retained source full-cycle mean before extrapolation; "
+                                  "offline reselection from stored per_rank method results")
+    return dict(report, cases=cases, contract=contract)
 
 
 def read_reference(path):
@@ -3497,7 +3602,7 @@ def result_rows(report):
                          'TPOT(ms)': result_value(method, 'tpot_ms'), '源参考rank': method.get('selected_rank'),
                          '状态': '条件估算' if result_value(method, 'cycle_ms') is not None else '缺少实际输入',
                          '口径与原因': ' | '.join(method.get('reasons', [])) or
-                         '剔除主0参考；逐类型均值外推，先求各rank轮次均值再取最大；衔接及轮次剩余区间分别计入。'})
+                         '先按源完整周期均值选共用rank；剔除主0参考后按该rank逐类型均值外推；衔接及轮次剩余区间分别计入。'})
     rows.extend({'采样组合': failure['case'], '状态': 'FAILED', '口径与原因': failure['error']}
                 for failure in report.get('failures', []))
     return rows
@@ -4261,9 +4366,83 @@ def _lm_source_summary(prepared):
 
 
 
+def _lm_source_rank_selection(result, prepared=None):
+    """Choose one captured source rank before either target communication model.
+
+    This pure selector also works on exported JSON without rereading a CSV.
+    Retained full-cycle durations are authoritative; prepared source durations
+    only support internal callers without measurement records. Target cycles,
+    per-component maxima and method-specific ranks are never selection inputs.
+    """
+    measurements = result.get("measurements")
+    rows = []
+    if measurements is not None:
+        if not isinstance(measurements, list) or not measurements:
+            raise ValueError("source-rank selection requires retained source measurements")
+        for measured in measurements:
+            rank, rounds = measured["rank"], measured["rounds"]
+            if not isinstance(rank, str) or not rank.strip() or not isinstance(rounds, list) or not rounds:
+                raise ValueError("source-rank selection requires named ranks with retained source rounds")
+            durations = [_lm_number(cycle["duration_ms"], "retained source cycle", True) for cycle in rounds]
+            rows.append({"rank": rank, "source_cycle_ms": statistics.fmean(durations), "rounds": len(rounds)})
+    elif prepared is not None:
+        for rank, rounds in prepared.items():
+            if not isinstance(rank, str) or not rank.strip() or not rounds:
+                raise ValueError("source-rank selection requires named ranks with prepared source rounds")
+            durations = [_lm_number(cycle["source_cycle_ms"], "prepared source cycle", True) for cycle in rounds]
+            rows.append({"rank": rank, "source_cycle_ms": statistics.fmean(durations), "rounds": len(rounds)})
+    if not rows or len({row["rank"] for row in rows}) != len(rows):
+        raise ValueError("source-rank selection requires unique captured source ranks")
+    captures = result.get("captures")
+    if captures is not None:
+        order = [capture["rank"] for capture in captures]
+        if len(order) != len(set(order)) or set(order) != {row["rank"] for row in rows}:
+            raise ValueError("source-rank selection capture and measurement rank identities disagree")
+        lookup = {row["rank"]: row for row in rows}
+        rows = [lookup[rank] for rank in order]
+    selected = max(rows, key=lambda row: row["source_cycle_ms"])
+    source = result.get("source")
+    source = source if isinstance(source, dict) else {}
+    aggregate = source.get("aggregate")
+    aggregate = aggregate if isinstance(aggregate, dict) else {}
+    if aggregate.get("selected_rank") is not None and aggregate["selected_rank"] != selected["rank"]:
+        raise ValueError("source aggregate rank disagrees with retained source-cycle rank selection")
+    if aggregate.get("cycle_ms") is not None and not math.isclose(
+            _lm_number(aggregate["cycle_ms"], "source aggregate cycle", True), selected["source_cycle_ms"],
+            rel_tol=1e-12, abs_tol=1e-8):
+        raise ValueError("source aggregate cycle disagrees with retained source-cycle rank selection")
+    if prepared is not None:
+        if set(prepared) != {row["rank"] for row in rows}:
+            raise ValueError("prepared and measured source-rank identities disagree")
+        for row in rows:
+            rounds = prepared[row["rank"]]
+            durations = [_lm_number(cycle["source_cycle_ms"], "prepared source cycle", True) for cycle in rounds]
+            if len(rounds) != row["rounds"] or not math.isclose(statistics.fmean(durations), row["source_cycle_ms"],
+                    rel_tol=1e-12, abs_tol=1e-8):
+                raise ValueError("prepared and retained source-cycle means disagree for " + row["rank"])
+    config = result.get("config")
+    config = config if isinstance(config, dict) else {}
+    expected = config.get("expected_ranks", aggregate.get("expected_ranks"))
+    expected = expected if type(expected) is int and expected > 0 else None
+    complete = None if expected is None else len(rows) == expected
+    if config.get("_rank_coverage_complete") is False or aggregate.get("rank_coverage_complete") is False:
+        complete = False
+    cards, chips = config.get("source_devices"), config.get("source_chips_per_card", 1)
+    if type(cards) is int and cards > 0 and type(chips) is int and chips > 0 and expected != cards * chips:
+        complete = False
+    return {"policy": "max_of_captured_rank_mean_source_cycle",
+            "basis": "retained_source_full_cycle_before_extrapolation", "status": "SELECTED",
+            "selected_rank": selected["rank"], "selected_source_cycle_ms": selected["source_cycle_ms"],
+            "tie_break": "first_source_input_rank", "scope": "captured_ranks_only",
+            "captured_ranks": len(rows), "captured_rank_names": [row["rank"] for row in rows],
+            "expected_ranks": expected, "rank_coverage_complete": complete, "per_rank": rows,
+            "scope_note": "Maximum among captured source ranks only; incomplete coverage does not establish the full-system slowest rank."}
+
+
 def _lm_estimate_method(result, prepared, shapes, target_schedule, communication, method_id, excluded,
-                        operator_cache=None):
+                        operator_cache=None, rank_selection=None):
     config = result["config"]
+    selection = rank_selection if rank_selection is not None else _lm_source_rank_selection(result, prepared)
     target_counts = collections.Counter((role, attention) for role, _, attention, _ in target_schedule)
     per_rank, all_details, all_evidence = [], [], []
     for rank, source_rounds in prepared.items():
@@ -4361,7 +4540,12 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
             per_rank[-1]["class_means"], stage_groups, per_rank[-1]["cycle_ms"], rounds=len(rounds))
     if not per_rank:
         raise ValueError("no source ranks/rounds for layer-mean estimation")
-    selected = max(per_rank, key=lambda row: row["cycle_ms"])
+    selected_rows = [row for row in per_rank if row["rank"] == selection["selected_rank"]]
+    if len(selected_rows) != 1:
+        raise ValueError("shared source-selected rank is missing from target estimates")
+    selected, = selected_rows
+    if not math.isclose(selected["source_cycle_ms"], selection["selected_source_cycle_ms"], rel_tol=1e-12, abs_tol=1e-8):
+        raise ValueError("shared source-selected cycle disagrees with its target estimate source")
     operator_cache = operator_cache if operator_cache is not None else {}
     if selected["rank"] not in operator_cache:
         operator_cache[selected["rank"]] = _lm_operator_source_means(prepared[selected["rank"]])
@@ -4395,7 +4579,8 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
             "cycle_ms": selected["cycle_ms"], "per_device_tokens_s": selected["per_device_tokens_s"],
             "global_tokens_s": selected["global_tokens_s"], "tpot_ms": selected["tpot_ms"],
             "source_cycle_ms": selected["source_cycle_ms"], "selected_rank": selected["rank"],
-            "aggregation": "max_of_per_rank_mean_of_per_round_layer_type_mean_estimates",
+            "source_rank": selected["rank"], "rank_selection": selection,
+            "aggregation": "per_round_layer_type_means_on_shared_source_cycle_rank",
             "per_rank": per_rank, "class_means": selected["class_means"], "role_details": selected["role_details"],
             "target_stage_breakdowns": target_stages,
             "source_partition": selected["source_partition"], "breakdown": selected["breakdown"],
@@ -4422,6 +4607,14 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
         operator_cache = {}
         source_errors = result.pop('_layer_mean_source_errors', [])
         coverage = {}
+        try:
+            rank_selection = _lm_source_rank_selection(result)
+        except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+            rank_selection = {"policy": "max_of_captured_rank_mean_source_cycle",
+                "basis": "retained_source_full_cycle_before_extrapolation", "status": "UNAVAILABLE",
+                "selected_rank": None, "selected_source_cycle_ms": None, "scope": "captured_ranks_only",
+                "reason": str(error)}
+            source_errors.append(str(error))
         try:
             config, model = result["config"], result["source_model"]
             source_schedule, target_schedule, errors = schedule_fn(model, config, result.get("target_model"))
@@ -4506,27 +4699,31 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
                     if errors:
                         raise ValueError("; ".join(errors))
                 method = _lm_estimate_method(result, prepared, shapes, target_schedule, comm, method_id, excluded,
-                                             operator_cache=operator_cache)
+                                             operator_cache=operator_cache, rank_selection=rank_selection)
                 method["warnings"].extend(coverage_warnings)
                 method["coverage"] = coverage
                 if method_id == "method2":
                     method["assumptions"].extend(assumptions)
             except (ValueError, KeyError, OSError, TypeError, ArithmeticError) as error:
                 source_summary = _lm_source_summary(prepared) if prepared else []
+                source_reference = next((row for row in source_summary
+                                         if row["rank"] == rank_selection["selected_rank"]), None)
                 method = {"id": method_id, "name": "方法1：按层类型均值＋逻辑通信倍率" if method_id == "method1" else "方法2：按层类型均值＋历史通信倍率",
                           "status": "UNAVAILABLE", "reasons": [str(error)], "assumptions": list(LAYER_MEAN_ASSUMPTIONS),
                           "warnings": coverage_warnings, "coverage": coverage,
                           "cycle_ms": None, "per_device_tokens_s": None, "global_tokens_s": None,
-                          "tpot_ms": None, "selected_rank": None, "per_rank": source_summary,
-                          "class_means": source_summary[0]["class_means"] if source_summary else [],
-                          "role_details": source_summary[0]["role_details"] if source_summary else [],
-                          "source_partition": source_summary[0]["source_partition"] if source_summary else {},
+                          "tpot_ms": None, "selected_rank": None, "source_rank": rank_selection["selected_rank"],
+                          "rank_selection": rank_selection, "per_rank": source_summary,
+                          "class_means": source_reference["class_means"] if source_reference else [],
+                          "role_details": source_reference["role_details"] if source_reference else [],
+                          "source_partition": source_reference["source_partition"] if source_reference else {},
                           "breakdown": [], "detail_rows": [], "compute_evidence": [], "target_stage_breakdowns": [],
                           "communication": comm, "comm_model": comm}
             methods.append(method)
         result["projection"]["layer_mean_methods"] = methods
         result["projection"]["display_method_set"] = "layer_mean_methods"
-    report.setdefault("contract", {})["layer_mean"] = "per-rank/per-round attention-kind means; main0 reference excluded by default; original chain boundaries and cross-role/tail residual retained once; explicit uncalibrated estimate"
+        result["projection"]["rank_selection"] = rank_selection
+    report.setdefault("contract", {})["layer_mean"] = "per-rank/per-round attention-kind means; main0 reference excluded by default; original chain boundaries and cross-role/tail residual retained once; both methods share the rank selected by retained source full-cycle mean before extrapolation; explicit uncalibrated estimate"
     return report
 
 
@@ -4752,7 +4949,7 @@ def render_html(path, report):
              '<title>10T模型推理估算</title><style>body{font:15px system-ui;margin:32px;background:#f4f7fb;color:#182c45}h1{font-size:26px}p{line-height:1.8}table{border-collapse:collapse;width:100%;background:white}td,th{padding:12px;border:1px solid #d7e0eb;text-align:left}th{background:#163551;color:white}</style>',
              '<h1>10T模型推理估算</h1>',
              '<p>主0只排除参考；HCA/CSA按各rank各轮同类型均值外推，草稿独立。通信及路由GMM只加变化量。方法一每次Dispatch/Combine目标耗时加14μs；方法二不再叠加。</p>',
-             '<p>源层间衔接及轮次剩余区间分别保留一次。先求各rank周期均值，再选最大rank；吞吐按目标物理卡数均摊。</p>',
+             '<p>源层间衔接及轮次剩余区间分别保留一次。先按外推前源完整周期均值选rank，两种方法共用该rank；吞吐按目标物理卡数均摊。</p>',
              '<table><thead><tr>' + ''.join('<th>' + esc(key) + '</th>' for key in fields) + '</tr></thead><tbody>']
     parts.extend('<tr>' + ''.join('<td>' + esc(row.get(key)) + '</td>' for key in fields) + '</tr>' for row in rows)
     parts += ['</tbody></table><p>Q_card＝1000×BS×目标DP×Neff/(目标周期ms×目标物理卡数)。</p>',
@@ -5218,7 +5415,7 @@ def main():
                                           'error': reference_error},
               'contract': {'source_depth': '8 main + 3 draft', 'timestamps': 'integer ns', 'timings': 'ms',
                            'throughput': 'new output token/s/physical card',
-                           'projection': 'exclude main0 reference; per-rank per-round attention means, rank means then maximum'}}
+                           'projection': 'select shared rank by retained source full-cycle mean before extrapolation; exclude main0 reference; per-rank per-round attention means'}}
     seen, jobs, failed = set(), [], {}
     for index, item in enumerate(config['cases']):
         name = item.get('name', 'unnamed') if isinstance(item, dict) else 'invalid'

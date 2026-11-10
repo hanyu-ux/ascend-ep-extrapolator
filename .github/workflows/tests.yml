@@ -39,3 +39,6 @@ jobs:
       - name: Verify BS and speculation sweep charts on Windows
         if: ${{ !cancelled() }}
         run: python -B -S -m unittest discover -s tests -p 'test_ep128*sweep*.py' -v
+      - name: Verify shared source rank and offline alignment on Windows
+        if: ${{ !cancelled() }}
+        run: python -B -S -m unittest discover -s tests -p 'test_ep128*source_rank*.py' -v
