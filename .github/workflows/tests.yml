@@ -32,7 +32,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Verify serial and spawn results on Windows
-        run: python -B -S -m unittest discover -s tests -p 'test_ep128_parallel.py' -v
+        run: python -B -S -m unittest discover -s tests -p 'test_ep128*parallel.py' -v
       - name: Verify Windows CLI and report export
         if: ${{ !cancelled() }}
         run: python -B -S -m unittest discover -s tests -p 'test_ep128_v2_cli.py' -v

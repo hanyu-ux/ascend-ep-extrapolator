@@ -7,8 +7,8 @@
   },
   "components": {
     "profile_ep128.py": {
-      "version": "20261110.2.parallel_analysis",
-      "sha256": "95ef224f42c959b813d9df8fb75b98c9a76ca20b404931039472c2d65aee5432",
+      "version": "20261110.3.rank_parallel",
+      "sha256": "3c1ed4f68b07cd7a3488c10e719c1c47db74936c3cbce3e24d7e564f74f8ae7e",
       "imported_version": "20261103.12.native_stages",
       "imported_sha256": "035f0c6312354ca0937361f1ab301452ed61c68239845b2c0c76f08653f9d7f7",
       "matches_imported_source": false
@@ -65,11 +65,12 @@
     "Final selected-rank CSA/HCA/SWA stages add optional operator drill-downs. Integer-nanosecond, all-stream clipped sweeps retain named parallel multiplicities and no-record gaps; source means use the parent reference layers and retained rounds, including zero for proven absent fingerprints. Native names, shapes, dtypes, streams and original row examples remain traceable. Existing Dispatch/Combine/GMM deltas are separate signed model entries; original cycle, TPOT, throughput, rank selection and ten-stage/U accounting are unchanged. Method1/2 sheets and HTML show closed Top-N coverage/model ledgers and separate nonadditive source-kernel hotspots, with readable labels, explicit aggregate remainders and old-report fallback. Only final selected-rank groups export operator detail, with source aggregation cached across methods; no private capture or detailed analysis is included.",
     "Operator labels in both method sheets and HTML retain complete parent-stage and operator type names, input shapes and streams with explicit wrapping. Full native names, output shapes and dtypes stay visible in source columns. Table and chart heights follow text length; continuation rows preserve long evidence and charts retain their original values. This renderer-only update can redraw existing operator-bearing JSON without resampling or changing core estimates, rankings or Top-N limits.",
     "Method1/2 sheets add fine main_inputs/main_metadata device-interval ledgers, pinned static function-entry references and one fixed selected-rank HC-round line chart with missing values preserved. New CSV exports retain every captured rank and original HC identity. Source Top8 kernels add whole-call Duration-weighted optional PMU counters, per-metric coverage and conservative AIC/AIV/MIX bound evidence without changing old timings, rankings, parent boundaries or extrapolation. Unknown counters remain unknown; non-ratio percent units and incomplete active-core time evidence cannot produce false bound diagnoses. Standard-library runtime and legacy JSON rendering remain supported; all private captures and generated reports remain local.",
-    "Case analysis uses a bounded spawn process pool (automatic maximum two, CPU/cgroup and low-memory budgets, --workers 1 for serial). Each case immediately finalizes both methods and releases prepared operator evidence; only private temporary-file identities cross IPC, and result/failure order stays deterministic. Rank coverage and all diagnostics remain intact. Bounded PMU value parsing and validated native PMU reuse reduce repeated work, exact Decimal trace timestamps avoid reparsing, and case/rank stage timing logs expose progress. Serial/spawn equivalence and Windows CLI/spawn CI are included; source/target timing, rank selection and all extrapolation formulas remain unchanged."
+    "Case analysis uses a bounded spawn process pool (automatic maximum two, CPU/cgroup and low-memory budgets, --workers 1 for serial). Each case immediately finalizes both methods and releases prepared operator evidence; only private temporary-file identities cross IPC, and result/failure order stays deterministic. Rank coverage and all diagnostics remain intact. Bounded PMU value parsing and validated native PMU reuse reduce repeated work, exact Decimal trace timestamps avoid reparsing, and case/rank stage timing logs expose progress. Serial/spawn equivalence and Windows CLI/spawn CI are included; source/target timing, rank selection and all extrapolation formulas remain unchanged.",
+    "Optional --parallel rank schedules every case/rank on one global spawn pool, with --workers as its total budget. Full case context and coverage are planned once; rank results spool privately, then each complete case is assembled in original rank order, finalized immediately, and released. Original duplicate-CSV and first preparation-error ordering, mean-rank tie selection, source and target formulas, and all successful-case CSV evidence are preserved. Default case parallelism remains compatible, including explicit nine-case concurrency. Windows CI also exercises rank concurrency and full serial/rank result equivalence."
   ],
   "validation": {
-    "discovered_tests": 380,
-    "passed": 370,
+    "discovered_tests": 388,
+    "passed": 378,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,

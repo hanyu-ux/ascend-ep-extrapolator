@@ -38,7 +38,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-三个运行脚本应放在同一目录。当前版本：统计 `20261110.2.parallel_analysis`、Excel 生成器 `20261110.1.u_focus_step_pmu`、写入器 `20261104.1.line_charts`。
+三个运行脚本应放在同一目录。当前版本：统计 `20261110.3.rank_parallel`、Excel 生成器 `20261110.1.u_focus_step_pmu`、写入器 `20261104.1.line_charts`。
 
 ## 快速运行
 
@@ -94,7 +94,16 @@ ascend-ep-extrapolator/
 python -u profile_ep128.py cases.local.json --out ep128_report --excel --workers 4
 ```
 
-`--workers 1` 使用串行。自动预算会考虑 CPU 与可用内存；探测到可用内存不足4 GiB时自动使用1个进程。显式设置仅受有效 case 数量限制，不会按内存自动改小。每个进程内部的 rank 仍顺序处理，不创建嵌套进程池。大采样每个进程可能使用数 GiB 内存，同时输出较大的证据 CSV；增加进程数须结合机器内存和磁盘吞吐。每个 case 完成后立即汇总并释放临时算子数据，最终结果和失败项仍按配置顺序排列；统计口径及各 rank 的证据不变。日志会标明 case、rank 和阶段，便于确认当前耗时位置。不同运行应使用不同 `--out` 目录。
+`--workers 1` 使用串行。自动预算会考虑 CPU 与可用内存；探测到可用内存不足4 GiB时自动使用1个进程。显式设置不会按内存自动改小。大采样每个进程可能使用数 GiB 内存，同时输出较大的证据 CSV；增加进程数须结合机器内存和磁盘吞吐。不同运行应使用不同 `--out` 目录。
+
+`--parallel` 选择并行粒度，两种模式共用一个总进程上限，不叠加：
+
+| 参数 | 行为 |
+| --- | --- |
+| `--parallel case --workers 9` | 最多同时分析9个 case；各 case 内的 rank 顺序处理。`case` 是默认模式。 |
+| `--parallel rank --workers 4` | 一个全局进程池最多同时分析4个 rank；同一 case 内的 rank 可以并行，单个 case 也能使用多个进程。 |
+
+rank 模式按 case 原顺序连续安排各自的 rank，分析结果暂存于私有临时目录；一个 case 的全部 rank 完成后，再按原 rank 顺序合并、校验重复 CSV、计算方法1/方法2并释放中间数据。临时盘需要容纳尚未汇总的 rank 证据。两种模式都保留全部 rank、统计口径、配置顺序和原来的最大均值 rank 选择规则；日志会标明 case、rank 和阶段。32GB Windows 机器可先用 `--parallel rank --workers 4` 观察实际内存与耗时，再调整进程数。
 
 ### 已有 JSON，只重绘 Excel
 
