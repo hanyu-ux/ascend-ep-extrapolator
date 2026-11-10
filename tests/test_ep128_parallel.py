@@ -4,7 +4,7 @@ from concurrent.futures import Future
 from contextlib import redirect_stdout
 import io
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import pickle
 import subprocess
 import sys
@@ -24,19 +24,42 @@ class ParallelCaseTests(unittest.TestCase):
             str(config), '--out', str(output), '--workers', str(workers)],
             text=True, capture_output=True, timeout=75)
 
+    def normalize_text(self, value, output):
+        # Some report fields and CSV cells contain serialized JSON, so Windows
+        # separators may appear raw, JSON-escaped, or escaped a second time.
+        prefixes = {str(output), output.as_posix()}
+        for _ in range(2):
+            prefixes.update(json.dumps(prefix, ensure_ascii=ascii_only)[1:-1]
+                            for prefix in tuple(prefixes) for ascii_only in (False, True))
+        for prefix in sorted(prefixes, key=len, reverse=True):
+            value = value.replace(prefix, '<OUTPUT>')
+        return value
+
     def normalize_output(self, value, output):
         if isinstance(value, dict):
             return {key: self.normalize_output(item, output) for key, item in value.items()
                     if key != 'generated_at'}
         if isinstance(value, list):
             return [self.normalize_output(item, output) for item in value]
-        return value.replace(str(output), '<OUTPUT>') if isinstance(value, str) else value
+        return self.normalize_text(value, output) if isinstance(value, str) else value
+
+    def test_output_normalization_handles_windows_and_embedded_json_paths(self):
+        output = PureWindowsPath('C:/用户/run/serial')
+        for path in (str(output), output.as_posix()):
+            with self.subTest(path=path):
+                self.assertEqual(self.normalize_text(path, output), '<OUTPUT>')
+                for ascii_only in (False, True):
+                    encoded = json.dumps(path, ensure_ascii=ascii_only)[1:-1]
+                    self.assertEqual(self.normalize_text(encoded, output), '<OUTPUT>')
+                    encoded_twice = json.dumps(encoded, ensure_ascii=ascii_only)[1:-1]
+                    self.assertEqual(self.normalize_text(encoded_twice, output), '<OUTPUT>')
 
     def test_spawn_and_serial_reports_and_all_csvs_are_identical_in_input_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             config = manifest(base)
             document = json.loads(config.read_text())
+            document['communication_reference'] = str(HERE / 'examples/communication-reference.synthetic.csv')
             first = document['cases'][0]
             first['name'] = 'ZETA_FIRST'
             second = copy.deepcopy(first)
@@ -53,6 +76,9 @@ class ParallelCaseTests(unittest.TestCase):
             b = json.loads((parallel_dir / 'model_architecture_report.json').read_text())
             self.assertEqual([item['name'] for item in b['cases']], ['ZETA_FIRST', 'ALPHA_SECOND'])
             self.assertEqual(self.normalize_output(a, serial_dir), self.normalize_output(b, parallel_dir))
+            for case in b['cases']:
+                self.assertEqual({method['id']: method['status'] for method in core.displayed_methods(case)},
+                                 {'method1': 'LAYER_MEAN_ESTIMATE', 'method2': 'LAYER_MEAN_ESTIMATE'})
             self.assertIn('layer_mean', b['contract'])
             self.assertTrue(all('_prepared_layer_means' not in case for case in b['cases']))
             left = {path.relative_to(serial_dir): path for path in serial_dir.rglob('*.csv')}
@@ -61,8 +87,8 @@ class ParallelCaseTests(unittest.TestCase):
             self.assertEqual(set(left), set(right))
             for relative, path in left.items():
                 with self.subTest(csv=str(relative)):
-                    self.assertEqual(path.read_text().replace(str(serial_dir), '<OUTPUT>'),
-                                     right[relative].read_text().replace(str(parallel_dir), '<OUTPUT>'))
+                    self.assertEqual(self.normalize_text(path.read_text(), serial_dir),
+                                     self.normalize_text(right[relative].read_text(), parallel_dir))
             self.assertIn('[case ZETA_FIRST]', parallel.stdout)
             self.assertIn('读取 dp0', parallel.stdout)
             self.assertIn('统计与估算完成', parallel.stdout)
@@ -179,9 +205,9 @@ class ParallelCaseTests(unittest.TestCase):
             '/sys/fs/cgroup/tenant/memory.current': str(2 * 1024 ** 3),
         }
         def read_text(path, *args, **kwargs):
-            if str(path) not in texts:
-                raise FileNotFoundError(str(path))
-            return texts[str(path)]
+            if path.as_posix() not in texts:
+                raise FileNotFoundError(path.as_posix())
+            return texts[path.as_posix()]
         with mock.patch.object(Path, 'read_text', read_text):
             self.assertEqual(core._cli_case_memory_available(), 2 * 1024 ** 3)
 

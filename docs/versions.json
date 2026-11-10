@@ -68,8 +68,8 @@
     "Case analysis uses a bounded spawn process pool (automatic maximum two, CPU/cgroup and low-memory budgets, --workers 1 for serial). Each case immediately finalizes both methods and releases prepared operator evidence; only private temporary-file identities cross IPC, and result/failure order stays deterministic. Rank coverage and all diagnostics remain intact. Bounded PMU value parsing and validated native PMU reuse reduce repeated work, exact Decimal trace timestamps avoid reparsing, and case/rank stage timing logs expose progress. Serial/spawn equivalence and Windows CLI/spawn CI are included; source/target timing, rank selection and all extrapolation formulas remain unchanged."
   ],
   "validation": {
-    "discovered_tests": 379,
-    "passed": 369,
+    "discovered_tests": 380,
+    "passed": 370,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,
