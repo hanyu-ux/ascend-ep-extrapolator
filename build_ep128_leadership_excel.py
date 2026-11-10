@@ -19,7 +19,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261110.2.bs_s_sweeps"
+RENDERER_VERSION = "20261110.3.shared_source_rank"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -119,6 +119,17 @@ def _validate_report(report):
         identities = [item.get("id") for item in methods]
         if any(item not in ("method1", "method2") for item in identities) or len(set(identities)) != len(identities):
             raise ValueError("方法id须为唯一的method1/method2")
+        selection = projection.get("rank_selection") or {}
+        shared_rank = selection.get("selected_rank") if selection.get("policy") == "max_of_captured_rank_mean_source_cycle" else None
+        declared_shared = [item.get("selected_rank") for item in [selection, *[method.get("rank_selection") or {} for method in methods]]
+            if item.get("policy") == "max_of_captured_rank_mean_source_cycle" and item.get("status") == "SELECTED"]
+        if declared_shared:
+            if None in declared_shared or len(set(declared_shared)) != 1:
+                raise ValueError("共同源rank元数据矛盾；同一case的两种方法不能声明不同rank")
+            shared_rank = declared_shared[0]
+            source_rank = _source(case).get("selected_rank")
+            if source_rank is not None and source_rank != shared_rank:
+                raise ValueError("共同rank与源基线选中rank不一致")
         for method in methods:
             if method.get("status") not in ("LAYER_MEAN_ESTIMATE", "PENDING", "UNAVAILABLE"):
                 raise ValueError("layer_mean_methods requires LAYER_MEAN_ESTIMATE, PENDING or UNAVAILABLE")
@@ -134,6 +145,13 @@ def _validate_report(report):
             if (not isinstance(ranks, list) or selected_rank is None or
                     sum(isinstance(item, dict) and item.get("rank") == selected_rank for item in ranks) != 1):
                 raise ValueError("LAYER_MEAN_ESTIMATE requires one explicit selected_rank in per_rank")
+            method_selection = method.get("rank_selection") or {}
+            if method_selection.get("policy") == "max_of_captured_rank_mean_source_cycle":
+                declared_rank = method_selection.get("selected_rank")
+                if declared_rank is None or selected_rank != declared_rank or shared_rank is not None and selected_rank != shared_rank:
+                    raise ValueError("共享源rank口径不一致；两种方法必须使用外推前选定的同一rank")
+            if shared_rank is not None and selected_rank != shared_rank:
+                raise ValueError("共享源rank口径不一致；不能混用旧方法所选rank")
     return report
 
 
@@ -674,6 +692,16 @@ def _source_sweep(case):
     return source_sweep_summary(case)
 
 
+def _align_source_rank(report):
+    from profile_ep128 import align_report_source_rank
+    return align_report_source_rank(report)
+
+
+def _save_source_rank_report(path, report):
+    from profile_ep128 import atomic_json
+    atomic_json(path, report)
+
+
 def _source_sweep_notes(case, summary):
     notes = [summary[key] for key in ("reason", "breakdown_reason") if summary[key]]
     aggregate = _source(case)
@@ -907,6 +935,20 @@ def _rank_note(method):
     return "目标rank未选择" + ("；源参考rank=" + _text(source) if source is not None else "")
 
 
+def _rank_selection_text(method):
+    selection = method.get("rank_selection") or {}
+    if selection.get("policy") == "max_of_captured_rank_mean_source_cycle":
+        if selection.get("selected_rank") is None:
+            return "共同源rank未选定；见方法不可用原因，不以其他rank补齐结果。"
+        return ("先按外推前源整轮平均耗时选rank=" + _text(selection.get("selected_rank"))
+            + "（源均值=" + _text(selection.get("selected_source_cycle_ms"))
+            + "ms）；同一case两种方法共用，外推后不重选；最大值范围仅为已采rank。")
+    if method.get("status") in ("PENDING", "UNAVAILABLE"):
+        return "方法不可用；不以其他rank补齐目标结果。"
+    return ("旧报告保留所存选中rank；未采用共同源rank新口径。"
+        "可用--align-source-rank从各rank已存结果离线对齐；不会读取CSV。")
+
+
 def _layer_mean_matrix_rows(method):
     """Copy the core-selected rank's class means; never average or choose ranks."""
     rows = []
@@ -1006,6 +1048,7 @@ def _overview(book, report):
             method = _method(case, identity)
             row = _note(sheet, row, _layer_mean_name(method) + " / " + _layer_mean_status(method) +
                         " / " + _rank_note(method) + " / 采样均值", columns=12)
+            row = _note(sheet, row, _rank_selection_text(method), columns=12)
             row = _layer_mean_cards(sheet, row, method, case_index, identity)
             row = _table(sheet, row, ["整轮组成/指标", "核心原值", "说明"], _layer_mean_closure_rows(method))
             row = _note(sheet, row, _explanation(method), warning=True, columns=12)
@@ -1016,6 +1059,7 @@ def _layer_mean_method_section(sheet, row, case, case_index, identity, method):
     row = _note(sheet, row, case["name"] + " · " + _layer_mean_name(method) +
                 " / " + _rank_note(method) + " / " + _layer_mean_status(method), columns=12)
     row = _note(sheet, row, _case_parameters(case), columns=12)
+    row = _note(sheet, row, _rank_selection_text(method), columns=12)
     row = _layer_mean_cards(sheet, row, method, case_index, identity)
     rank_scope = ("以下为核心所选rank的均值；不独立取主/草稿或某组件的最大值。"
                   if _layer_mean_publishable(method) else "源参考均值保留；目标输入不足时不选择目标rank。")
@@ -1029,8 +1073,8 @@ def _layer_mean_method_section(sheet, row, case, case_index, identity, method):
     row = _method_residual_section(sheet, row, case, method)
     row = _method_focus_section(sheet, row, case, method)
     row = _method_stage_expansions(sheet, row, case, method)
-    row = _table(sheet, row, ["采样rank", "周期均值(ms)", "主模型目标链(ms)", "草稿目标链(ms)", "轮次剩余区间(ms)", "核心选中"],
-        [[item.get("rank"), _layer_mean_value(method, item.get("cycle_ms"), True),
+    row = _table(sheet, row, ["采样rank", "外推前整轮均值(ms)", "本方法目标周期均值(ms)", "主模型目标链(ms)", "草稿目标链(ms)", "轮次剩余区间(ms)", "核心选中"],
+        [[item.get("rank"), item.get("source_cycle_ms"), _layer_mean_value(method, item.get("cycle_ms"), True),
           *[_layer_mean_value(method, next((role.get("target_chain_ms") for role in item.get("role_details") or []
                                            if role.get("role") == identity_role), None), True)
             for identity_role in ("main", "draft")],
@@ -1950,7 +1994,7 @@ def _method_focus_data(case, method):
     result.update(available=True, categories=[row[1] for row in result["step_rows"]],
         series=[(label, [row[2 + index] for row in result["step_rows"]], color)
             for index, ((_, label), color) in enumerate(zip(FOCUS_KEYS, ("168B8D", "D4793A")))],
-        note="rank=" + _text(selected) + "；" + _text(focus.get("scope") or "本方法selected_rank（最大完整周期均值rank）")
+        note="rank=" + _text(selected) + "；" + _rank_selection_text(method) + "；" + _text(focus.get("scope") or "沿用完整周期分析所选rank")
             + "；完整细分区间=" + _text(focus.get("segments_csv")) + "；逐轮CSV=" + _text(focus.get("steps_csv")))
     return result
 
@@ -2287,7 +2331,7 @@ def _review_sheet(book, report, origin):
         for identity in ("method1", "method2"):
             method = _method(case, identity)
             row = _table(sheet, row, ["方法", "状态", "核心选中rank", "汇总方式"],
-                         [[_layer_mean_name(method), _layer_mean_status(method), method.get("selected_rank"), "各rank先取轮次均值，再选最大周期均值"]])
+                         [[_layer_mean_name(method), _layer_mean_status(method), method.get("selected_rank"), _rank_selection_text(method)]])
             row = _table(sheet, row, ["本次原因/限制", "核心原文"],
                          [[field, value] for field in ("reasons", "warnings") for value in method.get(field) or []])
         row = _table(sheet, row, ["采样rank", "CSV来源", "SHA256"],
@@ -2729,6 +2773,7 @@ def _html_preview(report, out):
             method = _method(case, identity)
             parts.append('<section><h3>' + esc(_layer_mean_name(method)) + '</h3><p>' +
                          esc(_rank_note(method)) + '；采样均值</p>')
+            parts.append('<p>' + esc(_rank_selection_text(method)) + '</p>')
             parts.append('<p>' + esc(_case_parameters(case)) + '</p>')
             parts.append(_html_table(["完整周期(ms)", "TPOT(ms/token)", "预测单卡吞吐(token/s/card)", "状态"],
                          [[_target(method, "cycle_ms"), _target(method, "tpot_ms"), _target(method, "per_device_tokens_s"), _layer_mean_status(method)]]))
@@ -2789,12 +2834,14 @@ def _check_result_cells(book, report):
 
 def build_workbook(out, *, report=None, report_data=None, cases=None, reference=None,
                    reference_unit='unknown', preview=False, detail_rows=DEFAULT_DETAIL_ROWS, progress=None,
-                   expected_method_set=None):
+                   expected_method_set=None, align_source_rank=False):
     """Render a core report or an honestly empty configuration preview.
 
     ``report_data`` reuses an already loaded report without parsing its JSON
     again. ``report`` remains required as its source label. The supplied object
-    undergoes the usual report validation and is not copied or modified.
+    undergoes the usual report validation and is not modified. With
+    ``align_source_rank``, the core creates a derived report using each method's
+    saved per-rank results; the derived JSON is saved beside the workbook.
     ``expected_method_set`` prevents rendering a different method set from the
     one requested by the caller.
     """
@@ -2815,6 +2862,11 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
         raise ValueError('配置只能配合--preview；不能从配置伪造性能结果')
     if report is not None and preview:
         raise ValueError('--preview只用于--cases；真实报告状态由核心JSON决定')
+    if align_source_rank and (cases is not None or preview):
+        raise ValueError('--align-source-rank只用于已有报告JSON，不能用于配置预览')
+    aligned_path = Path(out).with_suffix('.source_rank.json') if align_source_rank else None
+    if aligned_path is not None and aligned_path.resolve() == Path(report).resolve():
+        raise ValueError('对齐后的JSON不能覆盖输入报告；请为--out选择另一个文件名')
     runtime = runtime_diagnostics()
     if not callable(getattr(xlsx_writer.Worksheet, "add_line_chart", None)):
         raise ValueError("Excel写入器缺少BS趋势图接口；请同步更新build_ep128_leadership_excel.py和ep128_xlsx_writer.py。"
@@ -2837,6 +2889,9 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
         payload = stage("读取配置预览" if cases is not None else "读取核心JSON",
                         lambda: _preview_report(cases) if cases is not None else _read_json(report))
     stage("校验核心报告", lambda: _validate_report(payload))
+    if align_source_rank:
+        payload = stage("按外推前源整轮均值对齐两方法rank", lambda: _align_source_rank(payload))
+        stage("校验共同源rank报告", lambda: _validate_report(payload))
     if expected_method_set is not None:
         stage("核对导出方法集", lambda: _check_expected_method_set(payload, expected_method_set, report or cases))
     if progress is not None:
@@ -2857,6 +2912,8 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
     stage("核对Excel关键结果", lambda: _check_result_cells(book, payload))
     path = stage("写入XLSX", lambda: book.save(out))
     stage("写入HTML预览", lambda: _html_preview(payload,path))
+    if aligned_path is not None:
+        stage("保存共同源rank核心JSON", lambda: _save_source_rank_report(aligned_path, payload))
     return Path(path)
 
 
@@ -2870,6 +2927,8 @@ def main():
     parser.add_argument('--reference',type=Path,help='原通信CSV仅展示；不参与renderer估算')
     parser.add_argument('--reference-unit',choices=('unknown','us','ms'),default='unknown')
     parser.add_argument('--out',type=Path,default=Path('10T模型推理估算.xlsx'))
+    parser.add_argument('--align-source-rank',action='store_true',
+                        help='将旧JSON按外推前源整轮均值最大rank对齐两方法；不读CSV，另存.source_rank.json')
     parser.add_argument('--detail-rows',type=int,default=DEFAULT_DETAIL_ROWS,
                         help='每case每类明细在Excel中最多预览的条数，默认1000，范围1..10000；核心统计及完整JSON不变')
     args=parser.parse_args()
@@ -2882,12 +2941,15 @@ def main():
     try:
         path=build_workbook(args.out,report=args.report,cases=args.cases,reference=args.reference,
                             reference_unit=args.reference_unit,preview=args.preview,detail_rows=args.detail_rows,
+                            align_source_rank=args.align_source_rank,
                             progress=lambda name: print('Excel阶段：'+name, file=sys.stderr, flush=True))
     except (OSError,ValueError,KeyError,TypeError) as error:
         traceback.print_exc(file=sys.stderr)
         return 1
     print('Excel：'+str(path.resolve()))
     print('HTML预览：'+str(path.with_suffix('.html').resolve()))
+    if args.align_source_rank:
+        print('共同源rank核心JSON：'+str(path.with_suffix('.source_rank.json').resolve()))
     return 0
 
 

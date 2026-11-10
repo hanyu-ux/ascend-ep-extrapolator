@@ -293,9 +293,10 @@ class RendererV2Tests(unittest.TestCase):
             if not isinstance(node, ast.ImportFrom):
                 continue
             if node.module == 'profile_ep128':
-                # Old JSON redraw may read the pure source-only summary helper;
-                # target estimation, rank selection and CSV access stay in core.
-                self.assertEqual([alias.name for alias in node.names], ['source_sweep_summary'])
+                # Core owns source summaries/offline rank alignment; the renderer
+                # may persist that derived JSON but never imports estimators.
+                allowed = {'source_sweep_summary', 'align_report_source_rank', 'atomic_json'}
+                self.assertTrue({alias.name for alias in node.names} <= allowed)
             else:
                 imports.append(node.module or '')
         self.assertFalse(any('profile_ep128' in name or 'source_point' in name or 'legacy' in name for name in imports))

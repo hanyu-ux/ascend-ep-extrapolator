@@ -103,7 +103,7 @@ python -u profile_ep128.py cases.local.json --out ep128_report --excel --workers
 | `--parallel case --workers 9` | 最多同时分析9个 case；各 case 内的 rank 顺序处理。`case` 是默认模式。 |
 | `--parallel rank --workers 4` | 一个全局进程池最多同时分析4个 rank；同一 case 内的 rank 可以并行，单个 case 也能使用多个进程。 |
 
-rank 模式按 case 原顺序连续安排各自的 rank，分析结果暂存于私有临时目录；一个 case 的全部 rank 完成后，再按原 rank 顺序合并、校验重复 CSV、计算方法1/方法2并释放中间数据。临时盘需要容纳尚未汇总的 rank 证据。两种模式都保留全部 rank、统计口径、配置顺序和原来的最大均值 rank 选择规则；日志会标明 case、rank 和阶段。32GB Windows 机器可先用 `--parallel rank --workers 4` 观察实际内存与耗时，再调整进程数。
+rank 模式按 case 原顺序连续安排各自的 rank，分析结果暂存于私有临时目录；一个 case 的全部 rank 完成后，再按原 rank 顺序合并、校验重复 CSV、计算方法1/方法2并释放中间数据。临时盘需要容纳尚未汇总的 rank 证据。两种并行模式保留全部 rank、配置顺序，并统一按外推前源整轮均值选定两种方法共用的 rank；日志会标明 case、rank 和阶段。32GB Windows 机器可先用 `--parallel rank --workers 4` 观察实际内存与耗时，再调整进程数。
 
 ### 已有 JSON，只重绘 Excel
 
@@ -115,9 +115,17 @@ python -u build_ep128_leadership_excel.py --report ep128_report/model_architectu
 
 报告同时展示两种横坐标：固定投机步长 S 看 BS，固定 BS 看 S。总览展示两种外推方法的单卡吞吐、TPOT 和完整周期曲线；两个方法页各展示整轮五项耗时随 BS、S 的变化。源采样基线页独立展示相同指标及五项分解，HTML 同步包含这些表和图，仍保留 9 个工作表。
 
-**ITL 代理值取完整周期，单位 ms/轮**，表示每轮输出间隔；采样没有逐 token 发送时间，不能把它当作实测逐 token ITL。TPOT 为周期除以该 case 配置的 SAL/Neff。固定 BS 的 S 对比保留每点自己的 SAL/Neff；未声明固定接受率时，不将变化只归因于 S。源基线沿用源周期均值最大的 rank，各方法沿用各自原选 rank，逐点列明；源五项使用该源 rank 的实际完整层边界，包含主0。缺少边界时只留空受影响的分解，不借用目标数据。重复横坐标保留各行、不画合并曲线；缺值断线。
+**ITL 代理值取完整周期，单位 ms/轮**，表示每轮输出间隔；采样没有逐 token 发送时间，不能把它当作实测逐 token ITL。TPOT 为周期除以该 case 配置的 SAL/Neff。固定 BS 的 S 对比保留每点自己的 SAL/Neff；未声明固定接受率时，不将变化只归因于 S。每个 case 的源基线与两种方法统一使用外推前源整轮均值最大的 rank，逐点列明；源五项使用该源 rank 的实际完整层边界，包含主0。旧 JSON 直接重绘保留旧口径，切换方式见下方。缺少边界时只留空受影响的分解，不借用目标数据。重复横坐标保留各行、不画合并曲线；缺值断线。
 
 已有完整 JSON 可直接用新版脚本重绘上述视图，无需重跑 CSV 分析。更新时一并复制 `profile_ep128.py` 和 `build_ep128_leadership_excel.py`，并保留同目录的 `ep128_xlsx_writer.py`。
+
+已有 JSON 若仍是两种方法独立选 rank 的旧口径，可离线切换：
+
+```bash
+python -u build_ep128_leadership_excel.py --report ep128_report/model_architecture_report.json --align-source-rank --out "ep128_report/共同源rank.xlsx"
+```
+
+此操作从源保留轮次选出共同 rank，再使用各方法已保存的该 rank 外推结果，另存 `共同源rank.source_rank.json`，并生成 Excel/HTML；原 JSON 不变，不读取 CSV。已存阶段与 U/逐 step 诊断随 rank 切换；新 rank 缺少算子/PMU证据时明确留空，不沿用旧 rank 明细。没有该 rank 的完整外推结果则报错，需要补统计，不能只改 rank 标签。直接重绘不加此参数时保留旧报告数据并注明旧口径。
 
 ## 配置口径
 
@@ -197,7 +205,9 @@ R目标 = 31 × 目标HCA层区间均值 + 30 × 目标CSA层区间均值
 
 新增 53 段主衔接的参考均值取不触及主0的 6 段边界；原来的 0→1 衔接仍保留在源7段合计中。
 
-脚本先**逐 rank、逐轮外推**，再对各 rank 的保留轮次求周期均值，最后选均值最大的 rank。各分项始终来自同一个选中 rank，不将不同 rank 的分项最大值拼接。两种方法及不同 BS 可以选中不同 rank。采样 rank 不全时会明确警告，不能声称已覆盖全系统最慢 rank。
+脚本先按每个 rank **外推前的完整源周期**，对首尾裁剪后保留轮次求平均，再选均值最大的 rank；并列时取源输入顺序中的第一个。完整周期包含主0、主/草稿层链、层间衔接和 U，不使用剔除主0后的参考层均值来选 rank。同一 case 的方法1/2固定共用此 rank；各方法仍保留全部 rank 的逐轮及均值外推结果，外推后不再改选。总览、五项分解、层阶段、U、逐 step 和算子/PMU均跟随该共同 rank。不同 BS/S 的 case 可各选自己的源 rank。
+
+因此当前结果是“源采样最慢平均 rank 上的两种外推”，不保证等于各方法外推后所有 rank 的最大周期。采样 rank 不全时，最大值仅限已采 rank，不能声称已覆盖全系统最慢 rank。方法缺输入仍标不可用，不以其他 rank 结果替代。
 
 ## 两种外推方法
 
@@ -260,7 +270,7 @@ TPOT（ms/token） = R / Neff
 
 方法1、方法2页还提供“下一主模型 KV 与输入准备”和“下一主 metadata 及输入映射准备”的额外细分：表格、横向柱状图和源码函数入口对应。细项按真实设备区间拆成单算子覆盖、具名并发组合和无记录间隙，合计等于原父段；函数入口是带版本依据的源码映射，不是 Python 函数实测耗时。
 
-两段的逐 step 表和折线使用本方法已选中的同一个 rank，展示各个保留 HC 周期的变化，并列均值、P50、P90和最大值。这里的 step 是保留周期及其原始 round_id，不冒充 trace 中的 `ProfilerStep`；不会逐点改选其他 rank。未识别 step 保留空值和原因，折线断开，不补0。
+两段的逐 step 表和折线使用本 case 在外推前选定的共同源 rank，两种方法展示相同源轮次证据，并列均值、P50、P90和最大值。这里的 step 是保留周期及其原始 round_id，不冒充 trace 中的 `ProfilerStep`；不会逐点改选其他 rank。未识别 step 保留空值和原因，折线断开，不补0。
 
 CSA、HCA、SWA 的源实测 Top8 热点后增加 PMU 指标和 bound 方向表，包含矩阵/向量计算、标量、读入/写出及片内搬运流水、核内时间、分核数和指标覆盖率等。指标按源 kernel **完整调用 Duration 加权**，不乘目标层数或外推倍率；跨阶段裁剪仅定位耗时，不能测得局部 PMU。bound 是有证据说明及置信度的流水倾向，MTE2 高不等于 HBM 已饱和，`cube_utilization` 也不是 MFU。需要原 CSV 已含相应 PMU 列；没有采集的数据继续显示未知。更新后应重新运行核心统计，旧 JSON 只重绘不能补出这些证据。
 

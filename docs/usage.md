@@ -136,6 +136,18 @@ python -u build_ep128_leadership_excel.py --report ep128_report/model_architectu
 
 重绘只读指定 JSON，不再读取原 CSV、trace 或 cases，也不会自动扫描新增 BS。使用绝对路径可减少误读其他目录旧报告的可能。`schema_version=2` 不因新增 BS 而改变。
 
+新版统计先用各 rank 外推前的完整源周期求保留轮次均值，选最大者作为同一 case 两种方法共用的 rank；均值并列按源输入顺序取第一个。选 rank 时包含主0、主/草稿、衔接和 U，主0只从后续参考层均值中排除。两种方法仍各自计算并保留全部 rank 的外推结果，最终卡片、五项、阶段和源诊断固定取共同 rank；不保证该 rank 也是外推后最慢者。最大值只限已采 rank。
+
+旧 JSON 直接重绘会保留所存数据并标明旧口径。要使用已存的逐 rank 外推结果切换到共同源 rank，无需重读九个 case 的 CSV：
+
+```bash
+python -u build_ep128_leadership_excel.py --report ep128_report/model_architecture_report.json --align-source-rank --out "ep128_report/共同源rank.xlsx"
+```
+
+生成 `共同源rank.xlsx`、同名 HTML 和 `共同源rank.source_rank.json`，原 JSON 不变；原有 CSV 导出仍属于旧报告。共同 rank 的周期、吞吐、TPOT、五项、分类和阶段取自各方法自己的 `per_rank` 行；U/逐 step 从相同 rank 的实测诊断取值。旧报告未保存新 rank 的 Top8/PMU 时显示缺证据，不沿用旧 rank 明细，也不将另一方法的目标增量复制过来。缺少共同 rank 的完整结果时停止并报具体缺项，不只改标签。若需要补齐缺失证据，再用新版核心处理原 CSV，不要求重新采样。
+
+新结果在 `projection.rank_selection` 和各方法的 `rank_selection` 中保存选择口径、源均值、平局规则和 rank 覆盖；共同策略为 `max_of_captured_rank_mean_source_cycle`。不可用方法保持不可用，并用 `source_rank` 记录共同源参考，不伪填目标结果。
+
 如果只想先看配置版式、还没有采样数据，可执行：
 
 ```bash
@@ -147,7 +159,7 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 ## 6. 如何核对结果
 
 1. 检查 case 的 `config.bs`、Neff、采样背景和 rank 覆盖。
-2. 检查每种方法的状态和所选 rank。方法1、2可能选择不同 rank。
+2. 检查每种方法的状态和所选 rank。新版按外推前源整轮平均耗时选一个 rank，同一 case 的方法1/2共用；方法不可用时不伪填目标 rank。
 3. 五项分解应闭合到目标周期；U 父阶段是 U 的展开，不再加到周期上。
 4. 主0仅从参考均值排除；目标主层仍完整计数。
 5. TPOT = 所选 rank 的目标平均周期 / Neff，不再除 BS 或 DP。
@@ -176,7 +188,7 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 4. 下一主模型 KV 与输入准备子阶段。
 5. 下一主 metadata 及输入映射准备子阶段。
 
-前三组使用当前方法 `selected_rank`、保留轮次和原估算相同的参考层：先在每轮内取同类型参考层均值，再按保留轮次取均值，默认主0不参加参考。表格同时给出源单层均值、目标单层均值、目标同类全部层合计以及占完整目标周期的比例；主图采用目标同类全部层合计，便于比较目标模型的耗时构成。两种方法独立使用各自的通信倍率和所选 rank，不混用其他 rank 的诊断。
+前三组使用当前方法 `selected_rank`、保留轮次和原估算相同的参考层：先在每轮内取同类型参考层均值，再按保留轮次取均值，默认主0不参加参考。表格同时给出源单层均值、目标单层均值、目标同类全部层合计以及占完整目标周期的比例；主图采用目标同类全部层合计，便于比较目标模型的耗时构成。两种方法使用各自的通信倍率，共用在外推前按源整轮均值选定的 rank，不混用其他 rank 的诊断。
 
 Dispatch 阶段只追加核心的 Dispatch 增量，Combine 阶段只追加 Combine 增量；“专家计算及衔接”整段只追加其中路由 GMM 的增量，激活及衔接时间不整体乘倍率。其他阶段沿用源参考均值。目标 10 段之和必须等于目标单层耗时，乘同类型目标层数后等于该类型层区间合计；这些费用已经包含在完整周期内，不再次追加。占周期比例的分母包含其他类型层、层间衔接和 U，因此单个类型的比例之和通常小于 100%。
 
@@ -241,7 +253,7 @@ python build_ep128_leadership_excel.py --report ep128_report/model_architecture_
 
 - 细项采用原始整数纳秒区间，在父段内合并所有可见 stream 的时间边界，分为单算子覆盖、具名并发组合、无设备记录间隙。各项互斥且覆盖父段，完整证据缺失时不编造函数归属。
 - 函数表给出设备入口、对应 Python 包装入口、相对源码路径、版本依据和原始 CSV 行号。它表示静态源码对应，不表示 trace 已测得该 Python 函数的入口到返回耗时。间隙没有足够来源证据时保留未知，不归成某个 CPU 函数。
-- 逐 step 图沿用每种方法按完整周期均值选出的 rank；同一张图中两段、所有点都属于这个 rank。分类保留原始 HC `round_id`，另列保留序号；不是 `ProfilerStep` 或墙钟采样序号。
+- 逐 step 图沿用本 case 外推前源整轮均值最大的共同 rank，两种方法不再分别改选；同一张图中两段、所有点都属于这个 rank。分类保留原始 HC `round_id`，另列保留序号；不是 `ProfilerStep` 或墙钟采样序号。
 - 表中均值、P50、P90、最大值及匹配数量说明波动。缺失 step 留空并标原因，折线断开；不能用0代替，也不借用别的 rank 或前后 step。
 - 细分表的分母是对应父段，细项相加等于父段；不得再把细项加到 U、完整周期、TPOT 或吞吐中。
 

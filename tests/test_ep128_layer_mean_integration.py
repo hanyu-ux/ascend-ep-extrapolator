@@ -565,7 +565,7 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(delta['target_total_ms'], -31 * .2)
         self.assertLess(delta['cycle_share'], 0)
 
-    def test_methods_use_operator_evidence_from_their_own_selected_rank(self):
+    def test_methods_use_operator_evidence_from_the_common_source_selected_rank(self):
         report, native = self.native_report({'dp0': [1., 1.], 'dp1': [1.01, 1.01]})
         self.add_payloads(report, native)
         for measured in report['cases'][0]['measurements']:
@@ -583,13 +583,17 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
         reference = HERE / 'examples/communication-reference.synthetic.csv'
         report['communication_reference'] = {'rows': core.read_reference(reference)}
         methods = self.attach(report, native)
-        self.assertEqual([row['selected_rank'] for row in methods], ['dp1', 'dp0'])
-        for method, clipped in zip(methods, (.0101, .01)):
+        self.assertEqual([row['selected_rank'] for row in methods], ['dp1', 'dp1'])
+        # Method2's target-model maximum is dp0, but the source full-round
+        # mean selects dp1 before either extrapolation is evaluated.
+        target_ranks = {row['rank']: row for row in methods[1]['per_rank']}
+        self.assertGreater(target_ranks['dp0']['cycle_ms'], target_ranks['dp1']['cycle_ms'])
+        for method in methods:
             self.assert_operator_closure(method)
             _, stages = self.stages(method)
             kernel = next(row for row in stages['attention_prepare']['operator_breakdown']['kernels']
                           if row['name'] == 'CarryIn')
-            self.assertAlmostEqual(kernel['kernel_sum_ms'], clipped)
+            self.assertAlmostEqual(kernel['kernel_sum_ms'], .0101)
             self.assertEqual(kernel['example']['rank'], method['selected_rank'])
 
     def test_workbook_and_html_keep_ten_stages_and_fifteen_u_stages_beside_operator_charts(self):
