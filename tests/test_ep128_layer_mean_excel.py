@@ -467,7 +467,9 @@ class LayerMeanRendererTests(unittest.TestCase):
         ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
         charts = self.chart_parts_by_sheet(out, book)
         for sheet_name, expected_count in (('估算总览', 6), ('方法1估算', 2), ('方法2估算', 2)):
-            lines = [chart for chart in charts[sheet_name] if chart.find('.//c:lineChart', ns) is not None]
+            # S sweeps are additional views; this contract covers fixed-S BS curves.
+            lines = [chart for chart in charts[sheet_name] if chart.find('.//c:lineChart', ns) is not None
+                     and '随BS变化' in self.chart_title(chart)]
             self.assertEqual(len(lines), expected_count)
             for chart in lines:
                 self.assert_line_cache_matches_sheet(chart, book, [4, 8])
@@ -1073,9 +1075,10 @@ class LayerMeanRendererTests(unittest.TestCase):
         out, _ = self.build(report)
         preview = out.with_suffix('.html').read_text(encoding='utf-8')
         svgs = [ET.fromstring(svg) for svg in re.findall(r'<svg\b.*?</svg>', preview, re.DOTALL)]
+        svgs = [svg for svg in svgs if not (svg.findtext('title') or '').startswith('源采样基线 · ')]
         self.assertEqual(len(svgs), 5)
         self.assertEqual([svg.findtext('title') for svg in svgs[:3]],
-                         ['单卡吞吐随BS变化', '完整周期随BS变化', 'TPOT随BS变化'])
+                         ['单卡吞吐随BS变化', '完整周期（ITL代理）随BS变化', 'TPOT随BS变化'])
         for index, svg in enumerate(svgs[3:], 1):
             self.assertIn(renderer._layer_mean_name({'id': 'method' + str(index)}), svg.findtext('title'))
             self.assertIn('整轮五项耗时构成随BS变化', svg.findtext('title'))
@@ -1126,7 +1129,8 @@ class LayerMeanRendererTests(unittest.TestCase):
                 ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
                 charts = self.chart_parts_by_sheet(out, book)
                 for name, expected in (('估算总览', 6), ('方法1估算', 2), ('方法2估算', 2)):
-                    line = [chart for chart in charts[name] if chart.find('.//c:lineChart', ns) is not None]
+                    line = [chart for chart in charts[name] if chart.find('.//c:lineChart', ns) is not None
+                            and '随BS变化' in self.chart_title(chart)]
                     self.assertEqual(len(line), expected)
                     for chart in line:
                         categories = [node.text for node in chart.findall('.//c:ser/c:cat/c:strRef/c:strCache/c:pt/c:v', ns)]
@@ -1154,8 +1158,13 @@ class LayerMeanRendererTests(unittest.TestCase):
         for name in ('估算总览', '方法1估算', '方法2估算'):
             self.assertFalse(any(chart.find('.//c:lineChart', ns) is not None for chart in charts[name]))
             self.assertIn('相同BS存在多条采样组合，未合并趋势', ' '.join(map(str, book[name][1].values())))
-        rows = [(int(cell[1:]), value) for cell, value in book['估算总览'][1].items()
-                if re.fullmatch(r'B\d+', cell) and value in {case['name'] for case in report['cases']}]
+        cells = book['估算总览'][1]
+        s_section = next(int(cell[1:]) for cell, value in cells.items()
+                         if re.fullmatch(r'A\d+', cell) and isinstance(value, str)
+                         and value.startswith('固定BS，不同投机步长S'))
+        rows = [(int(cell[1:]), value) for cell, value in cells.items()
+                if re.fullmatch(r'B\d+', cell) and int(cell[1:]) < s_section
+                and value in {case['name'] for case in report['cases']}]
         self.assertEqual(len(rows), 5)
         cases = {case['name']: case for case in report['cases']}
         for row, name in rows:

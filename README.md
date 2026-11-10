@@ -113,6 +113,12 @@ python -u build_ep128_leadership_excel.py --report ep128_report/model_architectu
 
 此命令仅读取 `--report` 指定的 JSON，不扫描新增 BS 目录，也不读取 cases 来补结果。新增 BS 后，先用更新的 cases 重新统计，再指向新 JSON。运行日志会打印报告路径、生成时间和各 case 的配置 BS，可据此检查是否读到了旧文件。
 
+报告同时展示两种横坐标：固定投机步长 S 看 BS，固定 BS 看 S。总览展示两种外推方法的单卡吞吐、TPOT 和完整周期曲线；两个方法页各展示整轮五项耗时随 BS、S 的变化。源采样基线页独立展示相同指标及五项分解，HTML 同步包含这些表和图，仍保留 9 个工作表。
+
+**ITL 代理值取完整周期，单位 ms/轮**，表示每轮输出间隔；采样没有逐 token 发送时间，不能把它当作实测逐 token ITL。TPOT 为周期除以该 case 配置的 SAL/Neff。固定 BS 的 S 对比保留每点自己的 SAL/Neff；未声明固定接受率时，不将变化只归因于 S。源基线沿用源周期均值最大的 rank，各方法沿用各自原选 rank，逐点列明；源五项使用该源 rank 的实际完整层边界，包含主0。缺少边界时只留空受影响的分解，不借用目标数据。重复横坐标保留各行、不画合并曲线；缺值断线。
+
+已有完整 JSON 可直接用新版脚本重绘上述视图，无需重跑 CSV 分析。更新时一并复制 `profile_ep128.py` 和 `build_ep128_leadership_excel.py`，并保留同目录的 `ep128_xlsx_writer.py`。
+
 ## 配置口径
 
 | 字段 | 含义 |

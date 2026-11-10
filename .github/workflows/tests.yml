@@ -36,3 +36,6 @@ jobs:
       - name: Verify Windows CLI and report export
         if: ${{ !cancelled() }}
         run: python -B -S -m unittest discover -s tests -p 'test_ep128_v2_cli.py' -v
+      - name: Verify BS and speculation sweep charts on Windows
+        if: ${{ !cancelled() }}
+        run: python -B -S -m unittest discover -s tests -p 'test_ep128*sweep*.py' -v

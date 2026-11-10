@@ -289,7 +289,15 @@ class RendererV2Tests(unittest.TestCase):
     def test_renderer_has_no_estimator_or_legacy_import(self):
         tree = ast.parse(RENDERER.read_text())
         imports = [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names]
-        imports += [node.module or '' for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.module == 'profile_ep128':
+                # Old JSON redraw may read the pure source-only summary helper;
+                # target estimation, rank selection and CSV access stay in core.
+                self.assertEqual([alias.name for alias in node.names], ['source_sweep_summary'])
+            else:
+                imports.append(node.module or '')
         self.assertFalse(any('profile_ep128' in name or 'source_point' in name or 'legacy' in name for name in imports))
         functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
         self.assertFalse(any('assumption' in name or 'point_diagnostic' in name for name in functions))
