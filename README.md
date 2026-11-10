@@ -38,7 +38,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-三个运行脚本应放在同一目录。当前版本：统计 `20261110.3.rank_parallel`、Excel 生成器 `20261110.1.u_focus_step_pmu`、写入器 `20261104.1.line_charts`。
+三个运行脚本应放在同一目录。当前版本：统计 `20261110.6.operator_bound_evidence`、Excel 生成器 `20261110.4.operator_bound_evidence`、写入器 `20261104.1.line_charts`。
 
 ## 快速运行
 
@@ -272,7 +272,17 @@ TPOT（ms/token） = R / Neff
 
 两段的逐 step 表和折线使用本 case 在外推前选定的共同源 rank，两种方法展示相同源轮次证据，并列均值、P50、P90和最大值。这里的 step 是保留周期及其原始 round_id，不冒充 trace 中的 `ProfilerStep`；不会逐点改选其他 rank。未识别 step 保留空值和原因，折线断开，不补0。
 
-CSA、HCA、SWA 的源实测 Top8 热点后增加 PMU 指标和 bound 方向表，包含矩阵/向量计算、标量、读入/写出及片内搬运流水、核内时间、分核数和指标覆盖率等。指标按源 kernel **完整调用 Duration 加权**，不乘目标层数或外推倍率；跨阶段裁剪仅定位耗时，不能测得局部 PMU。bound 是有证据说明及置信度的流水倾向，MTE2 高不等于 HBM 已饱和，`cube_utilization` 也不是 MFU。需要原 CSV 已含相应 PMU 列；没有采集的数据继续显示未知。更新后应重新运行核心统计，旧 JSON 只重绘不能补出这些证据。
+CSA、HCA、SWA 的源实测 Top8 热点后展示 PMU、流水候选和独立的 Roofline 定量表，覆盖其中入选的 Attention 与 MoE 算子。MTE1、Fixpipe 已列入主表；AIC 与 AIV 按各自适用的竞争流水检查完整性，缺项降低置信度。原始指标按源 kernel **完整调用 Duration 加权**，不乘目标层数或外推倍率；跨阶段裁剪不能测得局部 PMU。高活动比只是候选，MTE2 高不等于 HBM 饱和，`cube_utilization` 不是 MFU，`1−VEC` 不是 C/V 空泡。
+
+本次核对了公开 NPU 性能 Skills 的实际代码与硬件范围，独立实现证据分级和显式 Roofline；没有安装外部 Skill 或引入新依赖。检索清单见[公开 Skill 调研](docs/operator-bound-skill-survey.md)，判据、指标、硬件依据模板和限制见[算子 bound 说明](docs/operator-bound.md)。没有准确源逻辑 NPU、同计算精度峰值、有效 FLOPs 和同层级 bytes 时，定量模型留空；不以 GMM 容量行、packed 权重形状或默认 FP8 倍率补齐。
+
+已有 JSON 可直接更新判据，不重读九个 case 的 CSV：
+
+```bash
+python -u build_ep128_leadership_excel.py --report ep128_report_7/model_architecture_report.json --refresh-bound --out "ep128_report_7/专业bound.xlsx"
+```
+
+另存 `专业bound.bound.json`、Excel 和 HTML，原报告不变，仍为9个 sheet。若旧报告未保存逐调用诊断，不能恢复联合覆盖/短调用检查，对应置信度降低；未采的 PMU 继续未知。可用 `--bound-template bound_profile.local.json` 导出全空硬件/工作量模板，核实填写后以 `--bound-profile bound_profile.local.json` 生成定量结果；详见上述说明。需要新流量列时才补充原采样导出并重新统计，重绘不会制造计数器。
 
 后两组 U 子阶段仍沿用源实测、保留一次，不乘目标层数。旧 JSON 缺少目标阶段估算时，需要用新版核心重新统计采样；仅重绘不能生成这些估算。
 

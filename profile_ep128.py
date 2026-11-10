@@ -30,7 +30,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261110.5.shared_source_rank"
+PROFILE_VERSION = "20261110.6.operator_bound_evidence"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -145,13 +145,119 @@ for _pmu_core, _pmu_pipes in (("aic", ("mac", "vec", "scalar", "mte1", "mte2", "
 del _pmu_core, _pmu_pipes, _pmu_pipe
 
 
+_A_PMU_DOC = "https://github.com/Ascend/msopprof/blob/master/docs/en/user_guide/msopprof_performance_data.md"
+_A_PMU_MSPROF_DOC = "https://mstt.readthedocs.io/en/latest/msprof/source/user_guide/profile_data_file_references/"
+_A_PMU_EXPORT_SCOPE = ("exported row only; task-based and block/sub-block exports have different core "
+                       "aggregation; not inferred as a whole-device total")
+_A_PMU_LEGACY_FIELDS = tuple(_A_PMU_FIELDS.items())
+_A_PMU_FIELD_INFO = {field: {"unit": unit, "scope": "reported_core_execution",
+    "description": "Exporter-reported hardware counter; pipelines can overlap.",
+    "source": _A_PMU_MSPROF_DOC, "estimated": False, "aggregation": _A_PMU_EXPORT_SCOPE}
+    for field, unit in _A_PMU_LEGACY_FIELDS}
+_A_PMU_EXTRA_HEADERS = {}
+
+
+def _a_register_pmu(field, unit, scope, description, headers, *, estimated=False, source=_A_PMU_DOC,
+                    products=None):
+    """Register documented names only; retain the exporter's memory units."""
+    _A_PMU_FIELDS[field] = unit
+    _A_PMU_FIELD_INFO[field] = {"unit": unit, "scope": scope, "description": description,
+        "source": source, "source_header": headers[0] if headers else field,
+        "products": products, "estimated": estimated, "aggregation": _A_PMU_EXPORT_SCOPE}
+    for header in (field, *headers):
+        # Retain unit punctuation: GB/s, GB*s and GBs are not interchangeable.
+        normalized = re.sub(r"[_\s]", "", header.lower())
+        _A_PMU_EXTRA_HEADERS[normalized] = field
+
+
+# KB is deliberately not converted to bytes: these documents do not resolve
+# whether KB is decimal or binary. GM-channel traffic is not equated to HBM
+# transactions; cache hits and exporter/core aggregation must be established
+# separately before a quantitative external-memory roofline can use it.
+for _pmu_name, _pmu_scope in (("read_main_memory", "reported_main_memory"),
+        ("write_main_memory", "reported_main_memory"), ("gm_to_l1", "gm_to_l1_channel"),
+        ("l0c_to_l1", "internal_l0c_to_l1"), ("l0c_to_gm", "l0c_to_gm_channel"),
+        ("gm_to_ub", "gm_to_ub_channel"), ("ub_to_gm", "ub_to_gm_channel")):
+    _pmu_raw = _pmu_name + "_datas"
+    _a_register_pmu(_pmu_raw + "_kb", "KB", _pmu_scope,
+        "Reported transfer amount in KB; KB-to-byte scale is unspecified.",
+        (_pmu_raw + "(KB)",), source=_A_PMU_DOC + "#memory-memory-readwrite-bandwidth-rate",
+        products="Atlas A2/A3; Ascend 950PR/950DT")
+
+_a_register_pmu("l1_to_gm_datas_kb_estimate", "KB", "l1_to_gm_channel",
+    "Estimated L1-to-GM amount; preserve KB without a byte conversion.",
+    ("L1_to_GM_datas(KB)(estimate)",), estimated=True,
+    source=_A_PMU_DOC + "#memory-memory-readwrite-bandwidth-rate", products="Atlas A2/A3")
+
+# Use explicitly spelled combinations from the product tables, rather than
+# expanding an ai* documentation wildcard into unverified AIC/AIV columns.
+# In particular AIC UB<->GM is an Atlas-inference entry, not an A2/A3 claim.
+for _pmu_raw, _pmu_scope, _pmu_section, _pmu_products in (
+        ("aiv_gm_to_ub_bw", "gm_to_ub_channel", "memory", "Atlas A2/A3; Ascend 950PR/950DT"),
+        ("aiv_ub_to_gm_bw", "ub_to_gm_channel", "memory", "Atlas A2/A3; Ascend 950PR/950DT"),
+        ("aic_gm_to_ub_bw", "gm_to_ub_channel", "memory", "Atlas inference (310P)"),
+        ("aic_ub_to_gm_bw", "ub_to_gm_channel", "memory", "Atlas inference (310P)"),
+        ("aic_main_mem_read_bw", "reported_main_memory", "memory", "Atlas inference (310P)"),
+        ("aic_main_mem_write_bw", "reported_main_memory", "memory", "Atlas inference (310P)"),
+        ("aic_l1_read_bw", "internal_l1", "memory", "Atlas A2/A3; Ascend 950PR/950DT; Atlas inference"),
+        ("aic_l1_write_bw", "internal_l1", "memory", "Atlas A2/A3; Ascend 950PR/950DT; Atlas inference"),
+        ("aic_l0a_read_bw", "internal_l0a", "memoryl0", "Atlas A2/A3; Ascend 950PR/950DT; Atlas inference"),
+        ("aic_l0a_write_bw", "internal_l0a", "memoryl0", "Atlas A2/A3; Ascend 950PR/950DT; Atlas inference"),
+        ("aic_l0b_read_bw", "internal_l0b", "memoryl0", "Atlas A2/A3; Ascend 950PR/950DT; Atlas inference"),
+        ("aic_l0b_write_bw", "internal_l0b", "memoryl0", "Atlas A2/A3; Ascend 950PR/950DT; Atlas inference"),
+        ("aic_l0c_read_bw_cube", "internal_l0c_cube", "memoryl0", "Atlas A2/A3; Ascend 950PR/950DT; Atlas inference"),
+        ("aic_l0c_write_bw_cube", "internal_l0c_cube", "memoryl0", "Atlas A2/A3; Ascend 950PR/950DT; Atlas inference"),
+        ("aic_l0c_read_bw", "internal_l0c_vector", "memoryl0", "Atlas inference (310P)"),
+        ("aic_l0c_write_bw", "internal_l0c_vector", "memoryl0", "Atlas inference (310P)"),
+        ("aiv_ub_read_bw_vector", "internal_ub_vector", "memoryub", "Atlas A2/A3; Ascend 950PR/950DT"),
+        ("aiv_ub_write_bw_vector", "internal_ub_vector", "memoryub", "Atlas A2/A3; Ascend 950PR/950DT"),
+        ("aiv_ub_read_bw_scalar", "internal_ub_scalar", "memoryub", "Atlas A2/A3"),
+        ("aiv_ub_write_bw_scalar", "internal_ub_scalar", "memoryub", "Atlas A2/A3"),
+        ("aic_ub_read_bw_vector", "internal_ub_vector", "memoryub", "Atlas inference (310P)"),
+        ("aic_ub_write_bw_vector", "internal_ub_vector", "memoryub", "Atlas inference (310P)"),
+        ("aic_ub_read_bw_scalar", "internal_ub_scalar", "memoryub", "Atlas inference (310P)"),
+        ("aic_ub_write_bw_scalar", "internal_ub_scalar", "memoryub", "Atlas inference (310P)"),
+        ("aiv_ub_read_bw_gm", "ub_to_gm_channel", "memoryub", "Ascend 950PR/950DT"),
+        ("aiv_ub_write_bw_gm", "gm_to_ub_channel", "memoryub", "Ascend 950PR/950DT")):
+    _pmu_anchor = {"memory": "memory-memory-readwrite-bandwidth-rate", "memoryl0": "memoryl0-l0-readwrite-bandwidth-rate",
+                   "memoryub": "memoryub-ub-readwrite-bandwidth-rate"}[_pmu_section]
+    _a_register_pmu(_pmu_raw + "_gbps", "GB/s", _pmu_scope,
+        "Reported channel bandwidth over the exporter's total-cycle interval; channels are not summed.",
+        (_pmu_raw + "(GB/s)",), source=_A_PMU_DOC + "#" + _pmu_anchor, products=_pmu_products)
+
+for _pmu_raw, _pmu_products in (("aic_cube_fops", "Atlas A2/A3; Atlas inference"),
+        ("aic_vec_fops", "Atlas inference (310P)"), ("aiv_vec_fops", "Atlas A2/A3")):
+    _a_register_pmu(_pmu_raw, "operations", "reported_compute_operations",
+        "Reported floating-point operation count; not effective algorithm FLOPs or FLOPs per second.",
+        (), source=_A_PMU_DOC + "#arithmeticutilization-execution-time-and-ratios-of-cube-and-vector-instructions",
+        products=_pmu_products)
+
+_a_register_pmu("aic_l2_cache_hit_rate", "ratio", "l2_cache",
+    "Exporter-reported cache-hit fraction; not a bandwidth utilization measure.", ("aic_l2_cache_hit_rate(%)",),
+    source=_A_PMU_DOC + "#l2cache-l2-cache-hit-rate", products="Atlas inference (310P)")
+
+for _pmu_name in ("gm_to_l1", "l0c_to_l1", "l0c_to_gm", "gm_to_ub", "ub_to_gm"):
+    _pmu_raw = _pmu_name + "_bw_usage_rate"
+    _a_register_pmu(_pmu_raw, "ratio", _pmu_name + "_channel",
+        "Reported bandwidth usage for this single transfer channel.", (_pmu_raw + "(%)",),
+        source=_A_PMU_DOC + "#memory-memory-readwrite-bandwidth-rate", products="Atlas A2/A3; Ascend 950PR/950DT")
+_a_register_pmu("l1_to_gm_bw_usage_rate_estimate", "ratio", "l1_to_gm_channel",
+    "Estimated usage fraction of the L1-to-GM transfer channel.",
+    ("L1_to_GM_bw_usage_rate(%)(estimate)",), estimated=True,
+    source=_A_PMU_DOC + "#memory-memory-readwrite-bandwidth-rate", products="Atlas A2/A3")
+del _pmu_name, _pmu_scope, _pmu_raw, _pmu_section, _pmu_products, _pmu_anchor
+
+
 def _a_pmu_header(header):
     """Resolve optional hardware counters without changing timed-row parsing."""
     raw = str(header).lower().replace("μ", "u").replace("µ", "u").replace("％", "%")
     normalized = re.sub(r"[^a-z0-9]", "", raw)
+    extra = _A_PMU_EXTRA_HEADERS.get(re.sub(r"[_\s]", "", raw))
+    if extra is not None:
+        return extra, .01 if _A_PMU_FIELDS[extra] == "ratio" and "%" in raw else 1.
     if normalized in ("aictime", "aictimeus", "aictimemicroseconds"):
         return "aicore_time_us", 1.
-    for field, unit in _A_PMU_FIELDS.items():
+    for field, unit in _A_PMU_LEGACY_FIELDS:
         base = re.sub(r"[^a-z0-9]", "", field[:-3] if unit == "us" else field)
         if unit == "us":
             if normalized in (base, base + "us", base + "microseconds"):
@@ -1398,6 +1504,245 @@ def align_report_source_rank(report):
         contract["projection"] = ("select shared rank by retained source full-cycle mean before extrapolation; "
                                   "offline reselection from stored per_rank method results")
     return dict(report, cases=cases, contract=contract)
+
+
+BOUND_ENGINE_VERSION = "20261110.1.evidence_roofline"
+_BOUND_HARDWARE_KEYS = {"name", "architecture", "scope", "peak_tflops_by_dtype",
+                        "memory_bandwidth_gbps", "memory_level", "provenance"}
+_BOUND_WORK_KEYS = {"description", "compute_dtype", "flops_per_call", "memory_bytes_per_call",
+                   "memory_bytes_basis", "memory_level", "workload_basis", "provenance"}
+
+
+def validate_bound_profile(profile):
+    """Validate explicit source-device ceilings, never infer peaks or FP8 scaling."""
+    if not isinstance(profile, dict) or type(profile.get("schema_version")) is not int or profile["schema_version"] != 1:
+        raise ValueError("bound profile requires schema_version=1")
+    if set(profile) - {"schema_version", "cases"} or not isinstance(profile.get("cases"), dict):
+        raise ValueError("bound profile accepts only schema_version and cases object")
+
+    def positive(value, name):
+        try:
+            valid = type(value) in (int, float) and math.isfinite(value) and value > 0
+        except (OverflowError, ValueError):
+            valid = False
+        if value is not None and not valid:
+            raise ValueError(name + " must be a finite positive number or null")
+
+    for name, case in profile["cases"].items():
+        if not isinstance(name, str) or not name or not isinstance(case, dict):
+            raise ValueError("bound profile case name and object are required")
+        if set(case) - {"source_rank", "hardware", "operators"}:
+            raise ValueError("unknown bound profile case fields: " + name)
+        if not isinstance(case.get("source_rank"), str) or not case["source_rank"]:
+            raise ValueError("bound profile requires explicit source_rank: " + name)
+        hw, operators = case.get("hardware"), case.get("operators")
+        if not isinstance(hw, dict) or set(hw) - _BOUND_HARDWARE_KEYS or not isinstance(operators, dict):
+            raise ValueError("bound profile hardware/operators schema mismatch: " + name)
+        for key in ("name", "architecture", "memory_level", "provenance"):
+            if hw.get(key) is not None and not isinstance(hw[key], str):
+                raise ValueError("hardware." + key + " must be text or null")
+        if hw.get("scope") != "logical_npu":
+            raise ValueError("hardware.scope must be logical_npu; physical-card/system peaks cannot be mixed with rank time")
+        peaks = hw.get("peak_tflops_by_dtype", {})
+        if not isinstance(peaks, dict) or any(not isinstance(key, str) or not key.strip() for key in peaks):
+            raise ValueError("peak_tflops_by_dtype must be an object with explicit dtype names")
+        if len({key.upper().strip() for key in peaks}) != len(peaks):
+            raise ValueError("duplicate compute dtype in hardware peak map")
+        for key, value in peaks.items():
+            positive(value, "peak_tflops_by_dtype." + key)
+        positive(hw.get("memory_bandwidth_gbps"), "memory_bandwidth_gbps")
+        for key, op in operators.items():
+            if not isinstance(key, str) or not key or not isinstance(op, dict) or set(op) - _BOUND_WORK_KEYS:
+                raise ValueError("bound operator must use an exact fingerprint and known fields")
+            for field in ("description", "compute_dtype", "memory_level", "provenance"):
+                if op.get(field) is not None and not isinstance(op[field], str):
+                    raise ValueError("operator." + field + " must be text or null")
+            for field in ("flops_per_call", "memory_bytes_per_call"):
+                positive(op.get(field), "operator." + field)
+            if op.get("memory_bytes_basis") not in (None, "measured", "model"):
+                raise ValueError("memory_bytes_basis must be measured, model or null")
+            if op.get("workload_basis") not in (None, "constant_per_call"):
+                raise ValueError("workload_basis must be constant_per_call or null; variable active rows need per-call evidence")
+    return profile
+
+
+def _bound_method_kernels(method):
+    for group in method.get("target_stage_breakdowns") or []:
+        for stage in group.get("stage_rows") or []:
+            for kernel in (stage.get("operator_breakdown") or {}).get("kernels") or []:
+                yield kernel
+
+
+def operator_bound_profile_template(report):
+    """An editable evidence template, not guessed hardware/workload parameters."""
+    cases = {}
+    for case in report.get("cases") or []:
+        methods = (case.get("projection") or {}).get("layer_mean_methods") or []
+        ranks = {method.get("selected_rank") for method in methods if method.get("selected_rank") is not None}
+        if len(ranks) > 1:
+            raise ValueError("bound template needs one shared source rank; use --align-source-rank first")
+        if not ranks:
+            continue
+        rank, = ranks
+        operators = {}
+        for method in methods:
+            for kernel in _bound_method_kernels(method):
+                operators[kernel["key"]] = {"description": str(kernel.get("op_type") or kernel.get("name") or "")
+                    + " | " + str(kernel.get("input_shapes") or ""),
+                    "compute_dtype": None, "flops_per_call": None, "memory_bytes_per_call": None,
+                    "memory_bytes_basis": None, "memory_level": None, "workload_basis": None, "provenance": None}
+        cases[case["name"]] = {"source_rank": rank, "hardware": {"name": None, "architecture": None,
+            "scope": "logical_npu", "peak_tflops_by_dtype": {}, "memory_bandwidth_gbps": None,
+            "memory_level": None, "provenance": None}, "operators": operators}
+    return {"schema_version": 1, "cases": cases}
+
+
+def _lm_operator_roofline(member, pmu, operator_profile=None, hardware=None):
+    """Analytic model on the SAME native call, separate from pipeline screening.
+
+    No tensor-footprint/HBM equivalence, grouped active-row assumption, generic
+    low-precision multiplier, or per-core-counter/device-total conversion.
+    """
+    result = {"status": "unavailable", "label": "定量模型未建立", "confidence": "未判断",
+        "bound_verified": False, "scope": "source_unique_native_whole_call_mean; logical_npu",
+        "missing": [], "caveats": ["Roofline是给定工作量和硬件上限下的模型，不证明关键路径或可节省时间。",
+        "流水活动比不是MFU；GM通路数据量不自动等于HBM流量；未把KB或每核fops猜成全设备bytes/FLOPs。"]}
+    name = str(member.get("name") or "") + " " + str(member.get("op_type") or "")
+    if member.get("record_kind") == "synchronization_control" or re.search(
+            r"hccl|hcom|dispatch|combine|alltoall|allgather|allreduce|reducescatter|sendrecv", name, re.I):
+        result.update(status="not_applicable", label="通信/同步记录不套计算Roofline")
+        return result
+    if "aicpu" in (" ".join(pmu.get("core_types") or []) + " " + str(member.get("task_type") or "")).lower().replace("_", ""):
+        result.update(status="not_applicable", label="AICPU不套AI Core算力Roofline")
+        return result
+    op, hw = operator_profile or {}, hardware or {}
+    coverage = pmu.get("coverage") or {}
+    duration, calls = coverage.get("total_duration_ms"), coverage.get("total_calls")
+    if (type(duration) not in (float, int) or not math.isfinite(duration) or duration <= 0
+            or type(calls) is not int or calls <= 0):
+        result["missing"].append("原生整次调用时长与调用数（不能用段内裁剪时长替代）")
+    else:
+        actual_us = duration / calls * 1000
+        if not math.isfinite(actual_us) or actual_us <= 0:
+            result.update(status="inconsistent", label="整次调用时长超出有效数值范围")
+            return result
+        result["duration_mean_us"] = actual_us
+    for field, description in (("name", "源逻辑NPU型号"), ("architecture", "硬件架构"),
+                               ("provenance", "同精度硬件峰值来源"), ("memory_level", "带宽对应的存储层级")):
+        if not str(hw.get(field) or "").strip():
+            result["missing"].append(description)
+    dtype = str(op.get("compute_dtype") or "").upper().strip()
+    peak = {key.upper().strip(): value for key, value in (hw.get("peak_tflops_by_dtype") or {}).items()}.get(dtype)
+    if peak is None:
+        result["missing"].append("匹配实际计算dtype的TFLOP/s峰值（不从输入dtype推定）")
+    for field, description in (("flops_per_call", "每调用有效FLOPs"),
+                               ("memory_bytes_per_call", "同层级每调用流量bytes"),
+                               ("memory_bytes_basis", "流量为实测还是模型"),
+                               ("provenance", "工作量/流量依据")):
+        if op.get(field) is None or isinstance(op.get(field), str) and not op[field].strip():
+            result["missing"].append(description)
+    if not str(op.get("memory_level") or "").strip():
+        result["missing"].append("每调用bytes的存储层级")
+    elif hw.get("memory_level") and op["memory_level"].upper().strip() != hw["memory_level"].upper().strip():
+        result.update(status="inconsistent", label="流量层级与带宽峰值层级不匹配")
+        return result
+    if op.get("workload_basis") != "constant_per_call":
+        result["missing"].append("同指纹各调用有效工作量固定的证据（GMM容量/填充行不等于有效行）")
+    if hw.get("memory_bandwidth_gbps") is None:
+        result["missing"].append("同存储层级GB/s带宽峰值")
+    if result["missing"]:
+        return result
+    flops, traffic, bw = op["flops_per_call"], op["memory_bytes_per_call"], hw["memory_bandwidth_gbps"]
+    duration = result["duration_mean_us"]
+    compute_us, memory_us = flops / peak / 1e6, traffic / bw / 1000
+    theoretical_us = max(compute_us, memory_us)
+    derived = [compute_us, memory_us, theoretical_us, flops / traffic, peak * 1000 / bw,
+               flops / duration / 1e6, traffic / duration / 1000,
+               compute_us / duration, memory_us / duration, theoretical_us / duration]
+    if not all(math.isfinite(value) and value > 0 for value in derived):
+        result.update(status="inconsistent", label="模型数值超出有效范围，核对单位和数量级")
+        return result
+    direction = "compute" if compute_us > 1.25 * memory_us else "memory" if memory_us > 1.25 * compute_us else "balanced"
+    result.update(status="modeled", label={"compute": "模型偏计算侧", "memory": "模型偏存储侧", "balanced": "模型计算/存储接近"}[direction],
+        direction=direction, confidence="中" if op["memory_bytes_basis"] == "measured" else "低",
+        compute_dtype=dtype, hardware_name=hw["name"], architecture=hw["architecture"], memory_level=hw["memory_level"],
+        flops_per_call=flops, memory_bytes_per_call=traffic, memory_bytes_basis=op["memory_bytes_basis"],
+        peak_tflops=peak, peak_bandwidth_gbps=bw, compute_lower_bound_us=compute_us,
+        memory_lower_bound_us=memory_us, ideal_lower_bound_us=theoretical_us,
+        arithmetic_intensity=flops / traffic, ridge_point_flops_per_byte=peak * 1000 / bw,
+        achieved_tflops=flops / duration / 1e6, achieved_bandwidth_gbps=traffic / duration / 1000,
+        compute_peak_fraction=compute_us / duration, bandwidth_peak_fraction=memory_us / duration,
+        model_efficiency=theoretical_us / duration,
+        provenance={"hardware": hw["provenance"], "workload": op["provenance"]})
+    if op["memory_bytes_basis"] == "model":
+        result["caveats"].append("bytes是流量模型：带宽/算术强度及存储侧方向均不是实测HBM结果。")
+    if theoretical_us > duration * 1.05:
+        result.update(status="inconsistent", confidence="未判断", label="模型与实测不一致，先核对工作量/峰值/单位/范围")
+    result["caveats"].append("比较均值不能代替逐调用或逐核诊断；没有把1−VEC或1−MAC当作C/V空泡。")
+    return result
+
+
+def refresh_report_operator_bounds(report, profile=None):
+    """Copy changed PMU containers only; no CSV reads, re-estimation or rank changes."""
+    if not isinstance(report, dict) or not isinstance(report.get("cases"), list):
+        raise ValueError("bound refresh requires a report with cases")
+    if profile is None:
+        profile = (report.get("operator_bound_analysis") or {}).get("profile")
+    if profile is not None:
+        validate_bound_profile(profile)
+    configured = (profile or {}).get("cases") or {}
+    unknown_cases = set(configured) - {case.get("name") for case in report["cases"]}
+    if unknown_cases:
+        raise ValueError("bound profile case not present: " + ", ".join(sorted(unknown_cases)))
+    cases, updated = [], 0
+    for case in report["cases"]:
+        case_profile = configured.get(case.get("name")) or {}
+        operators = case_profile.get("operators") or {}
+        projection, methods, seen = case.get("projection") or {}, [], set()
+        if case_profile:
+            ranks = {method.get("selected_rank") for method in projection.get("layer_mean_methods") or []
+                     if method.get("selected_rank") is not None}
+            if ranks != {case_profile["source_rank"]}:
+                raise ValueError("bound profile source_rank differs from method selected rank: " + str(case.get("name")))
+        for method in projection.get("layer_mean_methods") or []:
+            groups = []
+            for group in method.get("target_stage_breakdowns") or []:
+                stages = []
+                for stage in group.get("stage_rows") or []:
+                    breakdown, kernels = stage.get("operator_breakdown"), []
+                    if not isinstance(breakdown, dict):
+                        stages.append(stage)
+                        continue
+                    for kernel in breakdown.get("kernels") or []:
+                        key, pmu = kernel.get("key"), dict(kernel.get("pmu") or {})
+                        seen.add(key)
+                        op = operators.get(key)
+                        if op is not None and method.get("selected_rank") != case_profile.get("source_rank"):
+                            raise ValueError("bound profile source_rank differs from method selected rank: " + str(case.get("name")))
+                        metrics = {field: (dict(item, field_info=dict(_A_PMU_FIELD_INFO[field]))
+                            if isinstance(item, dict) and field in _A_PMU_FIELD_INFO and not item.get("field_info") else item)
+                            for field, item in (pmu.get("metrics") or {}).items()}
+                        pmu["metrics"] = metrics
+                        coverage = pmu.get("coverage") or {}
+                        samples = [{"core_type": core, "metrics": {field: item["value"] for field, item in metrics.items()
+                            if isinstance(item, dict) and type(item.get("value")) in (float, int)}}
+                            for core in pmu.get("core_types") or []]
+                        pmu["bound"] = _lm_operator_pmu_bound(kernel, metrics, coverage, samples,
+                            sample_diagnostics=pmu.get("sample_diagnostics"))
+                        pmu["roofline"] = _lm_operator_roofline(kernel, pmu, op, case_profile.get("hardware"))
+                        pmu["scope_note"] = _LM_PMU_NOTE
+                        pmu["bound_engine_version"] = BOUND_ENGINE_VERSION
+                        kernels.append(dict(kernel, pmu=pmu))
+                        updated += 1
+                    stages.append(dict(stage, operator_breakdown=dict(breakdown, kernels=kernels)))
+                groups.append(dict(group, stage_rows=stages))
+            methods.append(dict(method, target_stage_breakdowns=groups))
+        if set(operators) - seen:
+            raise ValueError("bound profile operator fingerprint not present: " + str(case.get("name")))
+        cases.append(dict(case, projection=dict(projection, layer_mean_methods=methods)))
+    return dict(report, cases=cases, operator_bound_analysis={"schema_version": 1,
+        "engine_version": BOUND_ENGINE_VERSION, "source_csv_read": False, "updated_kernel_references": updated,
+        "profile": profile, "scope": "pipeline screening and explicit analytic model; no certified causal bound"})
 
 
 def read_reference(path):
@@ -3719,6 +4064,8 @@ _LM_PMU_NOTE = (
 _LM_PMU_SOURCES = [
     "https://github.com/mindstudio-docs/master/blob/master/msprof/docs/zh/user_guide/profile_data_file_references.md",
     "https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/programug/Ascendcopdevg/atlas_ascendc_best_practices_10_0009.html",
+    "https://github.com/Ascend/msopprof/blob/3d18a9fa93d348f56a3877e2b73f43c34abd1586/docs/en/user_guide/msopprof_performance_data.md",
+    "https://asc.gitcode.com/api/SIMD-API/c_api/data_move_guide/overview/data_path.html",
 ]
 
 
@@ -3765,12 +4112,28 @@ def _lm_pmu_core_kind(core_type, metrics):
     return "mix" if aic and aiv else "aic" if aic else "aiv" if aiv else "unknown"
 
 
+_LM_PMU_REQUIRED_PIPES = {"aic": ("mac", "scalar", "mte1", "mte2", "fixpipe"),
+                          "aiv": ("vec", "scalar", "mte2", "mte3")}
+
+
+def _lm_pmu_required_metrics(core):
+    return [core + "_" + pipe + "_ratio" for pipe in _LM_PMU_REQUIRED_PIPES[core]]
+
+
+def _lm_pmu_valid_ratio(value):
+    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1
+
+
 def _lm_pmu_pipeline_direction(prefix, metrics):
-    """Conservative heuristics; these thresholds are not hardware limits."""
+    """Screen competing pipelines; activity ratios never establish a bound."""
     compute = prefix + ("_mac_ratio" if prefix == "aic" else "_vec_ratio")
-    moves = [prefix + "_" + pipe + "_ratio" for pipe in ("mte1", "mte2", "mte3", "fixpipe")]
+    # AIC MTE3 is optional/architecture dependent. A missing AIC MTE3 is not
+    # evidence of a missing result path: Fixpipe is an independent candidate.
+    move_pipes = ("mte1", "mte2", "mte3", "fixpipe") if prefix == "aic" else ("mte2", "mte3")
+    moves = [prefix + "_" + pipe + "_ratio" for pipe in move_pipes]
     scalar = prefix + "_scalar_ratio"
-    values = {field: metrics[field]["value"] for field in (compute, *moves, scalar) if field in metrics}
+    values = {field: metrics[field]["value"] for field in (compute, *moves, scalar)
+              if isinstance(metrics.get(field), dict) and _lm_pmu_valid_ratio(metrics[field].get("value"))}
     if not values or max(values.values()) == 0:
         return "unknown", "未观察到有效流水活动", []
     def shown(field):
@@ -3780,38 +4143,97 @@ def _lm_pmu_pipeline_direction(prefix, metrics):
     mover = max((field for field in moves if field in values), key=values.get, default=None)
     transfer = values[mover] if mover else None
     compute_name = "矩阵计算" if prefix == "aic" else "向量计算"
-    if comp is not None and transfer is not None and min(comp, transfer) >= .85 and abs(comp - transfer) < .10:
-        return "mixed", compute_name + "/搬运同时高占用", evidence
-    if (comp is not None and comp >= .90 and transfer is not None and comp - transfer >= .10
-            and comp >= values.get(scalar, 0) + .10):
-        return "compute", "偏" + compute_name + "流水限制", evidence
-    if (transfer is not None and transfer >= .75 and comp is not None and transfer - comp >= .15
-            and transfer >= values.get(scalar, 0) + .10):
-        name = ("读入搬运" if "mte2" in mover else "写出搬运" if "mte3" in mover else "片内搬运")
-        return "transfer", "偏" + name + "流水限制", evidence
-    if values.get(scalar, 0) >= .60 and values[scalar] - max(comp or 0, transfer or 0) >= .10:
-        return "scalar", "标量/控制流水突出", evidence
+    complete = all(field in values for field in _lm_pmu_required_metrics(prefix))
+    if complete:
+        if min(comp, transfer) >= .85 and abs(comp - transfer) < .10:
+            return "mixed", compute_name + "/搬运同时高活动候选", evidence
+        if comp >= .90 and comp - transfer >= .10 and comp - values[scalar] >= .10:
+            return "compute", compute_name + "高活动候选（未验证compute-bound）", evidence
+        if transfer >= .75 and transfer - comp >= .15 and transfer - values[scalar] >= .10:
+            pipe = mover[len(prefix) + 1:-len("_ratio")]
+            name = {"mte1": "片内供数(MTE1)", "mte2": "GM读入搬运(MTE2，非HBM带宽结论)",
+                    "mte3": "逻辑写出/片内搬运(MTE3，通路依架构)",
+                    "fixpipe": "矩阵结果搬运/随路处理(Fixpipe)"}[pipe]
+            return "transfer", name + "高活动候选（未验证搬运bound）", evidence
+        if values[scalar] >= .60 and values[scalar] - max(comp, transfer) >= .10:
+            return "scalar", "标量/控制流水高活动候选（非CPU或指令瓶颈证明）", evidence
     if comp is not None and comp >= .75:
-        return "busy_compute", compute_name + "流水偏忙，bound尚不确定", evidence
+        return "busy_compute", compute_name + "流水偏忙，竞争流水或主导证据不足", evidence
     if transfer is not None and transfer >= .75:
-        return "busy_transfer", "搬运流水突出，bound尚不确定", evidence
+        return "busy_transfer", "搬运流水偏忙，竞争流水或主导证据不足", evidence
+    if values.get(scalar) is not None and values[scalar] >= .60:
+        return "busy_scalar", "标量/控制流水偏忙，竞争流水或主导证据不足", evidence
     return "unknown", "无单一流水显著主导，需核对依赖/分核/启动开销", evidence
 
 
-def _lm_operator_pmu_bound(member, metrics, coverage, samples):
+def _lm_pmu_sample_diagnostics(samples):
+    """Compact native-call checks that cannot be reconstructed from averages."""
+    timed = [sample for sample in samples if type(sample.get("duration_ns")) is int and sample["duration_ns"] > 0]
+    observed = bool(timed) and len(timed) == len(samples)
+    total = sum(sample["duration_ns"] for sample in timed)
+    short = sum(sample["duration_ns"] for sample in timed if sample["duration_ns"] <= 20000)
+    comparable, gap = [], []
+    for sample in timed:
+        raw = sample.get("metrics", {})
+        kind = _lm_pmu_core_kind(str(sample.get("core_type") or ""), raw)
+        fields = {"aic": ("aicore_time_us",), "aiv": ("aiv_time_us",),
+                  "mix": ("aicore_time_us", "aiv_time_us")}.get(kind, ())
+        times = [raw.get(field) for field in fields]
+        if not times or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in times):
+            continue
+        comparable.append(sample)
+        active = [value for value in times if value > 0]
+        duration_us = sample["duration_ns"] / 1000
+        if active and max(active) < .65 * duration_us and duration_us - max(active) > 3:
+            gap.append(sample)
+    comparable_ns = sum(sample["duration_ns"] for sample in comparable)
+    gap_ns = sum(sample["duration_ns"] for sample in gap)
+    joint = {}
+    for core in ("aic", "aiv"):
+        eligible = [sample for sample in timed if _lm_pmu_core_kind(
+            str(sample.get("core_type") or ""), sample.get("metrics", {})) in (core, "mix")]
+        native_ns = sum(sample["duration_ns"] for sample in eligible)
+        known = [sample for sample in eligible if all(_lm_pmu_valid_ratio(sample.get("metrics", {}).get(field))
+                 for field in _lm_pmu_required_metrics(core))]
+        known_ns = sum(sample["duration_ns"] for sample in known)
+        joint[core] = {"known_calls": len(known) if observed else None,
+            "total_calls": len(eligible) if observed else None,
+            "known_duration_ms": known_ns / 1e6 if observed else None,
+            "total_duration_ms": native_ns / 1e6 if observed else None,
+            "duration_coverage": known_ns / native_ns if observed and native_ns else None}
+    return {"scope": "unique_native_whole_calls", "per_call_checks_observed": observed,
+        "total_calls": len(timed) if observed else None, "total_duration_ms": total / 1e6 if observed else None,
+        "short_call_threshold_us": 20, "short_duration_share": short / total if observed else None,
+        "core_time_comparable_duration_share": comparable_ns / total if observed else None,
+        "core_time_gap_duration_share": gap_ns / total if observed and comparable else None,
+        "core_time_gap_checks_observed": observed and bool(comparable),
+        "pipeline_joint_coverage": joint}
+
+
+def _lm_operator_pmu_bound(member, metrics, coverage, samples, *, sample_diagnostics=None):
     label = " ".join(str(member.get(field) or "") for field in ("name", "op_type", "task_type")).upper()
-    result = {"code": "unknown", "label": "PMU证据不足，bound未知", "confidence": "低", "evidence": []}
+    result = {"code": "unknown", "label": "PMU证据不足，bound未知", "confidence": "低", "evidence": [],
+        "evidence_level": "insufficient_evidence", "bound_verified": False,
+        "scope": "native_whole_call_pipeline_screening", "required_metrics": [], "missing_metrics": [],
+        "pipeline_coverage": {}, "caveats": [
+            "高ratio仅筛选流水活动候选；未结合工作量、实际搬运量、硬件上限及依赖证明算子bound。",
+            "流水可重叠；比例不可相加，MAC活动比例不是MFU，MTE2活动比例不是HBM带宽利用率。",
+            "未核实具体芯片拓扑；MTE1为片内供数候选、Fixpipe为结果搬运/随路处理，MTE3通路随架构和指令变化。"]}
     evidence = result["evidence"]
     if re.search(r"MOEDISTRIBUTE|HCCL|ALLTOALL|ALLGATHER|ALLREDUCE|REDUCESCATTER|SENDRECV", label):
-        result.update(code="communication_mixed", label="通信/路由/同步复合任务，PMU不能拆出通信瓶颈")
+        result.update(code="communication_mixed", label="通信/路由/同步复合任务，PMU不能拆出通信瓶颈", evidence_level="not_applicable")
         evidence.append("需结合跨rank时间线和通信明细；不能由MAC低推断HBM或CPU瓶颈")
         return result
     if member.get("record_kind") == "synchronization_control":
-        result.update(code="synchronization_control", label="同步/控制任务，计算搬运bound不适用")
+        result.update(code="synchronization_control", label="同步/控制任务，计算搬运bound不适用", evidence_level="not_applicable")
         return result
-    kinds = {_lm_pmu_core_kind(sample["core_type"], sample["metrics"]) for sample in samples}
+    kinds = {_lm_pmu_core_kind(str(sample.get("core_type") or ""), sample.get("metrics", {})) for sample in samples}
+    if not kinds or kinds == {"unknown"}:
+        raw = {field: value["value"] for field, value in metrics.items()
+               if isinstance(value, dict) and _lm_pmu_valid_ratio(value.get("value"))}
+        kinds.add(_lm_pmu_core_kind(str(member.get("task_type") or ""), raw))
     if kinds == {"aicpu"}:
-        result.update(code="aicpu", label="AICPU任务，AIC/AIV流水不能判断服务器CPU瓶颈")
+        result.update(code="aicpu", label="AICPU任务，AIC/AIV流水不能判断服务器CPU瓶颈", evidence_level="not_applicable")
         return result
     cores = set()
     if "mix" in kinds or "aic" in kinds:
@@ -3835,43 +4257,68 @@ def _lm_operator_pmu_bound(member, metrics, coverage, samples):
         result["label"] = "流水无明确主导，需查依赖/分核/调度，bound待确认"
     if usable:
         result["confidence"] = "中"
-    relevant = [field for field in metrics if any(field.startswith(core + "_") for core in cores)
-                and field.endswith("_ratio")]
+        result["evidence_level"] = "pipeline_screening"
+    diagnostics = sample_diagnostics if isinstance(sample_diagnostics, dict) else _lm_pmu_sample_diagnostics(samples)
+    relevant = []
     for core in sorted(cores):
-        required = [core + ("_mac_ratio" if core == "aic" else "_vec_ratio"), core + "_mte2_ratio", core + "_mte3_ratio"]
-        if any(field not in metrics for field in required):
-            evidence.append(core.upper() + " 计算/读入/写出指标未采齐，方向判断受限")
+        required = _lm_pmu_required_metrics(core)
+        optional = ["aic_mte3_ratio"] if core == "aic" else []
+        observed = [field for field in required + optional if isinstance(metrics.get(field), dict)
+                    and _lm_pmu_valid_ratio(metrics[field].get("value"))]
+        missing = [field for field in required if field not in observed]
+        coverage_by_metric = {field: (metrics[field].get("duration_coverage") if field in observed else None)
+                              for field in required + [field for field in optional if field in observed]}
+        low = [field for field in observed if not _lm_pmu_valid_ratio(metrics[field].get("duration_coverage"))
+               or metrics[field]["duration_coverage"] < .8]
+        joint = (diagnostics.get("pipeline_joint_coverage") or {}).get(core) or {}
+        joint_ratio = joint.get("duration_coverage")
+        result["pipeline_coverage"][core] = {"required_metrics": required, "observed_metrics": observed,
+            "missing_metrics": missing, "low_coverage_metrics": low, "duration_coverage": coverage_by_metric,
+            "joint_duration_coverage": joint_ratio, "joint_known_calls": joint.get("known_calls"),
+            "joint_total_calls": joint.get("total_calls"),
+            "complete": not missing and not low and _lm_pmu_valid_ratio(joint_ratio) and joint_ratio >= .8}
+        result["required_metrics"].extend(required)
+        result["missing_metrics"].extend(missing)
+        relevant.extend(observed)
+        if missing:
+            evidence.append(core.upper() + " 必需竞争流水未采齐：" + ", ".join(missing) + "；缺失值未补0")
             result["confidence"] = "低"
-    if coverage["duration_coverage"] < .8 or any(metrics[field]["duration_coverage"] < .8 for field in relevant):
+        if not _lm_pmu_valid_ratio(joint_ratio):
+            evidence.append(core.upper() + " 缺少同次调用联合流水覆盖证据，不能从各列均值恢复")
+            result["confidence"] = "低"
+        elif joint_ratio < .8:
+            evidence.append(core.upper() + " 必需流水在同次调用的联合Duration覆盖不足80%")
+            result["confidence"] = "低"
+    if (not _lm_pmu_valid_ratio(coverage.get("duration_coverage")) or coverage["duration_coverage"] < .8
+            or any(not _lm_pmu_valid_ratio(metrics[field].get("duration_coverage"))
+                   or metrics[field]["duration_coverage"] < .8 for field in relevant)):
         evidence.append("PMU已知样本Duration覆盖不足80%；缺失指标未补0")
         result["confidence"] = "低"
-    total = sum(sample["duration_ns"] for sample in samples)
-    short = sum(sample["duration_ns"] for sample in samples if sample["duration_ns"] <= 20000)
-    if total and short / total >= .5:
+    if diagnostics.get("per_call_checks_observed") is not True:
+        evidence.append("未保留真实单次调用检查；短任务占比及联合采样不能由聚合均值反推")
+        result["confidence"] = "低"
+    short = diagnostics.get("short_duration_share")
+    if _lm_pmu_valid_ratio(short) and short >= .5:
         evidence.append("至少半数耗时来自≤20μs短任务，启动/调度/响应开销需单独核对")
         result["confidence"] = "低"
-    gap = 0
-    for sample in samples:
-        duration_us = sample["duration_ns"] / 1000
-        kind = _lm_pmu_core_kind(sample["core_type"], sample["metrics"])
-        fields = {"aic": ("aicore_time_us",), "aiv": ("aiv_time_us",),
-                  "mix": ("aicore_time_us", "aiv_time_us")}.get(kind, ())
-        times = [sample["metrics"].get(field) for field in fields]
-        # An unrelated accelerator's time says nothing about the active core.
-        # A MIX task can spend its whole duration on the unobserved half; both
-        # core times are required before contrasting its task/core spans.
-        if not times or any(value is None for value in times):
-            continue
-        active = [value for value in times if value is not None and value > 0]
-        if active and max(active) < .65 * duration_us and duration_us - max(active) > 3:
-            gap += sample["duration_ns"]
-    if total and gap / total >= .5:
-        result.update(code="task_core_time_gap", label="任务跨度显著大于核内时间，需查调度/分核不均/同步", confidence="低")
+    elif not _lm_pmu_valid_ratio(short):
+        result["caveats"].append("短调用Duration占比未知；不能由平均Duration推断全部调用均为长任务。")
+        result["confidence"] = "低"
+    gap = diagnostics.get("core_time_gap_duration_share")
+    if diagnostics.get("core_time_gap_checks_observed") is True and _lm_pmu_valid_ratio(gap) and gap >= .5:
+        result.update(code="task_core_time_gap", label="任务跨度显著大于核内时间，需查调度/分核不均/同步", confidence="低",
+                      evidence_level="task_core_time_discrepancy")
         evidence.append("aicore_time/aiv_time是按分核周期推导的时间，并非任务Duration；差值不能直接归因等待或CPU")
-    if any(metrics[field].get("max", 0) - metrics[field].get("min", 0) >= .35 for field in relevant):
+    elif diagnostics.get("core_time_gap_checks_observed") is not True:
+        evidence.append("核内时间未覆盖真实调用，任务/核内时差检查保持未知；不从均值相减归因")
+    ranges = [(metrics[field].get("min"), metrics[field].get("max")) for field in relevant]
+    if any(_lm_pmu_valid_ratio(left) and _lm_pmu_valid_ratio(right) and right - left >= .35
+           for left, right in ranges):
         evidence.append("同指纹调用的流水比例差异≥35个百分点，均值可能掩盖不同执行状态")
         result["confidence"] = "低"
-    if coverage["clipped_calls"]:
+    elif any(not _lm_pmu_valid_ratio(left) or not _lm_pmu_valid_ratio(right) for left, right in ranges):
+        result["caveats"].append("部分流水缺少调用分布范围，不能从均值恢复同指纹波动。")
+    if coverage.get("clipped_calls"):
         evidence.append("存在跨父阶段裁剪：本表引用整次调用PMU，并非该阶段局部测量")
     return result
 
@@ -3887,8 +4334,7 @@ def _lm_operator_pmu_summary(member, observations):
             unique[item["identity"]]["clipped"] |= item["clipped"]
     samples = list(unique.values())
     total_ns = sum(sample["duration_ns"] for sample in samples)
-    known = [sample for sample in samples if any(field.endswith("_ratio") or field in ("aicore_time_us", "aiv_time_us")
-                                              for field in sample["metrics"])]
+    known = [sample for sample in samples if sample["metrics"]]
     known_ns = sum(sample["duration_ns"] for sample in known)
     coverage = {"known_calls": len(known), "total_calls": len(samples),
                 "known_duration_ms": known_ns / 1e6, "total_duration_ms": total_ns / 1e6,
@@ -3904,16 +4350,32 @@ def _lm_operator_pmu_summary(member, observations):
         if not duration_ns:
             continue
         values = [sample["metrics"][field] for sample in available]
-        metrics[field] = {"value": math.fsum(sample["metrics"][field] * sample["duration_ns"] / duration_ns for sample in available),
+        metrics[field] = {"value": math.fsum(sample["metrics"][field] * (sample["duration_ns"] / duration_ns) for sample in available),
             "unit": _A_PMU_FIELDS[field], "known_calls": len(available), "total_calls": len(samples),
             "known_duration_ms": duration_ns / 1e6, "total_duration_ms": total_ns / 1e6,
             "duration_coverage": duration_ns / total_ns if total_ns else 0., "min": min(values), "max": max(values)}
-    return {"metrics": metrics, "coverage": coverage,
-            "bound": _lm_operator_pmu_bound(member, metrics, coverage, samples),
+    diagnostics = _lm_pmu_sample_diagnostics(samples)
+    for field, metric in metrics.items():
+        if field in _A_PMU_FIELD_INFO:
+            metric["field_info"] = dict(_A_PMU_FIELD_INFO[field])
+        # Amount/work counters need arithmetic call statistics. A sum of
+        # bandwidth rates (for example GB/s) is not an amount of traffic.
+        if _A_PMU_FIELDS[field] not in ("ratio", "us", "cycles", "count") and "/" not in _A_PMU_FIELDS[field]:
+            values = [sample["metrics"][field] for sample in samples if field in sample["metrics"]]
+            try:
+                amount_sum = math.fsum(values)
+            except OverflowError:
+                amount_sum = None
+            metric.update(sample_sum=amount_sum, sample_mean=math.fsum(value / len(values) for value in values),
+                          sample_aggregation="arithmetic_over_known_whole_calls")
+            if amount_sum is None:
+                metric["sample_statistics_status"] = "sum_overflow; original finite values and mean retained"
+    return {"metrics": metrics, "coverage": coverage, "sample_diagnostics": diagnostics,
+            "bound": _lm_operator_pmu_bound(member, metrics, coverage, samples, sample_diagnostics=diagnostics),
             "scope_note": _LM_PMU_NOTE, "sources": _LM_PMU_SOURCES,
             "core_types": sorted({sample["core_type"] for sample in samples if sample["core_type"]}),
             "aggregation": "native_whole_call_duration_weighted",
-            "heuristics": "方向阈值为审慎提示规则：计算≥90%且领先搬运≥10个百分点；搬运≥75%且领先计算≥15个百分点；非硬件bound认证"}
+            "heuristics": "必需竞争流水齐全后才筛选主导候选：计算≥90%且领先搬运≥10个百分点；搬运≥75%且领先计算≥15个百分点；仍须核对Scalar、联合采样与单次诊断，非硬件bound认证"}
 
 
 def _lm_operator_member(task, time_index):
@@ -5359,6 +5821,7 @@ def main():
     parser.add_argument('--out', type=Path, default=Path('ep128_report'))
     parser.add_argument('--excel', action='store_true', help='同时导出10T模型推理估算Excel')
     parser.add_argument('--comm-reference', type=Path, help='原通信参考表')
+    parser.add_argument('--bound-profile', type=Path, help='显式源逻辑NPU硬件及有效工作量依据；可在已有JSON上离线补充')
     parser.add_argument('--list-inputs', action='store_true', help='只核对输入文件，不读取CSV')
     parser.add_argument('--inventory', type=Path, help='查看少量CSV的字段和设备任务数量')
     parser.add_argument('--workers', type=_cli_positive_workers, default=None,
@@ -5384,6 +5847,7 @@ def main():
         print('脚本：' + str(Path(__file__).absolute()), flush=True)
         print('配置：' + str(args.cases.absolute()), flush=True)
     config = json.loads(args.cases.read_text(encoding='utf-8-sig'))
+    bound_profile = validate_bound_profile(json.loads(args.bound_profile.read_text(encoding='utf-8-sig'))) if args.bound_profile else None
     if type(config.get('schema_version')) is not int or config['schema_version'] != SCHEMA_VERSION:
         raise ValueError('Use the V2 example manifest (schema_version=2)')
     if not isinstance(config.get('cases'), list) or not config['cases']:
@@ -5449,6 +5913,7 @@ def main():
     if not report['cases']:
         # Keep the contract identical even when no case reached finalization.
         attach_layer_mean_report(report)
+    report = refresh_report_operator_bounds(report, bound_profile)
     for result in report['cases']:
         print_case_result(result)
     export_report(report, args.out, reference_rows, progress=lambda message: print(message, flush=True))

@@ -131,7 +131,7 @@ class OperatorPmuTests(unittest.TestCase):
     def test_vector_zeros_on_cube_do_not_make_vector_inefficient(self):
         result = summary([task(1, 100, {"aic_mac_ratio": 0, "aicore_time_us": 0,
             "aiv_vec_ratio": .97, "aiv_mte2_ratio": .3, "aiv_mte3_ratio": .2,
-            "aiv_time_us": 99}, core_type="AI_VECTOR_CORE")])
+            "aiv_scalar_ratio": .1, "aiv_time_us": 99}, core_type="AI_VECTOR_CORE")])
         self.assertEqual(result["bound"]["code"], "aiv_compute")
         self.assertEqual(result["bound"]["confidence"], "中")
         self.assertNotIn("AIC：", " ".join(result["bound"]["evidence"]))
@@ -139,8 +139,9 @@ class OperatorPmuTests(unittest.TestCase):
 
     def test_mixed_core_evaluates_each_core_in_its_own_denominator(self):
         result = summary([task(1, 100, {"aic_mac_ratio": .98, "aic_mte2_ratio": .3,
+            "aic_mte1_ratio": .2, "aic_fixpipe_ratio": .1, "aic_scalar_ratio": .1,
             "aic_mte3_ratio": .1, "aiv_vec_ratio": .2, "aiv_mte2_ratio": .96,
-            "aiv_mte3_ratio": .1}, core_type="MIX_AIC")])
+            "aiv_scalar_ratio": .1, "aiv_mte3_ratio": .1}, core_type="MIX_AIC")])
         self.assertEqual(result["bound"]["code"], "mixed_core")
         self.assertIn("矩阵计算", result["bound"]["label"])
         self.assertIn("读入搬运", result["bound"]["label"])
@@ -156,6 +157,7 @@ class OperatorPmuTests(unittest.TestCase):
 
     def test_high_mac_is_only_compute_direction_when_other_pipes_observed(self):
         full = {"aic_mac_ratio": .98, "aic_mte2_ratio": .77, "aic_mte3_ratio": .01,
+                "aic_mte1_ratio": .2, "aic_fixpipe_ratio": .1, "aic_scalar_ratio": .1,
                 "aicore_time_us": 99}
         result = summary([task(1, 100, full)])
         self.assertEqual(result["bound"]["code"], "aic_compute")
@@ -175,7 +177,8 @@ class OperatorPmuTests(unittest.TestCase):
 
     def test_core_time_gap_uses_active_core_and_requires_both_mix_times(self):
         metrics = {"aic_mac_ratio": .98, "aic_mte2_ratio": .2, "aic_mte3_ratio": .1,
-                   "aiv_vec_ratio": .3, "aiv_mte2_ratio": .96, "aiv_mte3_ratio": .1}
+                   "aic_mte1_ratio": .1, "aic_fixpipe_ratio": .1, "aic_scalar_ratio": .1,
+                   "aiv_vec_ratio": .3, "aiv_mte2_ratio": .96, "aiv_mte3_ratio": .1, "aiv_scalar_ratio": .1}
         # A small irrelevant AIV time must not replace an unknown AIC time.
         aic = summary([task(1, 100, dict(metrics, aiv_time_us=5), core_type="AI_CORE")])
         self.assertEqual(aic["bound"]["code"], "aic_compute")

@@ -42,3 +42,9 @@ jobs:
       - name: Verify shared source rank and offline alignment on Windows
         if: ${{ !cancelled() }}
         run: python -B -S -m unittest discover -s tests -p 'test_ep128*source_rank*.py' -v
+      - name: Verify bound evidence and offline export on Windows
+        if: ${{ !cancelled() }}
+        run: |
+          python -B -S -m unittest discover -s tests -p 'test_ep128*bound*.py' -v
+          python -B -S -m unittest discover -s tests -p 'test_ep128_roofline.py' -v
+          python -B -S -m unittest discover -s tests -p 'test_ep128_pmu_memory_fields.py' -v

@@ -19,7 +19,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261110.3.shared_source_rank"
+RENDERER_VERSION = "20261110.4.operator_bound_evidence"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -700,6 +700,16 @@ def _align_source_rank(report):
 def _save_source_rank_report(path, report):
     from profile_ep128 import atomic_json
     atomic_json(path, report)
+
+
+def _refresh_operator_bounds(report, profile=None):
+    from profile_ep128 import refresh_report_operator_bounds
+    return refresh_report_operator_bounds(report, profile)
+
+
+def _bound_profile_template(report):
+    from profile_ep128 import operator_bound_profile_template
+    return operator_bound_profile_template(report)
 
 
 def _source_sweep_notes(case, summary):
@@ -1468,13 +1478,17 @@ PMU_SCOPE = ("以下顺序与上方源实测Top8一一对应；PMU按原生整�
              "bound为流水活动证据支持的方向判断，不直接证明HBM带宽跑满、关键路径或优化收益。"
              "若调用跨父阶段，PMU仍属于整次调用；同一调用在不同阶段引用不能相加。")
 PMU_METRICS = (("aic_mac_ratio", "AIC MAC\n矩阵计算"),
-               ("aic_mte2_ratio", "AIC MTE2\n读入搬运"), ("aic_mte3_ratio", "AIC MTE3\n写出搬运"),
+               ("aic_mte1_ratio", "AIC MTE1\n片内供数"),
+               ("aic_mte2_ratio", "AIC MTE2\nGM读入"), ("aic_fixpipe_ratio", "AIC Fixpipe\n结果搬运"),
                ("aiv_vec_ratio", "AIV VEC\n向量计算"),
-               ("aiv_mte2_ratio", "AIV MTE2\n读入搬运"), ("aiv_mte3_ratio", "AIV MTE3\n写出搬运"))
+               ("aiv_mte2_ratio", "AIV MTE2\nGM读入"), ("aiv_mte3_ratio", "AIV MTE3\n逻辑写出/片内"))
 PMU_HEADERS = ["源热点编号 / 算子", *[label for _, label in PMU_METRICS], "Scalar\nAIC / AIV", "PMU证据覆盖", "bound方向 / 置信度"]
-PMU_SPANS = ((1, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 10), (11, 11), (12, 12))
+PMU_SPANS = ((1, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 10), (11, 11), (12, 12))
 PMU_DETAIL_HEADERS = ["源热点编号 / 算子", "完整指纹与高级指标", "bound依据 / 限制"]
 PMU_DETAIL_SPANS = ((1, 3), (4, 8), (9, 12))
+PMU_MODEL_HEADERS = ["源热点编号 / 算子", "整次均时\nμs", "每调用工作量 / 流量", "实得TFLOP/s / GB/s",
+                     "算术强度 / 拐点\nFLOPs/byte", "计算 / 搬运下限\nμs", "模型方向 / 置信度", "核内时间 / 依据"]
+PMU_MODEL_SPANS = ((1, 2), (3, 3), (4, 5), (6, 7), (8, 8), (9, 10), (11, 11), (12, 12))
 
 
 def _pmu_metric_value(pmu, key):
@@ -1507,6 +1521,12 @@ def _operator_pmu_data(kernels):
             if _number(coverage.get("duration_coverage")) else "未采集")
         if coverage.get("clipped_calls"):
             coverage_text += "\n跨段引用=" + _text(coverage["clipped_calls"])
+        for core, completeness in (bound.get("pipeline_coverage") or {}).items():
+            required = set(completeness.get("required_metrics") or [])
+            observed = required.intersection(completeness.get("observed_metrics") or [])
+            coverage_text += "\n" + core.upper() + "流水=" + str(len(observed)) + "/" + str(len(required))
+            joint = completeness.get("joint_duration_coverage")
+            coverage_text += "；联合" + (format(joint, ".1%") if _number(joint) else "未知")
         conclusion = _text(bound.get("label") or "证据不足") + "\n置信度：" + _text(bound.get("confidence") or "未提供")
         label = _pmu_label(kernel, number)
         rows.append([label, *[_pmu_metric_text(metrics.get(key)) for key, _ in PMU_METRICS],
@@ -1516,12 +1536,57 @@ def _operator_pmu_data(kernels):
         for key, item in metrics.items():
             if not isinstance(item, dict):
                 continue
+            info = item.get("field_info") or {}
+            arithmetic = ""
+            if "sample_mean" in item:
+                arithmetic = "；已知调用算术均值=" + _text(item.get("sample_mean"))
+                arithmetic += "；导出行求和=" + (_text(item["sample_sum"]) if _number(item.get("sample_sum")) else "未知/溢出")
+                arithmetic += "；" + _text(item.get("sample_aggregation")) + "（不自动等于全设备总量）"
             metric_details.append(key + "=" + _pmu_metric_text(item).replace("\n", "；")
-                + "；调用=" + _text(item.get("known_calls")) + "/" + _text(item.get("total_calls")))
+                + "；调用=" + _text(item.get("known_calls")) + "/" + _text(item.get("total_calls"))
+                + ("；" + _text(info.get("description")) + "；范围=" + _text(info.get("scope")) if info else "")
+                + ("；文档产品范围=" + _text(info["products"]) if info.get("products") else "") + arithmetic)
         evidence = bound.get("evidence") or []
+        evidence = list(evidence) + list(bound.get("caveats") or [])
+        if bound.get("missing_metrics"):
+            evidence.append("缺少必需流水：" + ", ".join(bound["missing_metrics"]))
         details.append([label, _operator_fingerprint_text(kernel) + "\n\n" + ("\n".join(metric_details) or "PMU未采集，请用新版脚本重新统计；不会以0替代。"),
             conclusion + "\n" + "\n".join(_text(item) for item in evidence)
             + "\n" + _text(pmu.get("scope_note") or "没有可用PMU证据，不推断bound。")])
+    return rows, details
+
+
+def _operator_roofline_data(kernels):
+    rows, details = [], []
+    def number(value):
+        return format(value, ".6g") if _number(value) else "未建立"
+    for index, kernel in enumerate(kernels, 1):
+        pmu = kernel.get("pmu") or {}
+        model, metrics = pmu.get("roofline") or {}, pmu.get("metrics") or {}
+        label = _pmu_label(kernel, index)
+        actual = model.get("duration_mean_us")
+        if actual is None:
+            cov = pmu.get("coverage") or {}
+            total, calls = cov.get("total_duration_ms"), cov.get("total_calls")
+            if _number(total) and type(calls) is int and calls > 0:
+                actual = total * 1000 / calls
+        core_time = "AIC=" + _pmu_metric_text(metrics.get("aicore_time_us")) + "\nAIV=" + _pmu_metric_text(metrics.get("aiv_time_us"))
+        rows.append([label, number(actual), "FLOPs=" + number(model.get("flops_per_call"))
+            + "\nbytes=" + number(model.get("memory_bytes_per_call")),
+            number(model.get("achieved_tflops")) + " / " + number(model.get("achieved_bandwidth_gbps")),
+            number(model.get("arithmetic_intensity")) + " / " + number(model.get("ridge_point_flops_per_byte")),
+            number(model.get("compute_lower_bound_us")) + " / " + number(model.get("memory_lower_bound_us")),
+            _text(model.get("label") or "定量模型未建立") + "\n" + _text(model.get("confidence") or "未判断"), core_time])
+        evidence = list(model.get("missing") or []) + list(model.get("caveats") or [])
+        for key in ("compute_peak_fraction", "bandwidth_peak_fraction", "model_efficiency"):
+            if _number(model.get(key)):
+                evidence.append(key + "=" + format(model[key], ".2%"))
+        evidence.append("模型范围：" + _text(model.get("scope") or "无定量依据"))
+        if model.get("provenance"):
+            evidence.append("依据：" + _text(model["provenance"]))
+        details.append([label, "\n".join(evidence), "已验证因果bound：否\n" + _text(model.get("hardware_name") or "源硬件未声明")
+            + "\n架构=" + _text(model.get("architecture")) + "；存储层级=" + _text(model.get("memory_level"))
+            + "\nbytes依据=" + _text(model.get("memory_bytes_basis"))])
     return rows, details
 
 
@@ -1533,6 +1598,12 @@ def _operator_pmu_section(sheet, row, attention, kernels, method):
         row = _note(sheet, row, "PMU未采集，请重新统计；上方原热点排序与耗时保留，未知指标不补0。", warning=True)
     row, _, _ = _operator_table(sheet, row, PMU_HEADERS, records, PMU_SPANS)
     row, _, _ = _operator_table(sheet, row, PMU_DETAIL_HEADERS, details, PMU_DETAIL_SPANS)
+    row = _note(sheet, row, "同次源调用 · Roofline定量核对（与流水候选分列）")
+    row = _note(sheet, row, "计算下限=FLOPs/同精度峰值；搬运下限=bytes/同层级带宽；理想下限取两者较大值。"
+        "只接受显式源逻辑NPU及固定有效工作量；GMM填充容量、FIA名字或MTE活动比不能补出FLOPs/HBM bytes。")
+    model_rows, model_details = _operator_roofline_data(kernels)
+    row, _, _ = _operator_table(sheet, row, PMU_MODEL_HEADERS, model_rows, PMU_MODEL_SPANS)
+    row, _, _ = _operator_table(sheet, row, PMU_DETAIL_HEADERS, model_details, PMU_DETAIL_SPANS)
     return row
 
 
@@ -2499,6 +2570,12 @@ def _method_operator_html(method, role, attention):
     parts.append('<div class="pmu-metrics">' + _html_table(PMU_HEADERS, pmu_rows) + '</div>')
     parts.append('<details><summary>展开完整指纹、高级PMU指标及bound依据</summary>'
                  + _html_table(PMU_DETAIL_HEADERS, pmu_details) + '</details>')
+    model_rows, model_details = _operator_roofline_data(data["kernel_items"])
+    parts.append('<h5>同次源调用 · Roofline定量核对</h5><p>计算下限=FLOPs/同精度峰值；搬运下限=bytes/同层级带宽；'
+                 '理想下限取较大值。模型与实测流水分列，缺少准确工作量及源硬件时不猜。</p>')
+    parts.append('<div class="pmu-metrics">' + _html_table(PMU_MODEL_HEADERS, model_rows) + '</div>')
+    parts.append('<details><summary>定量模型、峰值比例、缺失证据与限制</summary>'
+                 + _html_table(PMU_DETAIL_HEADERS, model_details) + '</details>')
     parts.append('<details><summary>本页源热点的完整指纹与原行/轮/层示例（全部明细见核心JSON）</summary><pre>'
         + esc(json.dumps({"core_basis_notes": data.get("basis_notes"), "target_preview": data["target_items"], "kernel_hotspots": data["kernel_items"]},
                          ensure_ascii=False, indent=2)) + '</pre></details></section>')
@@ -2834,7 +2911,8 @@ def _check_result_cells(book, report):
 
 def build_workbook(out, *, report=None, report_data=None, cases=None, reference=None,
                    reference_unit='unknown', preview=False, detail_rows=DEFAULT_DETAIL_ROWS, progress=None,
-                   expected_method_set=None, align_source_rank=False):
+                   expected_method_set=None, align_source_rank=False, refresh_bound=False,
+                   bound_profile=None, bound_template=None):
     """Render a core report or an honestly empty configuration preview.
 
     ``report_data`` reuses an already loaded report without parsing its JSON
@@ -2864,9 +2942,18 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
         raise ValueError('--preview只用于--cases；真实报告状态由核心JSON决定')
     if align_source_rank and (cases is not None or preview):
         raise ValueError('--align-source-rank只用于已有报告JSON，不能用于配置预览')
+    refresh_bound = refresh_bound or bound_profile is not None
+    if (refresh_bound or bound_template is not None) and (cases is not None or preview):
+        raise ValueError('bound更新及模板只用于已有报告JSON，不能用于配置预览')
     aligned_path = Path(out).with_suffix('.source_rank.json') if align_source_rank else None
+    bound_path = Path(out).with_suffix('.bound.json') if refresh_bound else None
     if aligned_path is not None and aligned_path.resolve() == Path(report).resolve():
         raise ValueError('对齐后的JSON不能覆盖输入报告；请为--out选择另一个文件名')
+    protected = [Path(value).resolve() for value in (report, bound_profile) if value is not None]
+    outputs = [Path(value).resolve() for value in (out, Path(out).with_suffix('.html'), aligned_path, bound_path, bound_template)
+               if value is not None]
+    if len(outputs) != len(set(outputs)) or any(value in protected for value in outputs):
+        raise ValueError('输出及bound模板必须使用独立路径，不能覆盖输入报告或profile')
     runtime = runtime_diagnostics()
     if not callable(getattr(xlsx_writer.Worksheet, "add_line_chart", None)):
         raise ValueError("Excel写入器缺少BS趋势图接口；请同步更新build_ep128_leadership_excel.py和ep128_xlsx_writer.py。"
@@ -2892,6 +2979,13 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
     if align_source_rank:
         payload = stage("按外推前源整轮均值对齐两方法rank", lambda: _align_source_rank(payload))
         stage("校验共同源rank报告", lambda: _validate_report(payload))
+    if refresh_bound:
+        profile = stage("读取bound硬件与工作量依据", lambda: _read_json(bound_profile)) if bound_profile is not None else None
+        payload = stage("离线更新流水候选和Roofline证据", lambda: _refresh_operator_bounds(payload, profile))
+        stage("校验bound更新报告", lambda: _validate_report(payload))
+    if bound_template is not None:
+        template = stage("生成bound依据模板（所有峰值和工作量留空）", lambda: _bound_profile_template(payload))
+        stage("保存bound依据模板", lambda: _save_source_rank_report(bound_template, template))
     if expected_method_set is not None:
         stage("核对导出方法集", lambda: _check_expected_method_set(payload, expected_method_set, report or cases))
     if progress is not None:
@@ -2914,6 +3008,8 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
     stage("写入HTML预览", lambda: _html_preview(payload,path))
     if aligned_path is not None:
         stage("保存共同源rank核心JSON", lambda: _save_source_rank_report(aligned_path, payload))
+    if bound_path is not None:
+        stage("保存bound更新核心JSON", lambda: _save_source_rank_report(bound_path, payload))
     return Path(path)
 
 
@@ -2929,6 +3025,12 @@ def main():
     parser.add_argument('--out',type=Path,default=Path('10T模型推理估算.xlsx'))
     parser.add_argument('--align-source-rank',action='store_true',
                         help='将旧JSON按外推前源整轮均值最大rank对齐两方法；不读CSV，另存.source_rank.json')
+    parser.add_argument('--refresh-bound',action='store_true',
+                        help='用已存PMU离线更新流水候选及缺失证据；另存.bound.json，不读取CSV')
+    parser.add_argument('--bound-profile',type=Path,
+                        help='显式源硬件/同精度峰值/固定有效工作量JSON；隐含--refresh-bound，不自动猜峰值')
+    parser.add_argument('--bound-template',type=Path,
+                        help='按当前case/源rank/算子指纹导出全空依据模板；不捏造Roofline数据')
     parser.add_argument('--detail-rows',type=int,default=DEFAULT_DETAIL_ROWS,
                         help='每case每类明细在Excel中最多预览的条数，默认1000，范围1..10000；核心统计及完整JSON不变')
     args=parser.parse_args()
@@ -2942,6 +3044,8 @@ def main():
         path=build_workbook(args.out,report=args.report,cases=args.cases,reference=args.reference,
                             reference_unit=args.reference_unit,preview=args.preview,detail_rows=args.detail_rows,
                             align_source_rank=args.align_source_rank,
+                            refresh_bound=args.refresh_bound, bound_profile=args.bound_profile,
+                            bound_template=args.bound_template,
                             progress=lambda name: print('Excel阶段：'+name, file=sys.stderr, flush=True))
     except (OSError,ValueError,KeyError,TypeError) as error:
         traceback.print_exc(file=sys.stderr)
@@ -2950,6 +3054,10 @@ def main():
     print('HTML预览：'+str(path.with_suffix('.html').resolve()))
     if args.align_source_rank:
         print('共同源rank核心JSON：'+str(path.with_suffix('.source_rank.json').resolve()))
+    if args.refresh_bound or args.bound_profile is not None:
+        print('bound更新核心JSON：'+str(path.with_suffix('.bound.json').resolve()))
+    if args.bound_template is not None:
+        print('bound依据模板：'+str(args.bound_template.resolve()))
     return 0
 
 
