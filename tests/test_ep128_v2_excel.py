@@ -295,7 +295,8 @@ class RendererV2Tests(unittest.TestCase):
             if node.module == 'profile_ep128':
                 # Core owns source summaries/offline rank alignment; the renderer
                 # may persist that derived JSON but never imports estimators.
-                allowed = {'source_sweep_summary', 'align_report_source_rank', 'atomic_json'}
+                allowed = {'source_sweep_summary', 'align_report_source_rank', 'atomic_json',
+                           'refresh_report_operator_bounds', 'operator_bound_profile_template'}
                 self.assertTrue({alias.name for alias in node.names} <= allowed)
             else:
                 imports.append(node.module or '')

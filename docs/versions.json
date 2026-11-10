@@ -7,15 +7,15 @@
   },
   "components": {
     "profile_ep128.py": {
-      "version": "20261110.5.shared_source_rank",
-      "sha256": "e4242871a8ed1ff47f4472fd46841a0aee3b570ddf6d9fb1a8c41b523d24281b",
+      "version": "20261110.6.operator_bound_evidence",
+      "sha256": "68ef9dea4912b4da23bf4e5a2228e04bdf675e61c2b70a8831d3410abfdd0236",
       "imported_version": "20261103.12.native_stages",
       "imported_sha256": "035f0c6312354ca0937361f1ab301452ed61c68239845b2c0c76f08653f9d7f7",
       "matches_imported_source": false
     },
     "build_ep128_leadership_excel.py": {
-      "version": "20261110.3.shared_source_rank",
-      "sha256": "ab104d5518ce162925ad76bb1477baaef2a8de25f50dc6e5904cceded8e96a42",
+      "version": "20261110.4.operator_bound_evidence",
+      "sha256": "c9e60f746ef27341ec9bbe5fdea149155323cc08310ea3b6684a8ee79b61ba31",
       "imported_version": "20261104.2.bs_inventory",
       "imported_sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
       "matches_imported_source": false
@@ -68,11 +68,12 @@
     "Case analysis uses a bounded spawn process pool (automatic maximum two, CPU/cgroup and low-memory budgets, --workers 1 for serial). Each case immediately finalizes both methods and releases prepared operator evidence; only private temporary-file identities cross IPC, and result/failure order stays deterministic. Rank coverage and all diagnostics remain intact. Bounded PMU value parsing and validated native PMU reuse reduce repeated work, exact Decimal trace timestamps avoid reparsing, and case/rank stage timing logs expose progress. Serial/spawn equivalence and Windows CLI/spawn CI are included; source/target timing, rank selection and all extrapolation formulas remain unchanged.",
     "Optional --parallel rank schedules every case/rank on one global spawn pool, with --workers as its total budget. Full case context and coverage are planned once; rank results spool privately, then each complete case is assembled in original rank order, finalized immediately, and released. Original duplicate-CSV and first preparation-error ordering, mean-rank tie selection, source and target formulas, and all successful-case CSV evidence are preserved. Default case parallelism remains compatible, including explicit nine-case concurrency. Windows CI also exercises rank concurrency and full serial/rank result equivalence.",
     "Source baseline and both extrapolation methods add editable BS/S sweep tables and line charts while preserving the nine-sheet workbook and offline HTML. Fixed-BS S comparisons retain each case configured Neff and existing rank choices; whole-cycle latency is explicitly an ITL round-interval proxy, not measured per-token delivery latency. Source headline values remain aggregate originals, and a pure source-only helper derives TPOT and five measured parts from the selected source rank exact layer boundaries including main0; missing or nonclosing evidence stays unknown. Old JSON redraw requires no CSV or trace reads, changes no report objects or target formulas, preserves duplicate points without ambiguous curves and missing points as gaps. Independent chart-cache, table-reference, source-rank isolation, alias-validation, and Windows sweep regression checks are included.",
-    "Both methods now share one rank per case selected before extrapolation from the maximum retained source full-cycle mean, including main0 and all original main/draft chains, gaps and residual. Ties preserve original source input order, all per-rank target estimates and formulas remain, and final cards, five parts, stages, U/step and operator/PMU evidence use the shared rank; target-model maxima are no longer selected. Explicit source-rank metadata and incomplete-coverage scope accompany results, with honest unavailable-method references. Optional renderer --align-source-rank performs pure offline reselection from stored per-rank results into a separate JSON/XLSX/HTML without CSV rereads or input mutation, preserving only verified same-method/same-rank operator evidence and leaving absent PMU unknown. Direct legacy redraw preserves original values and labels the old policy. Reversal, tie, mean, physical-card, evidence-provenance, metadata-conflict, CLI and Windows regression checks cover the change."
+    "Both methods now share one rank per case selected before extrapolation from the maximum retained source full-cycle mean, including main0 and all original main/draft chains, gaps and residual. Ties preserve original source input order, all per-rank target estimates and formulas remain, and final cards, five parts, stages, U/step and operator/PMU evidence use the shared rank; target-model maxima are no longer selected. Explicit source-rank metadata and incomplete-coverage scope accompany results, with honest unavailable-method references. Optional renderer --align-source-rank performs pure offline reselection from stored per-rank results into a separate JSON/XLSX/HTML without CSV rereads or input mutation, preserving only verified same-method/same-rank operator evidence and leaving absent PMU unknown. Direct legacy redraw preserves original values and labels the old policy. Reversal, tie, mean, physical-card, evidence-provenance, metadata-conflict, CLI and Windows regression checks cover the change.",
+    "Public NPU performance Skill/code survey pins 13 repositories and records licenses, assumptions and rejected heuristics. Independent operator screening now checks role-specific MAC/VEC/Scalar/MTE1/MTE2/MTE3/Fixpipe completeness, same-call joint coverage and saved per-call diagnostics; missing evidence never defaults to compute-bound. Forty-four explicitly documented memory, bandwidth, cache and operation fields retain product/unit/export-row provenance, with arithmetic amount statistics separate from Duration-weighted activity. Method1/2 Top8 tables expose MTE1/Fixpipe and a separate explicit source-logical-NPU Roofline model; dtype peaks, fixed effective work, memory level and source case/rank/fingerprint are validated, and inconsistent or absent models remain explicit. Optional --refresh-bound updates old JSON without CSV reads or timing/rank changes, with separate derived JSON/XLSX/HTML and evidence templates. The nine-sheet layout, standard-library Windows runtime, parallelism and all source/target timing formulas remain; regression and independent adversarial review cover provenance, units, coverage, overflow and input protection."
   ],
   "validation": {
-    "discovered_tests": 425,
-    "passed": 415,
+    "discovered_tests": 478,
+    "passed": 468,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,

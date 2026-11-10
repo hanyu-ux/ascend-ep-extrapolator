@@ -268,8 +268,8 @@ python build_ep128_leadership_excel.py --report ep128_report/model_architecture_
 | `aic_mac_ratio` | AIC 矩阵乘加流水活跃周期占比 |
 | `aiv_vec_ratio` | AIV 向量流水活跃周期占比 |
 | `aic/aiv_scalar_ratio` | 对应核的标量、地址和控制处理流水活跃占比 |
-| `aic/aiv_mte2_ratio` | 从外部存储层级读入数据的搬运流水活跃占比 |
-| `aic/aiv_mte3_ratio` | 向外部存储层级写出数据的搬运流水活跃占比 |
+| `aic/aiv_mte2_ratio` | GM向核内供数的流水活动；cache下不等同HBM物理读取 |
+| `aic/aiv_mte3_ratio` | 逻辑写出或片内搬运，通路依架构；不能一概解释为写GM |
 | `aic_mte1_ratio` / `aic_fixpipe_ratio` | 片内输入搬运和结果搬运流水活跃占比 |
 | `aicore_time` / `aiv_time` | PMU 按分核周期推导的核内时间，不能与任务 Duration 的差值直接等同等待 |
 | `Block Num` / `Mix Block Num` | 算子启动分核配置，不是实测吞吐利用率 |
@@ -280,6 +280,16 @@ python build_ep128_leadership_excel.py --report ep128_report/model_architecture_
 流水可以同时工作，因此比例不能堆叠成100%或相加为总时间。MIX 算子联合考虑 AIC/AIV，两侧比例分母不同；向量算子的 AIC 零值不能判作低效。高计算占用、高搬运占用、标量突出、通信/同步复合任务、短任务以及核内时间与任务跨度差异分别处理。表中给出的 bound 是保守方向和置信度，不证明带宽饱和、因果关键路径或优化收益。确证需要真实有效行数、硬件精度/频率、实际访存和依赖信息。
 
 输入 CSV 中已有 PMU 列即可使用；字段缺失时继续生成其他结果并明确提示。只有补采硬件 PMU 才能获得原采样未记录的指标，不能靠重绘补齐。
+
+新版主表直接列 MTE1、Fixpipe，并按 AIC/AIV 的竞争流水、逐项及同次联合覆盖检查置信度；未知不默认 compute-bound。另有独立 Roofline 表，严格要求显式源逻辑NPU、匹配计算dtype的峰值、固定有效工作量、同存储层级的bytes。规则与空模板填写方法见[算子bound说明](operator-bound.md)，公开来源和许可见[Skill调研](operator-bound-skill-survey.md)。
+
+已有报告可以只更新判据，不重读CSV：
+
+```bash
+python -u build_ep128_leadership_excel.py --report ep128_report_7/model_architecture_report.json --refresh-bound --out "ep128_report_7/专业bound.xlsx"
+```
+
+另存 `.bound.json`、Excel和HTML，仍保留9个sheet。未存逐调用诊断的旧JSON无法恢复联合覆盖/短任务检查，明确降级；指标值和时间账本保留。`--bound-template bound_profile.local.json` 生成全空硬件/工作量模板，核实后使用 `--bound-profile bound_profile.local.json`；不需要定量模型时无需填写。参数可与 `--align-source-rank` 合用；先按已存数据对齐，再更新bound，缺证据仍不借用其他rank。
 
 ### CSA、HCA、SWA 10 段与同 rank 对照
 
