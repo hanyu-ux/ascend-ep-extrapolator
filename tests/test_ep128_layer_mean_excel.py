@@ -466,20 +466,25 @@ class LayerMeanRendererTests(unittest.TestCase):
             self.assertNotIn('Neff=6.399999', ' '.join(str(value) for value in book[sheet_name][1].values()))
         ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
         charts = self.chart_parts_by_sheet(out, book)
-        for sheet_name, expected_count in (('估算总览', 6), ('方法1估算', 2), ('方法2估算', 2)):
+        for sheet_name, expected_count in (('估算总览', 6), ('方法1估算', 4), ('方法2估算', 4)):
             # S sweeps are additional views; this contract covers fixed-S BS curves.
             lines = [chart for chart in charts[sheet_name] if chart.find('.//c:lineChart', ns) is not None
                      and '随BS变化' in self.chart_title(chart)]
             self.assertEqual(len(lines), expected_count)
             for chart in lines:
                 self.assert_line_cache_matches_sheet(chart, book, [4, 8])
-        for group_index, group in enumerate(groups):
-            chart = charts['估算总览'][group_index * 3]
-            for series_index, identity in enumerate(('method1', 'method2')):
-                actual = [float(point.findtext('c:v', namespaces=ns)) for point in
-                          chart.findall('.//c:ser', ns)[series_index].findall('c:val/c:numRef/c:numCache/c:pt', ns)]
+        for identity in ('method1', 'method2'):
+            chart, = [chart for chart in charts['估算总览'] if self.chart_title(chart).startswith('单卡吞吐随BS变化')
+                      and renderer._layer_mean_name({'id': identity}) in self.chart_title(chart)]
+            series = self.assert_line_cache_matches_sheet(chart, book, [4, 8])
+            self.assertEqual(len(series), 2)  # Both fixed-S curves share this method's chart.
+            for item, draft in zip(series, (7, 9)):
+                actual = [float(point.findtext('c:v', namespaces=ns))
+                          for point in item.findall('c:val/c:numRef/c:numCache/c:pt', ns)]
+                selected_cases = sorted((case for case in report['cases'] if case['config']['draft_tokens'] == draft),
+                                        key=lambda case: case['config']['bs'])
                 expected = [next(method for method in case['projection']['layer_mean_methods']
-                                 if method['id'] == identity)['per_device_tokens_s'] for case in group['cases']]
+                                 if method['id'] == identity)['per_device_tokens_s'] for case in selected_cases]
                 self.assertEqual(actual, expected)
         preview = out.with_suffix('.html').read_text(encoding='utf-8')
         start = preview.index('class="case-parameters"')
@@ -491,7 +496,7 @@ class LayerMeanRendererTests(unittest.TestCase):
             self.assertEqual(preview.count('<p>' + line + '</p>'), 3)
         self.assertNotIn('Neff=6.399999', preview)
         self.assertIn('非实测', table)
-        self.assertTrue(renderer.RENDERER_VERSION.startswith('20261110.'))
+        self.assertRegex(renderer.RENDERER_VERSION, r'^\d{8}\.\d+\.')
 
     def test_operator_preview_closes_signed_models_and_keeps_largest_remaining_gap(self):
         report = operator_drilldown_report()
@@ -950,38 +955,23 @@ class LayerMeanRendererTests(unittest.TestCase):
         ordered = sorted(report['cases'], key=lambda case: case['config']['bs'])
         expected_bs = [4, 8, 16, 32]
         overview = [chart for chart in charts['估算总览'] if chart.find('.//c:lineChart', ns) is not None]
-        self.assertEqual(len(overview), 3)
-        first_values = {tuple(case['projection']['layer_mean_methods'][0][field] for case in ordered): field
-                        for field in ('cycle_ms', 'tpot_ms', 'per_device_tokens_s')}
-        seen = set()
-        for chart in overview:
-            series = self.assert_line_cache_matches_sheet(chart, book, expected_bs)
-            self.assertEqual(len(series), 2)
-            vector = tuple(float(row.findtext('c:v', namespaces=ns))
-                           for row in series[0].findall('c:val/c:numRef/c:numCache/c:pt', ns))
-            self.assertIn(vector, first_values)
-            field = first_values[vector]
-            seen.add(field)
-            for index, item in enumerate(series):
-                values = [float(row.findtext('c:v', namespaces=ns))
-                          for row in item.findall('c:val/c:numRef/c:numCache/c:pt', ns)]
-                self.assertEqual(values, [case['projection']['layer_mean_methods'][index][field] for case in ordered])
-                self.assertIn(renderer._layer_mean_name({'id': 'method' + str(index + 1)}),
-                              ''.join(item.find('c:tx', ns).itertext()))
-            first_row = int(re.search(r'\$A\$(\d+):',
-                series[0].findtext('c:cat/c:strRef/c:f', namespaces=ns)).group(1))
-            for row, case in enumerate(ordered, first_row):
-                self.assertEqual(book['估算总览'][1]['D' + str(row)],
-                                 case['projection']['layer_mean_methods'][0]['selected_rank'])
-                self.assertEqual(book['估算总览'][1]['H' + str(row)],
-                                 case['projection']['layer_mean_methods'][1]['selected_rank'])
-        self.assertEqual(seen, {'cycle_ms', 'tpot_ms', 'per_device_tokens_s'})
+        self.assertEqual(len(overview), 6)
+        for index, identity in enumerate(('method1', 'method2')):
+            selected = [chart for chart in overview if renderer._layer_mean_name({'id': identity}) in self.chart_title(chart)]
+            self.assertEqual(len(selected), 3)
+            vectors = set()
+            for chart in selected:
+                series, = self.assert_line_cache_matches_sheet(chart, book, expected_bs)
+                vectors.add(tuple(float(row.findtext('c:v', namespaces=ns))
+                                  for row in series.findall('c:val/c:numRef/c:numCache/c:pt', ns)))
+            self.assertEqual(vectors, {tuple(case['projection']['layer_mean_methods'][index][field] for case in ordered)
+                                       for field in ('cycle_ms', 'tpot_ms', 'per_device_tokens_s')})
         for index, name in enumerate(('方法1估算', '方法2估算')):
-            line = [chart for chart in charts[name] if chart.find('.//c:lineChart', ns) is not None]
-            self.assertEqual(len(line), 1)
-            # Existing per-case closed bars remain, alongside one BS comparison.
-            self.assertEqual(len(charts[name]), 5)
-            series = self.assert_line_cache_matches_sheet(line[0], book, expected_bs)
+            lines = [chart for chart in charts[name] if chart.find('.//c:lineChart', ns) is not None]
+            self.assertEqual(len(lines), 4)  # Q, TPOT, full cycle and the five-part graph.
+            self.assertEqual(len(charts[name]), 8)  # Four original closed bars are preserved.
+            part_chart, = [chart for chart in lines if self.chart_title(chart).startswith('整轮五项耗时构成')]
+            series = self.assert_line_cache_matches_sheet(part_chart, book, expected_bs)
             self.assertEqual(len(series), 5)
             methods = [case['projection']['layer_mean_methods'][index] for case in ordered]
             self.assertGreater(len({method['selected_rank'] for method in methods}), 1)
@@ -994,10 +984,11 @@ class LayerMeanRendererTests(unittest.TestCase):
                 rows = [next(row for row in method['breakdown'] if row['key'] == component) for method in methods]
                 self.assertEqual(values, [row['value_ms'] for row in rows])
                 self.assertIn(label, ''.join(item.find('c:tx', ns).itertext()))
-            first_row = int(re.search(r'\$A\$(\d+):',
-                series[0].findtext('c:cat/c:strRef/c:f', namespaces=ns)).group(1))
-            for row, method in enumerate(methods, first_row):
-                self.assertEqual(book[name][1]['D' + str(row)], method['selected_rank'])
+            # Original evidence tables keep each point's rank; trends never reaggregate it.
+            for case, method in zip(ordered, methods):
+                cells = book[name][1]
+                rows = [int(cell[1:]) for cell, value in cells.items() if re.fullmatch(r'B\d+', cell) and value == case['name']]
+                self.assertTrue(any(cells.get('D' + str(row)) == method['selected_rank'] for row in rows))
 
     def test_unavailable_middle_bs_is_a_blank_point_with_original_category_index(self):
         report = bs_trend_report()
@@ -1011,17 +1002,19 @@ class LayerMeanRendererTests(unittest.TestCase):
             if chart.find('.//c:lineChart', ns) is None:
                 continue
             series = self.assert_line_cache_matches_sheet(chart, book, [4, 8, 16, 32])
-            for index, item in enumerate(series):
+            method2 = renderer._layer_mean_name({'id': 'method2'}) in self.chart_title(chart)
+            for item in series:
                 points = item.findall('c:val/c:numRef/c:numCache/c:pt', ns)
-                self.assertEqual([int(row.get('idx')) for row in points], [0, 1, 2, 3] if index == 0 else [0, 2, 3])
+                self.assertEqual([int(row.get('idx')) for row in points], [0, 2, 3] if method2 else [0, 1, 2, 3])
                 values_ref = item.findtext('c:val/c:numRef/c:f', namespaces=ns)
-                if index == 1:
+                if method2:
                     self.assertIsNone(self.chart_reference_cells(book, values_ref)[1])
         line = [chart for chart in charts['方法2估算'] if chart.find('.//c:lineChart', ns) is not None]
-        self.assertEqual(len(line), 1)
-        for series in self.assert_line_cache_matches_sheet(line[0], book, [4, 8, 16, 32]):
-            self.assertEqual([int(row.get('idx')) for row in series.findall('c:val/c:numRef/c:numCache/c:pt', ns)], [0, 2, 3])
-            self.assertIsNone(self.chart_reference_cells(book, series.findtext('c:val/c:numRef/c:f', namespaces=ns))[1])
+        self.assertEqual(len(line), 4)
+        for chart in line:
+            for series in self.assert_line_cache_matches_sheet(chart, book, [4, 8, 16, 32]):
+                self.assertEqual([int(row.get('idx')) for row in series.findall('c:val/c:numRef/c:numCache/c:pt', ns)], [0, 2, 3])
+                self.assertIsNone(self.chart_reference_cells(book, series.findtext('c:val/c:numRef/c:f', namespaces=ns))[1])
 
     def test_nonclosing_breakdown_blanks_all_five_parts_but_keeps_valid_headline(self):
         report = bs_trend_report()
@@ -1032,8 +1025,9 @@ class LayerMeanRendererTests(unittest.TestCase):
         ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
         charts = self.chart_parts_by_sheet(out, book)
         line = [chart for chart in charts['方法1估算'] if chart.find('.//c:lineChart', ns) is not None]
-        self.assertEqual(len(line), 1)
-        for series in self.assert_line_cache_matches_sheet(line[0], book, [4, 8, 16, 32]):
+        self.assertEqual(len(line), 4)
+        part_chart, = [chart for chart in line if self.chart_title(chart).startswith('整轮五项耗时构成')]
+        for series in self.assert_line_cache_matches_sheet(part_chart, book, [4, 8, 16, 32]):
             self.assertEqual([int(row.get('idx')) for row in series.findall('c:val/c:numRef/c:numCache/c:pt', ns)],
                              [0, 2, 3])
             self.assertIsNone(self.chart_reference_cells(book, series.findtext('c:val/c:numRef/c:f', namespaces=ns))[1])
@@ -1076,23 +1070,19 @@ class LayerMeanRendererTests(unittest.TestCase):
         preview = out.with_suffix('.html').read_text(encoding='utf-8')
         svgs = [ET.fromstring(svg) for svg in re.findall(r'<svg\b.*?</svg>', preview, re.DOTALL)]
         svgs = [svg for svg in svgs if not (svg.findtext('title') or '').startswith('源采样基线 · ')]
-        self.assertEqual(len(svgs), 5)
-        self.assertEqual([svg.findtext('title') for svg in svgs[:3]],
-                         ['单卡吞吐随BS变化', '完整周期（ITL代理）随BS变化', 'TPOT随BS变化'])
-        for index, svg in enumerate(svgs[3:], 1):
-            self.assertIn(renderer._layer_mean_name({'id': 'method' + str(index)}), svg.findtext('title'))
-            self.assertIn('整轮五项耗时构成随BS变化', svg.findtext('title'))
-        def xs(line):
-            return [float(point.split(',')[0]) for point in line.get('points').split()]
-        for svg in svgs[:3]:
-            first = [line for line in svg.findall('polyline') if line.get('stroke') == '#168B8D']
-            second = [line for line in svg.findall('polyline') if line.get('stroke') == '#D4793A']
-            self.assertEqual([xs(line) for line in first], [[100., 420., 740., 1060.]])
-            self.assertEqual([xs(line) for line in second], [[100.], [740., 1060.]])
-        self.assertEqual([xs(line) for line in svgs[3].findall('polyline')],
-                         [[100., 420., 740., 1060.]] * 5)
-        self.assertEqual([xs(line) for line in svgs[4].findall('polyline')],
-                         [[100.], [740., 1060.]] * 5)
+        self.assertEqual(len(svgs), 14)  # Overview 2*3; each method's 3 metrics plus five parts.
+        for identity in ('method1', 'method2'):
+            selected = [svg for svg in svgs if renderer._layer_mean_name({'id': identity}) in svg.findtext('title')]
+            self.assertEqual(len(selected), 7)
+            for svg in selected:
+                is_parts = svg.findtext('title').startswith('整轮五项耗时构成')
+                expected_series = 5 if is_parts else 1
+                self.assertEqual(len(svg.findall('circle')), expected_series * (4 if identity == 'method1' else 3))
+                polylines = svg.findall('polyline')
+                # A singleton before a missing point is a marker, never bridged to later points.
+                expected_x = [[100., 420., 740., 1060.]] if identity == 'method1' else [[100.], [740., 1060.]]
+                self.assertEqual([[float(point.split(',')[0]) for point in line.get('points').split()]
+                                  for line in polylines], expected_x * expected_series)
 
     def test_non_bs_config_models_and_observed_rank_changes_never_share_a_trend(self):
         for changed in ('draft_tokens', 'effective_tokens_per_round', 'target_ep',
@@ -1128,7 +1118,9 @@ class LayerMeanRendererTests(unittest.TestCase):
                 out, (book, _) = self.build(report)
                 ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
                 charts = self.chart_parts_by_sheet(out, book)
-                for name, expected in (('估算总览', 6), ('方法1估算', 2), ('方法2估算', 2)):
+                combined = changed in ('draft_tokens', 'effective_tokens_per_round')
+                for name, expected in (('估算总览', 6 if combined else 12),
+                                       ('方法1估算', 4 if combined else 8), ('方法2估算', 4 if combined else 8)):
                     line = [chart for chart in charts[name] if chart.find('.//c:lineChart', ns) is not None
                             and '随BS变化' in self.chart_title(chart)]
                     self.assertEqual(len(line), expected)
@@ -1137,6 +1129,13 @@ class LayerMeanRendererTests(unittest.TestCase):
                         # Each chart contains one intact group, not duplicate
                         # categories from unrelated source/target conditions.
                         self.assertIn(categories[:len(set(categories))], [['4', '8'], ['4', '8', '16', '32']])
+                        first = chart.find('.//c:ser/c:cat/c:strRef/c:strCache', ns)
+                        actual_categories = [int(node.text) for node in first.findall('c:pt/c:v', ns)]
+                        series = self.assert_line_cache_matches_sheet(chart, book, actual_categories)
+                        if combined:
+                            self.assertEqual(actual_categories, [4, 8, 16, 32])
+                            expected_count = 10 if name != '估算总览' and self.chart_title(chart).startswith('整轮五项耗时构成') else 2
+                            self.assertEqual(len(series), expected_count)
 
     def test_duplicate_bs_keeps_each_case_row_and_suppresses_group_trends(self):
         report = bs_trend_report()
@@ -1225,11 +1224,14 @@ class LayerMeanRendererTests(unittest.TestCase):
         charts = self.chart_parts_by_sheet(out, book)
         for name in ('估算总览', '方法1估算', '方法2估算'):
             line = [chart for chart in charts[name] if chart.find('.//c:lineChart', ns) is not None]
-            self.assertEqual(len(line), 3 if name == '估算总览' else 1)
+            self.assertEqual(len(line), 6 if name == '估算总览' else 4)
             for chart in line:
                 self.assert_line_cache_matches_sheet(chart, book, [4, 8])
         preview = out.with_suffix('.html').read_text(encoding='utf-8')
-        start = preview.index(title)
+        # The clickable directory also contains the title; inspect the real heading/table.
+        heading = re.search(r'<h2(?:\s[^>]*)?>' + re.escape(title) + r'</h2>', preview)
+        self.assertIsNotNone(heading)
+        start = heading.start()
         index_html = preview[start:preview.index('</table>', start)]
         self.assertEqual(sorted(ordered, key=lambda case: index_html.index(case['name'])), ordered)
 
@@ -1941,7 +1943,7 @@ class LayerMeanRendererTests(unittest.TestCase):
             self.assertEqual(cells['I' + str(card_row + 1)], method['per_device_tokens_s'])
         preview = out.with_suffix('.html').read_text()
         for title in titles:
-            self.assertEqual(preview.count('<h4>' + title), 2, title)
+            self.assertEqual(len(re.findall(r'<h4(?:\s[^>]*)?>' + re.escape(title), preview)), 2, title)
         self.assertEqual(preview.count('class="method-stage-expansion"'), 10)
 
     def test_incomplete_main_attention_class_keeps_table_and_suppresses_only_its_chart(self):
@@ -1979,7 +1981,7 @@ class LayerMeanRendererTests(unittest.TestCase):
                 self.assertTrue(any(isinstance(value, str) and value.startswith(title)
                                     for value in book[name][1].values()))
                 self.assertFalse(any(self.chart_title(chart).startswith(title) for chart in by_sheet[name]))
-                self.assertIn('<h4>' + title, preview)
+                self.assertRegex(preview, r'<h4(?:\s[^>]*)?>' + re.escape(title))
             for title in DRILLDOWN_TITLES:
                 self.assertTrue(any(self.chart_title(chart).startswith(title) for chart in by_sheet[name]))
 

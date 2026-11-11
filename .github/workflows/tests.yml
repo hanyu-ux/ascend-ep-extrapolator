@@ -48,3 +48,10 @@ jobs:
           python -B -S -m unittest discover -s tests -p 'test_ep128*bound*.py' -v
           python -B -S -m unittest discover -s tests -p 'test_ep128_roofline.py' -v
           python -B -S -m unittest discover -s tests -p 'test_ep128_pmu_memory_fields.py' -v
+      - name: Verify combined trends, source-linked steps and navigation on Windows
+        if: ${{ !cancelled() }}
+        run: |
+          python -B -S -m unittest discover -s tests -p 'test_ep128_consolidated_trends.py' -v
+          python -B -S -m unittest discover -s tests -p 'test_ep128_focus_source.py' -v
+          python -B -S -m unittest discover -s tests -p 'test_ep128_internal_links.py' -v
+          python -B -S -m unittest discover -s tests -p 'test_ep128_report_navigation.py' -v
