@@ -458,9 +458,10 @@ class LayerMeanRendererTests(unittest.TestCase):
                                   acceptance_semantics='mean_accepted_draft_fraction')
             report['cases'].append(case)
             neff = '6.4' if draft == 9 else '5.2'
-            expected_rows.append([name, str(bs), str(draft), neff, '60%'])
+            expected_rows.append([name, str(bs), str(draft), neff,
+                                  '60%；平均草稿接受比例；历史SAL=1+S×r'])
             parameter_lines.append(f'BS={bs}；草稿S={draft}；Neff={neff}（含bonus）；'
-                                   '声明的平均草稿接受比例=60%（配置假设，非实测）')
+                                   '声明的平均草稿接受比例=60%（配置假设，非实测；历史SAL=1+S×r）')
         groups = renderer._bs_comparison_groups(report)
         self.assertEqual([[case['config']['draft_tokens'] for case in group['cases']] for group in groups],
                          [[9, 9], [7, 7]])
@@ -830,14 +831,14 @@ class LayerMeanRendererTests(unittest.TestCase):
                 expected_headers = renderer.CASE_PARAMETERS_HEADERS if with_legacy_rate else renderer.CASE_PARAMETERS_HEADERS[:-1]
                 expected_rows = [[first['name'], '8', '7', '5.2'], [second['name'], '8', '9', '6.4']]
                 if with_legacy_rate:
-                    expected_rows[0].append('60%')
+                    expected_rows[0].append('60%；平均草稿接受比例；历史SAL=1+S×r')
                     expected_rows[1].append('未声明')
                 headers, rows, _ = renderer._case_parameter_table(report)
                 self.assertEqual(headers, expected_headers)
                 self.assertEqual(rows, expected_rows)
                 first_line = 'BS=8；草稿S=7；Neff=5.2（含bonus）'
                 if with_legacy_rate:
-                    first_line += '；声明的平均草稿接受比例=60%（配置假设，非实测）'
+                    first_line += '；声明的平均草稿接受比例=60%（配置假设，非实测；历史SAL=1+S×r）'
                 second_line = 'BS=8；草稿S=9；Neff=6.4（含bonus）'
                 out, (book, _) = self.build(report)
                 self.assertEqual(tuple(book), renderer.SHEETS)
