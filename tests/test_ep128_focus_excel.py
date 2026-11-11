@@ -108,9 +108,9 @@ class FocusExcelTests(unittest.TestCase):
             lines = [root for root in roots if root.find(".//c:lineChart", CHART_NS) is not None
                      and "两项U逐轮耗时变化" in "".join(root.itertext())]
             self.assertEqual(len(lines), 1)
-            anchor, reference = line_positions[name]
-            first_data_row = int(re.search(r"!\$[A-Z]+\$(\d+):", reference).group(1))
-            self.assertLess(anchor[2], first_data_row - 1)  # Entire chart precedes even the table header.
+            _, reference = line_positions[name]
+            self.assertTrue(reference.startswith("'源采样基线'!"))
+            self.assertNotIn("保留序号", cells.values())
             series = lines[0].findall(".//c:lineChart/c:ser", CHART_NS)
             for index, base in enumerate((1., 4.)):
                 categories = [point.findtext("c:v", namespaces=CHART_NS) for point in
@@ -121,7 +121,8 @@ class FocusExcelTests(unittest.TestCase):
                 self.assertEqual(values, [factor * base * value for value in (.5, 1., 1.5)])
             bars = [root for root in roots if "互斥细项均值" in "".join(root.itertext())]
             self.assertEqual(len(bars), 2)
-        self.assertEqual(page.count("两项U重点诊断 · 固定rank逐轮变化与函数入口对照"), 2)
+        focus_headings = re.findall(r"<h4\b[^>]*>([^<]*)</h4>", page)
+        self.assertEqual(focus_headings.count("两项U重点诊断 · 固定rank逐轮变化与函数入口对照"), 2)
         self.assertIn("SYNTHETIC_FULL_NATIVE_NAME_", page)
         self.assertIn("SYNTHETIC_NATIVE_WHOLE_CALL_ONLY", page)
         self.assertIn("原HC轮次ID（等距；非ProfilerStep）", page)
@@ -146,7 +147,7 @@ class FocusExcelTests(unittest.TestCase):
         self.assertIsNone(data["step_rows"][1][2])
         self.assertEqual(data["step_rows"][1][1], "hc-13")
         self.assertIn("原因：SYNTHETIC_MISSING_UNIQUE_PARENT", data["step_rows"][1][-1])
-        self.assertIn("原因：SYNTHETIC_MISSING_UNIQUE_PARENT", "\n".join(map(str, book["方法1估算"][1].values())))
+        self.assertIn("原因：SYNTHETIC_MISSING_UNIQUE_PARENT", "\n".join(map(str, book["源采样基线"][1].values())))
         self.assertIn("原因：SYNTHETIC_MISSING_UNIQUE_PARENT", page)
         self.assertFalse(data["stages"][0]["closed"])
         self.assertIn("缺少或未识别结果时断线", page)

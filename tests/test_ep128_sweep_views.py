@@ -148,14 +148,16 @@ class SweepViewTests(unittest.TestCase):
         return [{int(point.get("idx")): float(point.findtext("c:v", namespaces=NS))
                  for point in item.findall("c:val/c:numRef/c:numCache/c:pt", NS)} for item in series]
 
-    def trend(self, charts, prefix, axis):
+    def trend(self, charts, prefix, axis, identity=None):
         selected = [chart for chart in charts if self.title(chart).removeprefix("源采样基线 · ").startswith(prefix)
-                    and "随" + axis + "变化" in self.title(chart)]
+                    and "随" + axis + "变化" in self.title(chart)
+                    and (identity is None or renderer._layer_mean_name({"id": identity}) in self.title(chart))]
         self.assertEqual(len(selected), 1, [self.title(chart) for chart in charts])
         return selected[0]
 
-    def proxy_trend(self, charts, axis):
-        selected = [chart for chart in charts if "ITL代理" in self.title(chart) and "随" + axis + "变化" in self.title(chart)]
+    def proxy_trend(self, charts, axis, identity=None):
+        selected = [chart for chart in charts if "ITL代理" in self.title(chart) and "随" + axis + "变化" in self.title(chart)
+                    and (identity is None or renderer._layer_mean_name({"id": identity}) in self.title(chart))]
         self.assertEqual(len(selected), 1, [self.title(chart) for chart in charts])
         return selected[0]
 
@@ -166,30 +168,18 @@ class SweepViewTests(unittest.TestCase):
                 title = self.title(chart)
                 if "随" + axis + "变化" not in title:
                     continue
-                token = ("单卡吞吐" if "单卡吞吐" in title else "TPOT" if "TPOT" in title
-                         else "ITL代理" if "ITL代理" in title else "整轮五项耗时构成")
-                def matches(svg):
-                    heading = svg.findtext("title") or ""
-                    if token not in heading or "随" + axis + "变化" not in heading:
-                        return False
-                    if sheet == "源采样基线":
-                        return heading.startswith("源采样基线 · ")
-                    if heading.startswith("源采样基线 · "):
-                        return False
-                    if sheet in ("方法1估算", "方法2估算"):
-                        identity = "method1" if sheet == "方法1估算" else "method2"
-                        return renderer._layer_mean_name({"id": identity}) in heading
-                    return token != "整轮五项耗时构成"
-                found = [svg for svg in svgs if matches(svg)]
-                self.assertEqual(len(found), 1, title)
-                points = []
-                for circle in found[0].findall("circle"):
-                    match = re.search(r"；" + axis + r"=(\d+)；([-+\d.eE]+) ", circle.findtext("title") or "")
-                    self.assertIsNotNone(match)
-                    points.append((int(match[1]), float(match[2])))
                 expected = [(categories[index], value) for values in self.line_values(chart, book, categories)
                             for index, value in values.items()]
-                self.assertEqual(points, expected, title)
+                expected_title = " · ".join(title.split(" · ")[:2]) if sheet == "源采样基线" else title
+                found = [svg for svg in svgs if svg.findtext("title") == expected_title]
+                self.assertTrue(found, title)
+                for svg in found:
+                    points = []
+                    for circle in svg.findall("circle"):
+                        match = re.search(r"；" + axis + r"=(\d+)；([-+\d.eE]+) ", circle.findtext("title") or "")
+                        self.assertIsNotNone(match)
+                        points.append((int(match[1]), float(match[2])))
+                    self.assertEqual(points, expected, title)
 
     def test_s_group_uses_numeric_config_order_and_allows_neff_to_change(self):
         report = sweep_report()
@@ -225,13 +215,15 @@ class SweepViewTests(unittest.TestCase):
         out, book, charts = self.build(report)
         ordered = sorted(report["cases"], key=lambda case: case["config"]["draft_tokens"])
         categories = [3, 7, 9]
-        for prefix, field in (("单卡吞吐随S变化", "per_device_tokens_s"), ("TPOT随S变化", "tpot_ms")):
-            values = self.line_values(self.trend(charts["估算总览"], prefix, "S"), book, categories)
-            self.assertEqual(values, [{i: case["projection"]["layer_mean_methods"][number][field]
-                                      for i, case in enumerate(ordered)} for number in (0, 1)])
-        values = self.line_values(self.proxy_trend(charts["估算总览"], "S"), book, categories)
-        self.assertEqual(values, [{i: case["projection"]["layer_mean_methods"][number]["cycle_ms"]
-                                  for i, case in enumerate(ordered)} for number in (0, 1)])
+        for number in (0, 1):
+            identity = "method" + str(number + 1)
+            for prefix, field in (("单卡吞吐随S变化", "per_device_tokens_s"), ("TPOT随S变化", "tpot_ms")):
+                values = self.line_values(self.trend(charts["估算总览"], prefix, "S", identity), book, categories)
+                self.assertEqual(values, [{i: case["projection"]["layer_mean_methods"][number][field]
+                                          for i, case in enumerate(ordered)}])
+            values = self.line_values(self.proxy_trend(charts["估算总览"], "S", identity), book, categories)
+            self.assertEqual(values, [{i: case["projection"]["layer_mean_methods"][number]["cycle_ms"]
+                                      for i, case in enumerate(ordered)}])
         for number, name in enumerate(("方法1估算", "方法2估算")):
             chart = self.trend(charts[name], "整轮五项耗时构成随S变化", "S")
             actual = self.line_values(chart, book, categories)
@@ -261,9 +253,10 @@ class SweepViewTests(unittest.TestCase):
         for prefix, field in (("单卡吞吐随BS变化", "per_device_tokens_s"), ("TPOT随BS变化", "tpot_ms")):
             actual = self.line_values(self.trend(charts["源采样基线"], prefix, "BS"), book, categories)
             self.assertEqual(actual, [{i: source_expected(case)[field] for i, case in enumerate(ordered)}])
-            targets = self.line_values(self.trend(charts["估算总览"], prefix, "BS"), book, categories)
-            self.assertEqual(targets, [{i: case["projection"]["layer_mean_methods"][number][field]
-                                       for i, case in enumerate(ordered)} for number in (0, 1)])
+            for number in (0, 1):
+                targets = self.line_values(self.trend(charts["估算总览"], prefix, "BS", "method" + str(number + 1)), book, categories)
+                self.assertEqual(targets, [{i: case["projection"]["layer_mean_methods"][number][field]
+                                           for i, case in enumerate(ordered)}])
         proxy = self.line_values(self.proxy_trend(charts["源采样基线"], "BS"), book, categories)
         self.assertEqual(proxy, [{i: source_expected(case)["cycle_ms"] for i, case in enumerate(ordered)}])
         chart = self.trend(charts["源采样基线"], "整轮五项耗时构成随BS变化", "BS")
@@ -280,17 +273,18 @@ class SweepViewTests(unittest.TestCase):
                                                                 reasons=["SYNTHETIC_S7_MISSING"])
         out, book, charts = self.build(report)
         for prefix in ("单卡吞吐随S变化", "TPOT随S变化"):
-            values = self.line_values(self.trend(charts["估算总览"], prefix, "S"), book, [3, 7, 9])
-            self.assertEqual([sorted(item) for item in values], [[0, 1, 2], [0, 2]])
+            for identity, expected in (("method1", [0, 1, 2]), ("method2", [0, 2])):
+                values = self.line_values(self.trend(charts["估算总览"], prefix, "S", identity), book, [3, 7, 9])
+                self.assertEqual([sorted(item) for item in values], [expected])
         values = self.line_values(self.trend(charts["方法2估算"], "整轮五项耗时构成随S变化", "S"), book, [3, 7, 9])
         self.assertEqual([sorted(item) for item in values], [[0, 2]] * 5)
         source = self.line_values(self.trend(charts["源采样基线"], "整轮五项耗时构成随S变化", "S"), book, [3, 7, 9])
         self.assertEqual([sorted(item) for item in source], [[0, 1, 2]] * 5)
         svgs = [ET.fromstring(svg) for svg in re.findall(r"<svg\b.*?</svg>", out.with_suffix(".html").read_text(), re.DOTALL)]
         target = next(svg for svg in svgs if (svg.findtext("title") or "").startswith("单卡吞吐随S变化")
-                      and len(svg.findall("polyline")) == 3)
-        lengths = [len(line.get("points").split()) for line in target.findall("polyline")]
-        self.assertCountEqual(lengths, [3, 1, 1])
+                      and renderer._layer_mean_name({"id": "method2"}) in svg.findtext("title"))
+        self.assertEqual([len(line.get("points").split()) for line in target.findall("polyline")], [1, 1])
+        self.assertEqual(len(target.findall("circle")), 2)
         self.assert_html_points_match_excel(out.with_suffix(".html").read_text(encoding="utf-8"),
                                             charts, book, [3, 7, 9], "S")
 

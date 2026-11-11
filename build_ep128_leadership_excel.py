@@ -8,10 +8,13 @@ import argparse
 import collections
 import csv
 from datetime import datetime, timezone
+import hashlib
 import html
+from html.parser import HTMLParser
 import json
 import math
 from pathlib import Path
+import re
 import sys
 import traceback
 import unicodedata
@@ -19,7 +22,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261110.4.operator_bound_evidence"
+RENDERER_VERSION = "20261111.1.trends_navigation"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -231,6 +234,10 @@ def _note(sheet, row, text, warning=False, columns=12):
 
 
 def _table(sheet, row, headers, rows, *, record_rows=None, spans=None, blank_columns=()):
+    if getattr(sheet, 'navigation_enabled', False):
+        sheet.navigation_entries.append(dict(row=row, kind='表', context=sheet.navigation_context,
+            case_index=sheet.navigation_case_index,
+            label=' / '.join(_text(value).replace('\n', ' ') for value in headers[:3])))
     def put(current, col, value, style):
         first, last = spans[col - 1] if spans else (col, col)
         if first == last:
@@ -267,6 +274,100 @@ def _table(sheet, row, headers, rows, *, record_rows=None, spans=None, blank_col
     if continued:
         current = _note(sheet, current, "长文本已按Excel单元格长度限制分成续行；原始记录顺序和数值保留，续行不是新增统计记录。")
     return current + 1
+
+
+def _navigation_link(sheet, row, first, last, label, target_sheet, target_cell):
+    """Preserve long labels with actual internal hyperlinks on every continuation."""
+    for part in _text_parts(label):
+        sheet.merge(row, first, row, last, part, 'link').row_height(row, 30)
+        sheet.add_internal_link(row, first, part, target_sheet, target_cell)
+        row += 1
+    return row
+
+
+def _navigation_start(sheet, report):
+    sheet.navigation_enabled = False
+    sheet.navigation_entries, sheet.navigation_cases = [], []
+    sheet.navigation_context = '跨case汇总与趋势'
+    sheet.navigation_case_index = None
+    sheet.navigation_case_links = []
+    row = _note(sheet, 5, '本页目录 · 点击case查看结果，或进入该case的完整图表目录')
+    row = _navigation_link(sheet, row, 1, 12, '跨case趋势与汇总 · 点击进入', sheet.name, 'A1')
+    sheet.navigation_trend_link = row - 1
+    for index, case in enumerate(report['cases']):
+        first = row
+        label = str(index + 1) + '. ' + case['name'] + ' · BS=' + _text((case.get('config') or {}).get('bs')) + ' · S=' + _text(_s_value(case))
+        row = _navigation_link(sheet, row, 1, 8, label, sheet.name, 'A1')
+        _navigation_link(sheet, first, 9, 12, '该case图表目录', sheet.name, 'A1')
+        sheet.navigation_case_links.append((first, row, index, case['name']))
+    sheet.navigation_content_start = row + 1
+    sheet.add_internal_link(sheet.navigation_trend_link, 1, '跨case趋势与汇总 · 点击进入',
+                            sheet.name, cell_reference(row + 1, 1))
+    sheet.navigation_enabled = True
+    return row + 1
+
+
+def _navigation_case(sheet, row, case):
+    case_index = len(sheet.navigation_cases)
+    sheet.navigation_context = case['name']
+    sheet.navigation_case_index = case_index
+    sheet.navigation_cases.append((row, case['name']))
+    for first, last, index, name in sheet.navigation_case_links:
+        if index == case_index:
+            for current in range(first, last):
+                label = sheet.cells[current, 1][1]
+                sheet.add_internal_link(current, 1, label, sheet.name, cell_reference(row, 1))
+            break
+
+
+def _navigation_finish(sheet):
+    """Collect real chart anchors after layout; do not move cells or rewrite data refs."""
+    sheet.navigation_enabled = False
+    entries = list(sheet.navigation_entries)
+    for chart in sheet.charts:
+        row, col = chart['anchor'][:2]
+        context, case_index = '跨case汇总与趋势', None
+        for index, (start, name) in enumerate(sheet.navigation_cases):
+            if start > row:
+                break
+            context, case_index = name, index
+        if (row, col) not in sheet.cells:
+            sheet.write(row, col, '', 'body')
+        entries.append(dict(row=row, col=col, context=context, case_index=case_index, kind='图', label=chart['title']))
+    entries.sort(key=lambda item: (item['row'], item.get('col', 1), item['kind']))
+    row = sheet._extent()[0] + 2
+    directory = row
+    row = _note(sheet, row, '完整图表目录 · 所有条目均可点击，图表与数据保持原值')
+    sheet.merge(4, 1, 4, 4, '本页完整图表目录', 'link').row_height(4, 30)
+    sheet.add_internal_link(4, 1, '本页完整图表目录', sheet.name, cell_reference(directory, 1))
+    sheet.merge(4, 5, 4, 8, '源数据：源采样基线', 'link')
+    sheet.add_internal_link(4, 5, '源数据：源采样基线', SHEETS[1], 'A1')
+    sheet.merge(4, 9, 4, 12, '返回估算总览', 'link')
+    sheet.add_internal_link(4, 9, '返回估算总览', SHEETS[0], 'A1')
+    previous, group_rows = None, {}
+    for item in entries:
+        group = (item.get('case_index'), item['context'])
+        if group != previous:
+            previous = group
+            group_rows[item.get('case_index')] = row
+            first_group_row = row
+            for part in _text_parts(item['context']):
+                sheet.merge(row, 1, row, 9, part, 'header').row_height(row, 34)
+                row += 1
+            _navigation_link(sheet, first_group_row, 10, 12, '返回页首目录', sheet.name, 'A5')
+        label = item['kind'] + ' · ' + item['label']
+        row = _navigation_link(sheet, row, 1, 12, label, sheet.name,
+                               cell_reference(item['row'], item.get('col', 1)))
+    if not entries:
+        row = _note(sheet, row, '本页没有可用图表；原状态和缺失原因见正文。')
+    for first, _, index, name in sheet.navigation_case_links:
+        target = group_rows.get(index)
+        if target is not None:
+            sheet.add_internal_link(first, 9, '该case图表目录', sheet.name, cell_reference(target, 1))
+        else:
+            sheet.add_internal_link(first, 9, '该case原始状态', sheet.name,
+                cell_reference(sheet.navigation_cases[index][0], 1))
+    return row
 
 
 def _flatten(value, prefix=""):
@@ -620,66 +721,243 @@ def _bs_table(sheet, row, headers, rows, spans, blank_columns):
     return row, written if contiguous else None
 
 
+TREND_COLORS = ("168B8D", "D4793A", "3975B8", "9371B5", "D2675B", "54853B",
+                "AF5386", "65739B", "AB8A32", "388773", "855B42", "527EAA",
+                "B34E4E", "7B7347", "7263A4")
+TREND_SCOPE = ("同一方法、同一指标的可比采样组合并；图例区分固定S或固定BS。"
+    "横轴为声明数值的升序等距档位，各曲线缺少该档位时留空并断线，不补0或插值。"
+    "模型、硬件/拓扑、观测rank覆盖及接受率策略不同的组分别作图；每点沿用核心原选rank。")
+
+
+def _trend_annotation(value, config):
+    """Normalize only explicit axis/Neff annotations matching this case's values.
+
+    Arbitrary provenance numbers (capture window, revision, warmup, etc.) remain
+    comparison conditions; replacing every number would merge unrelated runs.
+    """
+    if not isinstance(value, str):
+        return value
+    value = " ".join(value.casefold().split())
+    expected = {"bs": config.get("bs"), "s": _s_value({"config": config}),
+                "neff": config.get("effective_tokens_per_round")}
+    aliases = {"synthetic_acceptance_length": "neff", "synthetic_acception_length": "neff",
+               "effective_tokens_per_round": "neff", "sal": "neff"}
+    pattern = (r"(?<![\w])(?P<key>synthetic_acceptance_length|synthetic_acception_length|"
+               r"effective_tokens_per_round|neff|sal|bs|s)\s*[=:]\s*"
+               r"(?P<number>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(?![\w.])")
+    def replace(match):
+        key = aliases.get(match["key"], match["key"])
+        reference = expected[key]
+        if _number(reference) and math.isclose(float(match["number"]), reference, rel_tol=1e-12, abs_tol=1e-12):
+            return key + "=#"
+        return match[0]
+    return re.sub(pattern, replace, value)
+
+
+def _trend_conditions(case, identity):
+    """Hold non-experiment conditions fixed; BS/S and derived Neff are axes/series."""
+    config = case.get("config") or {}
+    excluded = {"bs", "draft_tokens", "num_speculative_tokens", "name", "path", "paths", "inputs",
+                "target_model", "sample_model", "source_model"}
+    conditions = {}
+    for key, value in config.items():
+        if (key in excluded or key.startswith("_") or key in ("effective_tokens_per_round",
+                "synthetic_acceptance_length", "synthetic_acception_length")):
+            continue
+        is_annotation = key == "token_basis" or "provenance" in key or key in ("sal_source",)
+        conditions[key] = _trend_annotation(value, config) if is_annotation else value
+    coverage = _method(case, identity).get("coverage") or {}
+    observed = sorted({str(item["rank"]) for item in case.get("captures") or case.get("measurements") or []
+                       if item.get("rank") is not None})
+    declared_coverage = {key: coverage[key] for key in
+        ("captured_ranks", "expected_ranks", "source_logical_devices", "complete") if key in coverage}
+    if "captured_rank_names" in coverage:
+        declared_coverage["captured_rank_names"] = sorted(coverage["captured_rank_names"])
+    rate = config.get("acceptance")
+    policy = ("fixed_acceptance_fraction" if config.get("acceptance_semantics") == "mean_accepted_draft_fraction"
+              and _number(rate) and 0 <= rate <= 1 else "per_case_configured_neff")
+    return {"source_model": case.get("source_model"), "target_model": case.get("target_model"),
+            "conditions": conditions, "observed_ranks": observed, "coverage": declared_coverage,
+            "output_policy": policy}
+
+
+def _trend_families(report, axis, identity):
+    """Pure, deterministic families with fixed-parameter series and original cases."""
+    if axis not in ("BS", "S"):
+        raise ValueError("Unknown trend axis: " + str(axis))
+    families = {}
+    for case in report["cases"]:
+        scope = _trend_conditions(case, identity)
+        signature = json.dumps(scope, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        family = families.setdefault(signature, {"axis": axis, "identity": identity, "scope": scope,
+            "cases": [], "series": [], "excluded_groups": [], "_groups": {}})
+        family["cases"].append(case)
+        config, draft = case.get("config") or {}, _s_value(case)
+        bs = config.get("bs")
+        valid_bs = type(bs) is int and bs > 0
+        if axis == "BS":
+            fixed = (draft, config.get("effective_tokens_per_round"))
+            fixed_valid = draft is not None
+            label = "S=" + _parameter_text(draft) + "；Neff=" + _parameter_text(fixed[1])
+            coordinate, valid_x = bs, valid_bs
+        else:
+            fixed, fixed_valid = (bs,), valid_bs
+            label = "固定BS=" + (_parameter_text(bs) if valid_bs else "未声明")
+            coordinate, valid_x = draft, draft is not None
+        if not fixed_valid:
+            family["excluded_groups"].append({"label": case["name"],
+                "reason": "固定S缺失、无效或别名冲突" if axis == "BS" else "固定BS缺失或无效"})
+            continue
+        key = json.dumps(fixed, ensure_ascii=False, allow_nan=False)
+        group = family["_groups"].setdefault(key, {"label": label, "fixed": fixed, "cases": [], "invalid": []})
+        group["cases"].append(case)
+        if not valid_x:
+            group["invalid"].append(case["name"])
+    result = []
+    for number, family in enumerate(families.values(), 1):
+        groups = sorted(family.pop("_groups").values(), key=lambda item:
+            tuple(value if _number(value) else math.inf for value in item["fixed"]))
+        label_counts = collections.Counter(group["label"] for group in groups)
+        for group in groups:
+            if label_counts[group["label"]] > 1:
+                # Compact formatting can round nearby Neff values to the same
+                # legend; retain a distinct label for every exact series key.
+                group["label"] += "；固定参数原值=" + _text(group["fixed"])
+            coordinates = [((case.get("config") or {}).get("bs") if axis == "BS" else _s_value(case))
+                           for case in group["cases"]]
+            counts = collections.Counter(value for value in coordinates
+                if type(value) is int and value >= (1 if axis == "BS" else 0))
+            duplicate = sorted(value for value, count in counts.items() if value is not None and count > 1)
+            reason = ("存在缺失或无效的配置" + axis + "，保留原表，不绘制该曲线" if group["invalid"] else
+                      "相同" + axis + "存在多条采样组合，未合并趋势；重复坐标=" + _text(duplicate) if duplicate else None)
+            if reason:
+                family["excluded_groups"].append({"label": group["label"], "reason": reason})
+                continue
+            group["case_by_x"] = {((case.get("config") or {}).get("bs") if axis == "BS" else _s_value(case)): case
+                                  for case in group["cases"]}
+            group["cases"] = [group["case_by_x"][value] for value in sorted(group["case_by_x"])]
+            family["series"].append(group)
+        family["categories"] = sorted({value for group in family["series"] for value in group["case_by_x"]})
+        config = family["cases"][0].get("config") or {}
+        family["label"] = ("条件组" + str(number) + " · " + _case_scope(family["cases"][0])
+            + "；源DP=" + _text(config.get("source_dp")) + "，目标DP=" + _text(config.get("target_dp"))
+            + "，源/目标物理卡=" + _text(config.get("source_devices")) + "/" + _text(config.get("target_devices")))
+        if family["scope"]["output_policy"] == "fixed_acceptance_fraction":
+            family["note"] = ("声明的平均草稿接受比例r=" + _parameter_text(config.get("acceptance"))
+                + "（配置假设，非实测）；各点Neff含bonus并沿用各case原值。")
+        else:
+            family["note"] = ("各点沿用case配置Neff（含bonus）；非固定接受率的单变量对照，不能将变化仅归因于"
+                + axis + "；不从长度反推实测接受率。")
+        result.append(family)
+    return result
+
+
+def _trend_matrix(family, field):
+    """One chart's numeric matrix; missing coordinates never join across gaps."""
+    categories, series = family["categories"], []
+    for group_index, group in enumerate(family["series"]):
+        if field == "parts":
+            values = {value: _bs_breakdown_values(_method(case, family["identity"]))
+                      for value, case in group["case_by_x"].items()}
+            for part_index, (_, label, _) in enumerate(BS_PARTS):
+                series.append({"name": group["label"] + " · " + label,
+                    "values": [values.get(value)[part_index] if values.get(value) is not None else None for value in categories],
+                    "color": TREND_COLORS[(group_index * len(BS_PARTS) + part_index) % len(TREND_COLORS)]})
+        else:
+            series.append({"name": group["label"],
+                "values": [_bs_value(_method(group["case_by_x"][value], family["identity"]), field)
+                           if value in group["case_by_x"] else None for value in categories],
+                "color": TREND_COLORS[group_index % len(TREND_COLORS)]})
+    return {"categories": categories, "series": series,
+        "headers": [family["axis"], *[item["name"] for item in series]],
+        "rows": [[value, *[item["values"][index] for item in series]] for index, value in enumerate(categories)]}
+
+
+def _trend_title(family, label):
+    return (label + "随" + family["axis"] + "变化 · " + _layer_mean_name({"id": family["identity"]})
+            + " · " + family["label"])
+
+
+def _trend_excel_chart(sheet, row, title, family, matrix, unit):
+    """Visible bounded-width data blocks feed editable series via exact references."""
+    if len(matrix["categories"]) < 2:
+        return _note(sheet, row, "本条件仅有一个" + family["axis"] + "，保留原值表；不能说明变化趋势。")
+    if not any(_number(value) for item in matrix["series"] for value in item["values"]):
+        return _note(sheet, row, title + "：本项没有可用数值，保留原值表，不绘制趋势。")
+    row = _note(sheet, row, "趋势图数据 · " + title)
+    reference = "'" + sheet.name.replace("'", "''") + "'!"
+    series, categories_ref = [], None
+    # Keep all visible table blocks within the existing 12-column page.
+    for first in range(0, len(matrix["series"]), 10):
+        selected = matrix["series"][first:first + 10]
+        headers = [family["axis"], *[item["name"] for item in selected]]
+        records = [[value, *[item["values"][index] for item in selected]]
+                   for index, value in enumerate(matrix["categories"])]
+        written = []
+        header = row
+        row = _table(sheet, row, headers, records, record_rows=written,
+                     blank_columns=tuple(range(1, len(headers) + 1)))
+        sheet.row_height(header, 72)
+        if categories_ref is None:
+            categories_ref = reference + "$A$" + str(written[0]) + ":$A$" + str(written[-1])
+        for index, item in enumerate(selected, 2):
+            letter = cell_reference(1, index)[:-1]
+            series.append({**item, "values_ref": reference + "$" + letter + "$" + str(written[0])
+                           + ":$" + letter + "$" + str(written[-1])})
+    height = 20 + max(0, math.ceil(len(series) / 3) - 1) * 2
+    sheet.add_line_chart(title, categories=[str(value) for value in matrix["categories"]], series=series,
+        anchor=(row, 1, row + height, 12), categories_ref=categories_ref,
+        x_axis_title=_sweep_axis(family["axis"]), y_axis_title=unit)
+    return row + height + 2
+
+
+def _trend_excel_section(sheet, row, report, axis, identities, *, parts=False):
+    row = _note(sheet, row, "合并趋势：固定S看BS" if axis == "BS" else "合并趋势：固定BS看S")
+    row = _note(sheet, row, TREND_SCOPE + ITL_PROXY_SCOPE)
+    for identity in identities:
+        for family in _trend_families(report, axis, identity):
+            row = _note(sheet, row, family["label"] + "。" + family["note"])
+            for item in family["excluded_groups"]:
+                row = _note(sheet, row, item["label"] + "：" + item["reason"], warning=True)
+            fields = list(SWEEP_METRICS)
+            if parts:
+                fields.append(("parts", "整轮五项耗时构成", "ms/完整周期"))
+            for field, label, unit in fields:
+                row = _trend_excel_chart(sheet, row, _trend_title(family, label), family, _trend_matrix(family, field), unit)
+    return row + 1
+
+
 def _bs_overview_section(sheet, row, report):
     groups = _bs_comparison_groups(report)
     row = _note(sheet, row, BS_INDEX_TITLE)
     row = _note(sheet, row, "本次报告来源：" + str(Path(sheet.report_origin).resolve())
         + "；报告生成时间：" + _text(report.get("generated_at"))
-        + "。以下列出报告内全部组合；对比组不同的BS仍保留原值，分组表和图在索引下方。")
+        + "。全部采样原值保留；趋势图按方法分别合并可比曲线。")
     row = _table(sheet, row, BS_INDEX_HEADERS, _bs_index_rows(groups), spans=BS_INDEX_SPANS, blank_columns=(1,))
     if report.get("failures"):
         row = _table(sheet, row, ["统计失败、未纳入BS对比的采样组合", "失败原因"],
             [[item.get("case"), item.get("error")] for item in report["failures"]], spans=((1, 4), (5, 12)))
-    row = _note(sheet, row, "不同BS的单卡吞吐、完整周期与TPOT变化")
-    row = _note(sheet, row, BS_COMPARISON_SCOPE + ITL_PROXY_SCOPE)
     for group in groups:
-        row = _note(sheet, row, group["label"])
-        records = _bs_overview_rows(group)
-        row, written = _bs_table(sheet, row, BS_OVERVIEW_HEADERS, records, BS_OVERVIEW_SPANS,
-                                 (1, 4, 5, 6, 8, 9, 10))
+        row = _note(sheet, row, group["label"] + " · 原始分组表")
+        row, _ = _bs_table(sheet, row, BS_OVERVIEW_HEADERS, _bs_overview_rows(group), BS_OVERVIEW_SPANS,
+                           (1, 4, 5, 6, 8, 9, 10))
         reason = _bs_chart_reason(group)
-        if reason or written is None:
-            row = _note(sheet, row, reason or "表格含长文本续行，保留原表，不绘制本组趋势。", warning=bool(reason and len(group["cases"]) > 1))
-            continue
-        reference = "'" + sheet.name.replace("'", "''") + "'!"
-        for metric_index, (field, label, unit) in enumerate(BS_METRICS):
-            series = []
-            for identity, color, column in (("method1", "168B8D", 5 + metric_index), ("method2", "D4793A", 9 + metric_index)):
-                series.append(dict(name=_layer_mean_name({"id": identity}), color=color,
-                    values=[_bs_value(_method(case, identity), field) for case in group["cases"]],
-                    values_ref=reference + "$" + cell_reference(1, column)[:-1] + "$" + str(written[0])
-                        + ":$" + cell_reference(1, column)[:-1] + "$" + str(written[-1])))
-            sheet.add_line_chart(label + "随BS变化 · " + group["label"].split(" · ")[0],
-                categories=[str(record[0]) for record in records], series=series, anchor=(row, 1, row + 17, 12),
-                categories_ref=reference + "$A$" + str(written[0]) + ":$A$" + str(written[-1]),
-                x_axis_title="BS（每DP请求数）", y_axis_title=unit)
-            row += 19
-    return row + 1
+        if reason and (group["duplicate_bs"] or group["invalid_bs"]):
+            row = _note(sheet, row, reason, warning=True)
+    return _trend_excel_section(sheet, row, report, "BS", ("method1", "method2"))
 
 
 def _bs_method_section(sheet, row, report, identity):
-    row = _note(sheet, row, "不同BS的整轮五项耗时构成变化 · " + _layer_mean_name({"id": identity}))
-    row = _note(sheet, row, BS_COMPARISON_SCOPE + "五项之和须闭合完整周期；D/C和路由计算变化已计入层区间，U保留一次。")
+    row = _note(sheet, row, "不同BS的整轮五项原始数据 · " + _layer_mean_name({"id": identity}))
+    row = _note(sheet, row, "五项之和须闭合完整周期；D/C和路由计算变化已计入层区间，U保留一次。")
     for group in _bs_comparison_groups(report):
-        row = _note(sheet, row, group["label"])
-        records = _bs_method_rows(group, identity)
-        row, written = _bs_table(sheet, row, BS_METHOD_HEADERS, records, BS_METHOD_SPANS, (1, 4, 5, 6, 7, 8, 9))
+        row = _note(sheet, row, group["label"] + " · 原始分组表")
+        row, _ = _bs_table(sheet, row, BS_METHOD_HEADERS, _bs_method_rows(group, identity), BS_METHOD_SPANS,
+                           (1, 4, 5, 6, 7, 8, 9))
         reason = _bs_chart_reason(group)
-        if reason or written is None:
-            row = _note(sheet, row, reason or "表格含长文本续行，保留原表，不绘制本组趋势。", warning=bool(reason and len(group["cases"]) > 1))
-            continue
-        reference = "'" + sheet.name.replace("'", "''") + "'!"
-        series = []
-        for index, (_, label, color) in enumerate(BS_PARTS):
-            column = cell_reference(1, 5 + index)[:-1]
-            series.append(dict(name=label, color=color, values=[record[3 + index] for record in records],
-                values_ref=reference + "$" + column + "$" + str(written[0]) + ":$" + column + "$" + str(written[-1])))
-        sheet.add_line_chart("整轮五项耗时构成随BS变化 · " + group["label"].split(" · ")[0],
-            categories=[str(record[0]) for record in records], series=series, anchor=(row, 1, row + 21, 12),
-            categories_ref=reference + "$A$" + str(written[0]) + ":$A$" + str(written[-1]),
-            x_axis_title="BS（每DP请求数）", y_axis_title="ms/完整周期")
-        row += 23
-    return row + 1
+        if reason and (group["duplicate_bs"] or group["invalid_bs"]):
+            row = _note(sheet, row, reason, warning=True)
+    return _trend_excel_section(sheet, row, report, "BS", (identity,), parts=True)
 
 
 def _s_groups(report):
@@ -807,44 +1085,29 @@ def _sweep_excel_chart(sheet, row, title, records, written, specs, unit, axis):
 
 
 def _s_overview_section(sheet, row, report):
-    row = _note(sheet, row, "固定BS，不同投机步长S的单卡吞吐、TPOT与ITL代理变化")
+    row = _note(sheet, row, "固定BS，不同投机步长S的原始数据及合并趋势")
     row = _note(sheet, row, S_COMPARISON_SCOPE + ITL_PROXY_SCOPE)
-    groups = _s_groups(report)
-    if not groups:
-        return _note(sheet, row, "当前报告没有同一固定BS下的多条S采样；不生成跨条件曲线。")
-    for group in groups:
-        row = _note(sheet, row, group["label"])
-        row = _note(sheet, row, group["note"])
-        records = _s_overview_rows(group)
-        row, written = _bs_table(sheet, row, S_OVERVIEW_HEADERS, records, S_OVERVIEW_SPANS, (1, 3, 5, 6, 7, 9, 10, 11))
+    for group in _s_groups(report):
+        row = _note(sheet, row, group["label"] + " · 原始分组表。" + group["note"])
+        row, _ = _bs_table(sheet, row, S_OVERVIEW_HEADERS, _s_overview_rows(group), S_OVERVIEW_SPANS,
+                           (1, 3, 5, 6, 7, 9, 10, 11))
         reason = _s_chart_reason(group)
-        if reason:
+        if reason and (group["duplicate_s"] or group["invalid_s"] or group["invalid_bs"]):
             row = _note(sheet, row, reason, warning=True)
-            continue
-        for index, (_, label, unit) in enumerate(SWEEP_METRICS):
-            specs = [(_layer_mean_name({"id": identity}), [record[4 + index + shift] for record in records], color, 6 + index + shift)
-                for identity, shift, color in (("method1", 0, "168B8D"), ("method2", 4, "D4793A"))]
-            row = _sweep_excel_chart(sheet, row, label + "随S变化 · " + group["label"].split(" · ")[0],
-                                     records, written, specs, unit, "S")
-    return row + 1
+    return _trend_excel_section(sheet, row, report, "S", ("method1", "method2"))
 
 
 def _s_method_section(sheet, row, report, identity):
-    row = _note(sheet, row, "固定BS，不同投机步长S的整轮五项耗时构成 · " + _layer_mean_name({"id": identity}))
+    row = _note(sheet, row, "固定BS，不同投机步长S的整轮五项原始数据 · " + _layer_mean_name({"id": identity}))
     row = _note(sheet, row, S_COMPARISON_SCOPE + "五项之和须闭合完整周期；不再次追加通信或路由计算。")
     for group in _s_groups(report):
-        row = _note(sheet, row, group["label"] + "。" + group["note"])
-        records = _s_method_rows(group, identity)
-        row, written = _bs_table(sheet, row, _sweep_part_headers("S"), records, SWEEP_PART_SPANS, (1, 3, 5, 6, 7, 8, 9, 10))
+        row = _note(sheet, row, group["label"] + " · 原始分组表。" + group["note"])
+        row, _ = _bs_table(sheet, row, _sweep_part_headers("S"), _s_method_rows(group, identity), SWEEP_PART_SPANS,
+                           (1, 3, 5, 6, 7, 8, 9, 10))
         reason = _s_chart_reason(group)
-        if reason:
+        if reason and (group["duplicate_s"] or group["invalid_s"] or group["invalid_bs"]):
             row = _note(sheet, row, reason, warning=True)
-            continue
-        specs = [(label, [record[4 + index] for record in records], color, 6 + index)
-                 for index, (_, label, color) in enumerate(BS_PARTS)]
-        row = _sweep_excel_chart(sheet, row, "整轮五项耗时构成随S变化 · " + group["label"].split(" · ")[0],
-                                 records, written, specs, "ms/完整周期", "S")
-    return row + 1
+    return _trend_excel_section(sheet, row, report, "S", (identity,), parts=True)
 
 
 def _source_sweeps_section(sheet, row, report):
@@ -1045,13 +1308,15 @@ def _overview(book, report):
         scope = PREVIEW + "：只读取配置，所有性能数值待估算。" + scope
     sheet = _sheet(book, SHEETS[0], "10T模型推理估算", scope)
     sheet.result_rows, sheet.result_cells = {}, {}
-    row = _note(sheet, 5, CASE_PARAMETERS_TITLE)
+    row = _navigation_start(sheet, report)
+    row = _note(sheet, row, CASE_PARAMETERS_TITLE)
     row = _note(sheet, row, CASE_PARAMETERS_SCOPE)
     headers, records, spans = _case_parameter_table(report)
     row = _table(sheet, row, headers, records, spans=spans)
     row = _bs_overview_section(sheet, row, report)
     row = _s_overview_section(sheet, row, report)
     for case_index, case in enumerate(report["cases"]):
+        _navigation_case(sheet, row, case)
         row = _note(sheet, row, case["name"] + " · " + _case_scope(case), columns=12)
         row = _note(sheet, row, _case_parameters(case), columns=12)
         for identity in ("method1", "method2"):
@@ -1062,6 +1327,7 @@ def _overview(book, report):
             row = _layer_mean_cards(sheet, row, method, case_index, identity)
             row = _table(sheet, row, ["整轮组成/指标", "核心原值", "说明"], _layer_mean_closure_rows(method))
             row = _note(sheet, row, _explanation(method), warning=True, columns=12)
+    _navigation_finish(sheet)
     return sheet
 
 
@@ -1096,8 +1362,10 @@ def _layer_mean_method_section(sheet, row, case, case_index, identity, method):
 def _source_sheet(book, report):
     sheet = _sheet(book, SHEETS[1], "源采样基线 · 外推输入与核对",
                    "源采样逐rank诊断；配置BS/Neff换算不等于实测有效吞吐。")
-    row = _source_sweeps_section(sheet, 5, report)
+    book.focus_source_tables = {}
+    row = _source_sweeps_section(sheet, _navigation_start(sheet, report), report)
     for case in report["cases"]:
+        _navigation_case(sheet, row, case)
         row = _note(sheet, row, case["name"] + " / " + _text(_source(case).get("scope")))
         row = _table(sheet, row, ["rank", "保留轮次", "单卡均摊条件值(token/s/card)", "本DP请求组条件输出率(token/s)",
             "周期均值(ms)", "p50(ms)", "p95(ms)", "设备任务覆盖均值(ms)", "无任务记录均值(ms)", "token依据", "范围"],
@@ -1105,6 +1373,8 @@ def _source_sheet(book, report):
               "cycle_ms_mean", "cycle_ms_p50", "cycle_ms_p95", "recorded_busy_ms_mean", "no_recorded_ms_mean", "token_basis", "scope")]
              for item in (case.get("source") or {}).get("per_rank") or []])
         row = _table(sheet, row, ["配置/核心字段", "原值"], list(_flatten(case.get("config") or {})))
+        row = _source_focus_case_section(book, sheet, row, case)
+    _navigation_finish(sheet)
     return sheet
 
 
@@ -2070,6 +2340,57 @@ def _method_focus_data(case, method):
     return result
 
 
+def _focus_source_anchor(case, rank, case_index=None):
+    parts = [case.get("name"), rank]
+    if case_index is not None:
+        parts.append(case_index)
+    identity = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+    return "focus-source-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+
+def _focus_source_entries(case):
+    """One actual source table per selected rank, including legacy rank choices."""
+    entries = {}
+    for identity in ("method1", "method2"):
+        method = _method(case, identity)
+        data = _method_focus_data(case, method)
+        if data["rank"] not in entries:
+            entries[data["rank"]] = dict(data=data, methods=[])
+        entries[data["rank"]]["methods"].append(_layer_mean_name(method))
+    return list(entries.values())
+
+
+def _source_focus_case_section(book, sheet, row, case):
+    entries = _focus_source_entries(case)
+    row = _note(sheet, row, case["name"] + " · 选中rank不同轮次耗时源数据")
+    row = _note(sheet, row, FOCUS_SCOPE)
+    for entry in entries:
+        data = entry["data"]
+        row = _note(sheet, row, "rank=" + _text(data["rank"]) + "；引用：" + "、".join(entry["methods"]))
+        row = _note(sheet, row, data["note"], warning=not data["available"])
+        if not data["available"]:
+            continue
+        row, header, written = _operator_table(sheet, row, FOCUS_STEP_HEADERS, data["step_rows"], FOCUS_STEP_SPANS)
+        category_column, value_columns = 2, (4, 5)
+        if data["step_rows"] and not written:
+            # Long status/boundary descriptions have continuation rows. Keep
+            # those intact, then bind the charts to compact, contiguous copies
+            # on this source sheet, never to continuation rows or method pages.
+            row = _note(sheet, row, "折线引用数据（与上方同一组源值；长文本已保留，不新增统计记录）")
+            records = [[record[1], record[2], record[3]] for record in data["step_rows"]]
+            row, _, written = _operator_table(sheet, row,
+                ["原HC轮次ID", "KV与输入(ms)", "metadata(ms)"], records, ((1, 6), (7, 9), (10, 12)))
+            category_column, value_columns = 1, (7, 10)
+        book.focus_source_tables[(id(case), data["rank"])] = dict(
+            sheet_name=sheet.name, header_row=header, written_rows=written,
+            category_column=category_column, value_columns=value_columns,
+            categories=data["categories"], series=data["series"],
+            anchor=_focus_source_anchor(case, data["rank"]))
+        if data["step_rows"] and not written:
+            row = _note(sheet, row, "原HC轮次ID需要长文本续行，保留完整原值；不构造不精确的折线单元格引用。", warning=True)
+    return row + 1
+
+
 def _method_focus_section(sheet, row, case, method):
     data = _method_focus_data(case, method)
     row = _note(sheet, row, "两项U重点诊断 · 固定rank逐轮变化与函数入口对照")
@@ -2083,23 +2404,26 @@ def _method_focus_section(sheet, row, case, method):
             FOCUS_PARENT_HEADERS, data["parent_rows"], FOCUS_PARENT_SPANS, header, written, (1,),
             "源实测ms/HC轮次；已含于U，不额外相加")
     row = _note(sheet, row, "同一rank不同原HC轮次的阶段耗时；P50/P90/最大为核心原值，缺失轮次不画0")
-    # Reserve the overview before the potentially long per-round table. Range
-    # references are bound after the table has its final physical row numbers.
-    line_row = row
-    if data["step_rows"]:
-        row += 24
-    row, _, written = _operator_table(sheet, row, FOCUS_STEP_HEADERS, data["step_rows"], FOCUS_STEP_SPANS)
+    source = getattr(sheet, "focus_source_tables", {}).get((id(case), data["rank"])) or {}
+    written = source.get("written_rows") or []
     if written and len(written) == len(data["step_rows"]):
-        reference = "'" + sheet.name.replace("'", "''") + "'!"
+        reference = "'" + source["sheet_name"].replace("'", "''") + "'!"
+        link_row = row
+        label = "源数据：" + source["sheet_name"] + " · rank=" + _text(data["rank"]) + "（逐轮明细）"
+        row = _note(sheet, row, label)
+        sheet.add_internal_link(link_row, 1, label, source["sheet_name"], cell_reference(source["header_row"], 1))
         series = [dict(name=label, values=values, color=color,
-            values_ref=reference + cell_reference(written[0], 4 + index, True) + ":" + cell_reference(written[-1], 4 + index, True))
+            values_ref=reference + cell_reference(written[0], source["value_columns"][index], True) + ":"
+                + cell_reference(written[-1], source["value_columns"][index], True))
             for index, (label, values, color) in enumerate(data["series"])]
         sheet.add_line_chart("两项U逐轮耗时变化 · 固定rank=" + _text(data["rank"]),
-            categories=data["categories"], series=series, anchor=(line_row, 1, line_row + 22, 12),
-            categories_ref=reference + cell_reference(written[0], 2, True) + ":" + cell_reference(written[-1], 2, True),
+            categories=data["categories"], series=series, anchor=(row, 1, row + 22, 12),
+            categories_ref=reference + cell_reference(written[0], source["category_column"], True) + ":"
+                + cell_reference(written[-1], source["category_column"], True),
             x_axis_title="原HC轮次ID（等距；非ProfilerStep）", y_axis_title="源实测阶段跨度(ms)")
+        row += 24
     elif data["step_rows"]:
-        row = _note(sheet, row, "逐轮表出现长文本续行，保留完整明细，折线未绘制。", warning=True)
+        row = _note(sheet, row, "源采样基线中的逐轮表缺少精确图表引用，折线未绘制；不在方法页复制源明细。", warning=True)
     else:
         row = _note(sheet, row, "逐step未采集，请重新统计；均值细分不代替逐轮数据。", warning=True)
     for stage in data["stages"]:
@@ -2318,10 +2642,13 @@ def _method_sheet(book, report, identity, sheet_name):
     sheet = _sheet(book, sheet_name, _layer_mean_name({"id": identity}) + " · 采样均值与轮次估算",
                    "源实测与目标估算 · 主/草稿独立列；层内已有成本只追加增量。")
     sheet.result_rows, sheet.result_cells = {}, {}
-    row = _bs_method_section(sheet, 5, report, identity)
+    sheet.focus_source_tables = getattr(book, 'focus_source_tables', {})
+    row = _bs_method_section(sheet, _navigation_start(sheet, report), report, identity)
     row = _s_method_section(sheet, row, report, identity)
     for case_index, case in enumerate(report["cases"]):
+        _navigation_case(sheet, row, case)
         row = _layer_mean_method_section(sheet, row, case, case_index, identity, _method(case, identity))
+    _navigation_finish(sheet)
     return sheet
 
 
@@ -2438,7 +2765,27 @@ def _method_residual_html(case, method):
     return ''.join(parts)
 
 
-def _method_focus_html(case, method):
+def _focus_source_html(report):
+    esc = lambda value: html.escape(_text(value), quote=True)
+    parts = ['<section class="u-focus u-focus-source"><h2>选中rank不同轮次耗时源数据</h2><p>'
+             + esc(FOCUS_SCOPE) + '</p>']
+    cases = report.get("cases") or []
+    counts = collections.Counter(case["name"] for case in cases)
+    for index, case in enumerate(cases):
+        case_index = index if counts[case["name"]] > 1 else None
+        for entry in _focus_source_entries(case):
+            data = entry["data"]
+            parts.append('<section id="' + _focus_source_anchor(case, data["rank"], case_index) + '"><h3>'
+                + esc(case["name"] + ' · rank=' + _text(data["rank"])) + '</h3><p>'
+                + esc('引用：' + '、'.join(entry["methods"])) + '</p><p>' + esc(data["note"]) + '</p>')
+            if data["available"]:
+                parts.append(_html_table(FOCUS_STEP_HEADERS,
+                    [['' if value is None else value for value in row] for row in data["step_rows"]]))
+            parts.append('</section>')
+    return ''.join(parts) + '</section>'
+
+
+def _method_focus_html(case, method, case_index=None):
     esc = lambda value: html.escape(_text(value), quote=True)
     data = _method_focus_data(case, method)
     parts = ['<section class="u-focus"><h4>两项U重点诊断 · 固定rank逐轮变化与函数入口对照</h4><p>'
@@ -2454,9 +2801,8 @@ def _method_focus_html(case, method):
         parts.append(_bs_svg('两项U逐轮耗时变化 · 固定rank=' + _text(data["rank"]), data["categories"], data["series"],
             '源实测阶段跨度(ms)', x_axis_title='原HC轮次ID（等距；非ProfilerStep）', category_name='原HC轮次ID',
             description='一个固定rank的原保留HC轮次；缺少或未识别结果时断线，不以0替代。', max_labels=14))
-        parts.append('<details><summary>展开全部原HC轮次、设备记录与无记录区间</summary>'
-            + _html_table(FOCUS_STEP_HEADERS, [['' if value is None else value for value in row] for row in data["step_rows"]])
-            + '</details>')
+        parts.append('<p><a href="#' + _focus_source_anchor(case, data["rank"], case_index)
+            + '">源数据：源采样基线 · rank=' + esc(data["rank"]) + '（全部原HC轮次、设备记录与无记录区间）</a></p>')
     else:
         parts.append('<p>逐step未采集，请重新统计；均值细分不代替逐轮数据。</p>')
     for stage in data["stages"]:
@@ -2675,8 +3021,17 @@ def _bs_svg(title, categories, series, unit, *, x_axis_title="BS（每DP请求�
     width = right - left
     x = lambda index: left + width * index / max(1, len(categories) - 1)
     y = lambda value: bottom - (bottom - top) * value / maximum
+    legend_columns = min(3 if max((len(label) for label, _, _ in series), default=0) < 35 else 2,
+                         max(1, len(series)))
+    legend_width = 1080 / legend_columns
+    legend_lines = [_operator_svg_label_lines(label, width=max(18, int(legend_width / 7) - 6))
+                    for label, _, _ in series]
+    legend_rows, legend_y = [], 410
+    for first in range(0, len(series), legend_columns):
+        legend_rows.append(legend_y)
+        legend_y += max((len(lines) for lines in legend_lines[first:first + legend_columns]), default=1) * 14 + 15
     parts = ['<figure class="bs-trend"><figcaption>' + esc(title) + '</figcaption>',
-        '<svg viewBox="0 0 1120 420" role="img" aria-label="' + esc(title + '；' + unit) + '">',
+        '<svg viewBox="0 0 1120 ' + str(max(420, legend_y + 5)) + '" role="img" aria-label="' + esc(title + '；' + unit) + '">',
         '<title>' + esc(title) + '</title><desc>' + esc(description) + '</desc>',
         '<text x="16" y="24">' + esc(unit) + '</text>']
     for tick in range(5):
@@ -2707,9 +3062,12 @@ def _bs_svg(title, categories, series, unit, *, x_axis_title="BS（每DP请求�
             for index, value in segment:
                 parts.append(f'<circle cx="{x(index):.3f}" cy="{y(value):.3f}" r="4" fill="#{color}">'
                     + '<title>' + esc(f'{label}；{category_name}={categories[index]}；{value} {unit}') + '</title></circle>')
-        legend_x = 22 + series_index * (1080 / max(1, len(series)))
-        parts.append(f'<line x1="{legend_x:.3f}" y1="410" x2="{legend_x + 23:.3f}" y2="410" stroke="#{color}" stroke-width="3"/>'
-            f'<text x="{legend_x + 30:.3f}" y="415">{esc(label)}</text>')
+        legend_x = 22 + (series_index % legend_columns) * legend_width
+        legend_top = legend_rows[series_index // legend_columns]
+        parts.append(f'<line x1="{legend_x:.3f}" y1="{legend_top}" x2="{legend_x + 23:.3f}" y2="{legend_top}" stroke="#{color}" stroke-width="3"/>'
+            f'<text x="{legend_x + 30:.3f}" y="{legend_top + 5}"><title>' + esc(label) + '</title>'
+            + ''.join(f'<tspan x="{legend_x + 30:.3f}" dy="{0 if index == 0 else 14}">' + esc(line) + '</tspan>'
+                      for index, line in enumerate(legend_lines[series_index])) + '</text>')
     return ''.join(parts) + '</svg></figure>'
 
 
@@ -2722,33 +3080,15 @@ def _bs_comparison_html(report):
     if report.get('failures'):
         parts.append(_html_table(['统计失败、未纳入BS对比的采样组合', '失败原因'],
             [[item.get('case'), item.get('error')] for item in report['failures']]))
-    parts.append('<h2>不同BS的变化对比</h2><p>' + esc(BS_COMPARISON_SCOPE + ITL_PROXY_SCOPE) + '</p>')
     for group in groups:
-        parts.append('<h3>' + esc(group['label']) + '</h3><h4>单卡吞吐、完整周期与TPOT</h4>')
-        overview = _bs_overview_rows(group)
-        parts.append('<div class="bs-table">' + _html_table(BS_OVERVIEW_HEADERS,
-            [['' if value is None else value for value in row] for row in overview]) + '</div>')
-        reason = _bs_chart_reason(group)
-        if reason:
-            parts.append('<p>' + esc(reason) + '</p>')
-        else:
-            categories = [row[0] for row in overview]
-            for field, label, unit in BS_METRICS:
-                series = [(_layer_mean_name({'id': identity}), [_bs_value(_method(case, identity), field)
-                    for case in group['cases']], color) for identity, color in
-                    (('method1', '168B8D'), ('method2', 'D4793A'))]
-                parts.append(_bs_svg(label + '随BS变化', categories, series, unit))
-        for identity in ('method1', 'method2'):
-            records = _bs_method_rows(group, identity)
-            name = _layer_mean_name({'id': identity})
-            parts.append('<h4>' + esc(name + ' · 整轮五项耗时构成') + '</h4>')
-            parts.append('<div class="bs-table">' + _html_table(BS_METHOD_HEADERS,
-                [['' if value is None else value for value in row] for row in records]) + '</div>')
-            if not reason:
-                series = [(label, [row[3 + index] for row in records], color)
-                    for index, (_, label, color) in enumerate(BS_PARTS)]
-                parts.append(_bs_svg(name + ' · 整轮五项耗时构成随BS变化', categories, series, 'ms/完整周期'))
-    parts.append('<p>五项之和闭合完整周期；D/C和路由计算变化已计入层区间，U保留一次。</p>')
+        parts.append('<h3>' + esc(group['label'] + ' · 原始分组表') + '</h3>')
+        parts.append(_sweep_html_table(BS_OVERVIEW_HEADERS, _bs_overview_rows(group)))
+    parts.append(_trend_html_section(report, 'BS', ('method1', 'method2')))
+    for identity in ('method1', 'method2'):
+        for group in groups:
+            parts.append('<h3>' + esc(_layer_mean_name({'id': identity}) + ' · ' + group['label'] + ' · 原始分组表') + '</h3>')
+            parts.append(_sweep_html_table(BS_METHOD_HEADERS, _bs_method_rows(group, identity)))
+        parts.append(_trend_html_section(report, 'BS', (identity,), parts=True))
     return ''.join(parts) + '</section>'
 
 
@@ -2764,34 +3104,53 @@ def _sweep_html_chart(title, records, series, unit, axis):
         category_name=axis, description="横轴为声明的" + axis + "数值升序等距档位；缺少结果时断线，不补0或插值。")
 
 
+def _trend_html_section(report, axis, identities, *, parts=False):
+    esc = lambda value: html.escape(str(value), quote=True)
+    output = ['<section class="merged-trends"><h3>' + ('固定S看BS' if axis == 'BS' else '固定BS看S')
+              + ' · 按方法合并可比曲线</h3><p>' + esc(TREND_SCOPE + ITL_PROXY_SCOPE) + '</p>']
+    for identity in identities:
+        for family in _trend_families(report, axis, identity):
+            output.append('<h4>' + esc(family['label']) + '</h4><p>' + esc(family['note']) + '</p>')
+            for item in family['excluded_groups']:
+                output.append('<p>' + esc(item['label'] + '：' + item['reason']) + '</p>')
+            fields = list(SWEEP_METRICS)
+            if parts:
+                fields.append(('parts', '整轮五项耗时构成', 'ms/完整周期'))
+            for field, label, unit in fields:
+                matrix = _trend_matrix(family, field)
+                if len(matrix['categories']) < 2:
+                    output.append('<p>本条件仅有一个' + axis + '，保留原值表；不能说明变化趋势。</p>')
+                    continue
+                title = _trend_title(family, label)
+                if not any(_number(value) for item in matrix['series'] for value in item['values']):
+                    output.append('<p>' + esc(title + '：本项没有可用数值，保留原值表，不绘制趋势。') + '</p>')
+                    continue
+                output.append('<h4>' + esc('趋势图数据 · ' + title) + '</h4>')
+                for first in range(0, len(matrix['series']), 10):
+                    selected = matrix['series'][first:first + 10]
+                    output.append(_sweep_html_table([axis, *[item['name'] for item in selected]],
+                        [[value, *[item['values'][index] for item in selected]]
+                         for index, value in enumerate(matrix['categories'])]))
+                output.append(_bs_svg(title, matrix['categories'],
+                    [(item['name'], item['values'], item['color']) for item in matrix['series']], unit,
+                    x_axis_title=_sweep_axis(axis), category_name=axis, description=TREND_SCOPE))
+    return ''.join(output) + '</section>'
+
+
 def _s_comparison_html(report):
     esc = lambda value: html.escape(_text(value), quote=True)
-    parts = ['<section class="s-comparison"><h2>固定BS，不同投机步长S的变化对比</h2><p>'
-        + esc(S_COMPARISON_SCOPE + ITL_PROXY_SCOPE) + '</p>']
     groups = _s_groups(report)
-    if not groups:
-        parts.append('<p>当前报告没有同一固定BS下的多条S采样；不生成跨条件曲线。</p>')
+    parts = ['<section class="s-comparison"><h2>固定BS，不同投机步长S的原始数据及合并趋势</h2><p>'
+        + esc(S_COMPARISON_SCOPE + ITL_PROXY_SCOPE) + '</p>']
     for group in groups:
-        parts.append('<h3>' + esc(group['label']) + '</h3><p>' + esc(group['note']) + '</p>')
-        records = _s_overview_rows(group)
-        parts.append(_sweep_html_table(S_OVERVIEW_HEADERS, records))
-        reason = _s_chart_reason(group)
-        if reason:
-            parts.append('<p>' + esc(reason) + '</p>')
-        else:
-            for index, (_, label, unit) in enumerate(SWEEP_METRICS):
-                series = [(_layer_mean_name({'id': identity}), [record[4 + index + shift] for record in records], color)
-                    for identity, shift, color in (('method1', 0, '168B8D'), ('method2', 4, 'D4793A'))]
-                parts.append(_sweep_html_chart(label + '随S变化', records, series, unit, 'S'))
-        for identity in ('method1', 'method2'):
-            records = _s_method_rows(group, identity)
-            name = _layer_mean_name({'id': identity})
-            parts.append('<h4>' + esc(name + ' · 整轮五项耗时构成') + '</h4>')
-            parts.append(_sweep_html_table(_sweep_part_headers('S'), records))
-            if not reason:
-                series = [(label, [record[4 + index] for record in records], color)
-                          for index, (_, label, color) in enumerate(BS_PARTS)]
-                parts.append(_sweep_html_chart(name + ' · 整轮五项耗时构成随S变化', records, series, 'ms/完整周期', 'S'))
+        parts.append('<h3>' + esc(group['label'] + ' · 原始分组表') + '</h3><p>' + esc(group['note']) + '</p>')
+        parts.append(_sweep_html_table(S_OVERVIEW_HEADERS, _s_overview_rows(group)))
+    parts.append(_trend_html_section(report, 'S', ('method1', 'method2')))
+    for identity in ('method1', 'method2'):
+        for group in groups:
+            parts.append('<h3>' + esc(_layer_mean_name({'id': identity}) + ' · ' + group['label'] + ' · 原始分组表') + '</h3>')
+            parts.append(_sweep_html_table(_sweep_part_headers('S'), _s_method_rows(group, identity)))
+        parts.append(_trend_html_section(report, 'S', (identity,), parts=True))
     return ''.join(parts) + '</section>'
 
 
@@ -2827,6 +3186,152 @@ def _source_sweeps_html(report):
     return ''.join(parts) + '</section>'
 
 
+class _HTMLNavigationParser(HTMLParser):
+    """Index actual rendered targets without rewriting their tables or SVG data."""
+    def __init__(self, document):
+        super().__init__(convert_charrefs=True)
+        self.document, self.blocks, self.active = document, [], []
+        self.line_offsets = [0]
+        self.line_offsets.extend(match.end() for match in re.finditer('\n', document))
+        self.context, self.subcontext = '总览与采样配置', ''
+        self.title_depth, self.header_depth = 0, 0
+        self.tag_depths, self.existing_ids = collections.Counter(), set()
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        self.tag_depths[tag] += 1
+        if values.get('id'):
+            self.existing_ids.add(values['id'])
+        chart_div = tag == 'div' and values.get('role') == 'img' and 'u-bars' in values.get('class', '').split()
+        if re.fullmatch('h[2-5]', tag) or tag in ('table', 'svg') or chart_div:
+            line, column = self.getpos()
+            block = {'tag': tag, 'position': self.line_offsets[line - 1] + column,
+                'raw': self.get_starttag_text(), 'id': values.get('id'), 'depth': self.tag_depths[tag],
+                'new_id': not values.get('id'), 'context': self.context, 'subcontext': self.subcontext,
+                'parts': [], 'kind': '图' if tag == 'svg' or chart_div else '表' if tag == 'table' else '章节'}
+            if chart_div:
+                block['parts'] = [values.get('aria-label') or '阶段耗时图']
+            self.blocks.append(block)
+            self.active.append(block)
+        if tag == 'title':
+            self.title_depth += 1
+        if tag == 'th':
+            self.header_depth += 1
+
+    def handle_data(self, data):
+        for block in self.active:
+            if re.fullmatch('h[2-5]', block['tag']) or block['tag'] == 'svg' and self.title_depth and not block.get('title_complete'):
+                block['parts'].append(data)
+            elif block['tag'] == 'table' and self.header_depth and len(block['parts']) < 3:
+                block['parts'].append(data)
+
+    def handle_endtag(self, tag):
+        if tag == 'title':
+            for block in self.active:
+                if block['tag'] == 'svg':
+                    block['title_complete'] = True
+            self.title_depth = max(0, self.title_depth - 1)
+        if tag == 'th':
+            self.header_depth = max(0, self.header_depth - 1)
+        for index in range(len(self.active) - 1, -1, -1):
+            if self.active[index]['tag'] != tag or self.active[index]['depth'] != self.tag_depths[tag]:
+                continue
+            block = self.active.pop(index)
+            text = (' / ' if tag == 'table' else '').join(block['parts'])
+            block['label'] = ' '.join(text.split()) or block['kind']
+            if tag == 'h2':
+                self.context, self.subcontext = block['label'], ''
+                block['context'] = self.context
+            elif tag == 'h3':
+                self.subcontext = block['label']
+            break
+        self.tag_depths[tag] = max(0, self.tag_depths[tag] - 1)
+
+
+def _html_navigation(document):
+    """Offline, searchable chart/table directory with real fragment targets."""
+    parser = _HTMLNavigationParser(document)
+    parser.feed(document)
+    parser.close()
+    groups = {}
+    insertions = []
+    used_ids, next_id = set(parser.existing_ids), 1
+    directory_id = 'report-chart-directory'
+    while directory_id in used_ids:
+        directory_id += '-index'
+    filter_id = directory_id + '-filter'
+    while filter_id in used_ids:
+        filter_id += '-input'
+    for block in parser.blocks:
+        if block['new_id']:
+            while 'report-nav-target-' + str(next_id) in used_ids:
+                next_id += 1
+            block['id'] = 'report-nav-target-' + str(next_id)
+            used_ids.add(block['id'])
+            next_id += 1
+            insertions.append((block['position'] + len(block['raw']) - 1,
+                               ' id="' + html.escape(block['id'], quote=True) + '"'))
+        label = block.get('label') or ' '.join(block['parts']) or block['kind']
+        if block['subcontext'] and block['tag'] in ('table', 'svg', 'div'):
+            label = block['subcontext'] + ' · ' + label
+        groups.setdefault(block['context'], []).append((block['id'], block['kind'] + ' · ' + label))
+    for position, text in reversed(insertions):
+        document = document[:position] + text + document[position:]
+    contents = ['<nav id="' + directory_id + '" class="report-directory" aria-label="图表目录">',
+        '<h2>图表目录</h2><p>按采样组合及分析部分展开，点击可跳转到图或表；可输入case、方法或图表名筛选。</p>',
+        '<label for="' + filter_id + '">查找图表：</label><input id="' + filter_id + '" type="search" placeholder="例如 BS16、方法一、逐轮、bound">']
+    for context, entries in groups.items():
+        contents.append('<details class="directory-group"><summary>' + html.escape(context)
+                        + ' · ' + str(len(entries)) + '项</summary><ul>')
+        for target, label in entries:
+            contents.append('<li><a href="#' + html.escape(target, quote=True) + '">' + html.escape(label) + '</a></li>')
+        contents.append('</ul></details>')
+    contents.append('</nav><a class="directory-return" href="#' + directory_id + '">返回图表目录</a>')
+    contents.append('''<style>
+html{scroll-behavior:smooth} [id]{scroll-margin-top:16px}
+.report-directory{background:#f6f9fc;border:1px solid #cbd9e6;padding:18px;margin:24px 0;max-width:1160px}
+.report-directory h2{margin-top:0}.report-directory input{box-sizing:border-box;width:100%;padding:10px;margin:8px 0 12px;font:inherit}
+.report-directory summary{padding:10px;overflow-wrap:anywhere}.report-directory li{margin:9px 0;overflow-wrap:anywhere}
+.report-directory a{color:#1266a1}.directory-return{position:fixed;right:18px;bottom:16px;background:#173451;color:white;padding:10px 14px;border-radius:6px;z-index:10;text-decoration:none}
+@media print{.directory-return,.report-directory input,.report-directory label{display:none}}
+</style><script>
+(function(){
+const nav=document.getElementById('__REPORT_NAV_ID__');
+const filter=document.getElementById('__REPORT_FILTER_ID__');
+filter.addEventListener('input',function(){
+ const query=filter.value.trim().toLocaleLowerCase();
+ nav.querySelectorAll('.directory-group').forEach(function(group){
+  let found=0;
+  group.querySelectorAll('li').forEach(function(item){
+   item.hidden=!!query&&!item.textContent.toLocaleLowerCase().includes(query);
+   if(!item.hidden)found++;
+  });
+  group.hidden=!found;
+  if(query&&found)group.open=true;
+ });
+});
+function showTarget(hash){
+ let id;try{id=decodeURIComponent(hash.slice(1));}catch(error){return;}
+ const target=document.getElementById(id);if(!target)return;
+ for(let parent=target.parentElement;parent;parent=parent.parentElement){if(parent.tagName==='DETAILS')parent.open=true;}
+ target.scrollIntoView({block:'start'});
+}
+document.addEventListener('click',function(event){
+ const link=event.target.closest('a[href^="#"]');if(!link)return;
+ const hash=link.getAttribute('href');if(hash.length>1){requestAnimationFrame(function(){showTarget(hash);});}
+});
+window.addEventListener('hashchange',function(){showTarget(location.hash);});
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){if(location.hash)showTarget(location.hash);});
+else if(location.hash)showTarget(location.hash);
+})();
+</script>'''.replace('__REPORT_NAV_ID__', directory_id).replace('__REPORT_FILTER_ID__', filter_id))
+    position = document.find('</h1>')
+    if position < 0:
+        raise ValueError('HTML目录缺少报告主标题锚点')
+    position += len('</h1>')
+    return document[:position] + ''.join(contents) + document[position:]
+
+
 def _html_preview(report, out):
     esc = lambda value: html.escape(_text(value), quote=True)
     parts = ['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
@@ -2843,8 +3348,12 @@ def _html_preview(report, out):
     parts.append(_bs_comparison_html(report))
     parts.append(_s_comparison_html(report))
     parts.append(_source_sweeps_html(report))
-    for case in report["cases"]:
-        parts.append('<h2>' + esc(case["name"]) + '</h2><p>' + esc(_case_scope(case)) + '</p>')
+    parts.append(_focus_source_html(report))
+    case_counts = collections.Counter(case['name'] for case in report['cases'])
+    for case_index, case in enumerate(report["cases"]):
+        focus_case_index = case_index if case_counts[case['name']] > 1 else None
+        heading = case['name'] + (' · 组合序号' + str(case_index + 1) if focus_case_index is not None else '')
+        parts.append('<h2>' + esc(heading) + '</h2><p>' + esc(_case_scope(case)) + '</p>')
         parts.append('<p>' + esc(_case_parameters(case)) + '</p>')
         for identity in ("method1", "method2"):
             method = _method(case, identity)
@@ -2857,7 +3366,7 @@ def _html_preview(report, out):
             parts.append(_html_table(LAYER_MEAN_MATRIX_HEADERS, _layer_mean_matrix_rows(method)))
             parts.append(_html_table(["整轮闭合/单卡指标", "核心原值", "说明"], _layer_mean_closure_rows(method)))
             parts.append(_method_residual_html(case, method))
-            parts.append(_method_focus_html(case, method))
+            parts.append(_method_focus_html(case, method, focus_case_index))
             parts.append(_method_stage_expansions_html(case, method))
             parts.append('<p><code>' + esc(method.get("formula")) + '</code></p><p>' + esc(_explanation(method)) + '</p></section>')
         for capture in case.get("measurements") or []:
@@ -2869,7 +3378,7 @@ def _html_preview(report, out):
                 parts.append(_residual_html(diagnostic, capture.get("rank")))
     parts.append('</html>')
     path = Path(out).with_suffix('.html')
-    path.write_text(''.join(parts), encoding='utf-8')
+    path.write_text(_html_navigation(''.join(parts)), encoding='utf-8')
     return path
 
 
@@ -2957,6 +3466,9 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
     runtime = runtime_diagnostics()
     if not callable(getattr(xlsx_writer.Worksheet, "add_line_chart", None)):
         raise ValueError("Excel写入器缺少BS趋势图接口；请同步更新build_ep128_leadership_excel.py和ep128_xlsx_writer.py。"
+                         + "实际写入器：" + runtime["writer_path"] + "（" + runtime["writer_version"] + "）")
+    if not callable(getattr(xlsx_writer.Worksheet, "add_internal_link", None)):
+        raise ValueError("Excel写入器缺少图表目录内部跳转接口；请同步更新build_ep128_leadership_excel.py和ep128_xlsx_writer.py。"
                          + "实际写入器：" + runtime["writer_path"] + "（" + runtime["writer_version"] + "）")
 
     def stage(name, action):

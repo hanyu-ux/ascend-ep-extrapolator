@@ -4,6 +4,7 @@ import ast
 import copy
 import csv
 import importlib.util
+from html.parser import HTMLParser
 import json
 import os
 import subprocess
@@ -280,11 +281,41 @@ class RendererV2Tests(unittest.TestCase):
         data['cases'][0]['projection']['layer_mean_methods'][0]['warnings'] = ['<img src=x onerror=bad>']
         out, _ = self.build(data)
         text = out.with_suffix('.html').read_text()
-        for forbidden in ('<script>', '<svg onload', '<img src=x'):
+        for forbidden in ('<script>alert("bad")</script>', '<svg onload', '<img src=x'):
             self.assertNotIn(forbidden, text)
-        self.assertIn('&lt;script&gt;', text)
-        self.assertIn('&lt;svg', text)
-        self.assertIn('&lt;img', text)
+        self.assertIn('&lt;script&gt;alert(&quot;bad&quot;)&lt;/script&gt;', text)
+        self.assertIn('&lt;svg onload=bad&gt;', text)
+        self.assertIn('&lt;img src=x onerror=bad&gt;', text)
+
+        class ExecutableMarkup(HTMLParser):
+            def __init__(self, document):
+                super().__init__(convert_charrefs=True)
+                self.scripts, self.active, self.event_attrs = [], None, []
+                self.feed(document)
+
+            def handle_starttag(self, tag, attrs):
+                self.event_attrs.extend((tag, key, value) for key, value in attrs if key.lower().startswith('on'))
+                if tag == 'script':
+                    self.active = {'attrs': dict(attrs), 'parts': []}
+                    self.scripts.append(self.active)
+
+            def handle_data(self, value):
+                if self.active is not None:
+                    self.active['parts'].append(value)
+
+            def handle_endtag(self, tag):
+                if tag == 'script':
+                    self.active = None
+
+        markup = ExecutableMarkup(text)
+        self.assertEqual(markup.event_attrs, [])
+        self.assertEqual(len(markup.scripts), 1)  # Only the trusted local navigation script.
+        self.assertEqual(markup.scripts[0]['attrs'], {})
+        script = ''.join(markup.scripts[0]['parts'])
+        self.assertIn("document.getElementById('report-chart-directory')", script)
+        self.assertIn("document.getElementById('report-chart-directory-filter')", script)
+        self.assertNotIn('alert(', script)
+        self.assertNotIn('bad', script)
 
     def test_renderer_has_no_estimator_or_legacy_import(self):
         tree = ast.parse(RENDERER.read_text())

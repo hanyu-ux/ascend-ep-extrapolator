@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
-WRITER_VERSION = "20261104.1.line_charts"
+WRITER_VERSION = "20261111.1.internal_links"
 MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -300,6 +300,28 @@ def cell_reference(row, col, absolute=False):
     return ("$" if absolute else "") + column_name(col) + ("$" if absolute else "") + str(row)
 
 
+def _sheet_name(name):
+    if (not isinstance(name, str) or not 1 <= len(name) <= 31
+            or re.search(r"[\[\]:*?/\\]", name) or name.startswith("'") or name.endswith("'")):
+        raise ValueError("Worksheet names require 1–31 characters without []:*?/\\ or edge apostrophes")
+    return _text(name)
+
+
+def _internal_cell(value):
+    if not isinstance(value, str):
+        raise ValueError("Internal hyperlink target must be a single A1 cell reference")
+    match = re.fullmatch(r"\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})", value.strip())
+    if not match:
+        raise ValueError("Internal hyperlink target must be a single A1 cell reference")
+    letters, row = match.groups()
+    col = 0
+    for letter in letters.upper():
+        col = col * 26 + ord(letter) - 64
+    row = int(row)
+    _position(row, col)
+    return row, col
+
+
 def _value_type(value):
     if value is None:
         return "blank", None
@@ -338,6 +360,7 @@ STYLE_DEFINITIONS = {
     "ratio": (4, 6, 169, "right", 1),
     "total_display": (4, 7, 167, "right", 1),
     "hero_integer": (7, 3, 165, "right", 1),
+    "link": (9, 0, 0, "left", 1),
 }
 STYLE_IDS = {name: index for index, name in enumerate(STYLE_DEFINITIONS, 1)}
 
@@ -348,12 +371,12 @@ def _styles():
     for number, code in ((164, "0.000000"), (165, "#,##0"), (166, "0.0%"),
                          (167, "#,##0.000"), (168, "0.00"), (169, '0.000"×"')):
         _node(formats, "numFmt", {"numFmtId": number, "formatCode": code})
-    fonts = _node(root, "fonts", {"count": 9})
-    for size, color, bold in ((10, "24364B", False), (23, "FFFFFF", True),
+    fonts = _node(root, "fonts", {"count": 10})
+    for index, (size, color, bold) in enumerate(((10, "24364B", False), (23, "FFFFFF", True),
                               (11, "E3EDF7", False), (11, "FFFFFF", True),
                               (10, "16314F", True), (9, "617286", False),
                               (10, "9A4B10", True), (20, "FFFFFF", True),
-                              (12, "FFFFFF", True)):
+                              (12, "FFFFFF", True), (10, "0563C1", False))):
         font = _node(fonts, "font")
         _node(font, "sz", {"val": size})
         _node(font, "color", {"rgb": "FF" + color})
@@ -362,6 +385,8 @@ def _styles():
         _node(font, "charset", {"val": 134})
         if bold:
             _node(font, "b")
+        if index == 9:
+            _node(font, "u")
     fills = _node(root, "fills", {"count": 8})
     for pattern, color in (("none", None), ("gray125", None),
                             ("solid", "173451"), ("solid", "127D87"),
@@ -412,6 +437,7 @@ class Worksheet:
         self.heights = {}
         self.frozen = (0, 0)
         self.charts = []
+        self.internal_links = {}
 
     def _check_position(self, row, col):
         try:
@@ -432,6 +458,23 @@ class Worksheet:
 
     def write(self, row, col, value, style="body"):
         return self._put(row, col, value, style)
+
+    def add_internal_link(self, row, col, label, target_sheet, target_cell, style="link"):
+        """Write a label linked to a real cell inside this workbook.
+
+        Targets may be written later, including on a sheet added later. Save
+        validates both endpoints. Only a single A1 address and a legal sheet
+        name are accepted; URLs, external references and formulas are rejected.
+        Later writes to the source cell preserve its separately stored link.
+        For merged cells use the top-left anchor, at both source and target.
+        """
+        target_sheet = _sheet_name(target_sheet)
+        target_row, target_col = _internal_cell(target_cell)
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("Internal hyperlink label must be nonempty text")
+        self.write(row, col, _text(label), style)
+        self.internal_links[row, col] = target_sheet, target_row, target_col
+        return self
 
     def formula(self, row, col, expression, cached_value, style="number"):
         expression = _text(expression)
@@ -645,6 +688,15 @@ class Worksheet:
             merged = _node(root, "mergeCells", {"count": len(self.merges)})
             for r1, c1, r2, c2 in self.merges:
                 _node(merged, "mergeCell", {"ref": cell_reference(r1, c1) + ":" + cell_reference(r2, c2)})
+        if self.internal_links:
+            hyperlinks = _node(root, "hyperlinks")
+            for (row, col), (target_sheet, target_row, target_col) in sorted(self.internal_links.items()):
+                location = "'" + target_sheet.replace("'", "''") + "'!" + cell_reference(target_row, target_col)
+                attributes = {"ref": cell_reference(row, col), "location": location}
+                kind, value, _, _ = self.cells[row, col]
+                if kind != "blank":
+                    attributes["display"] = value
+                _node(hyperlinks, "hyperlink", attributes)
         _node(root, "printOptions", {"horizontalCentered": 1})
         _node(root, "pageMargins", {"left": .25, "right": .25, "top": .35, "bottom": .35,
                                     "header": .15, "footer": .15})
@@ -663,19 +715,30 @@ class Workbook:
         self.sheets = []
 
     def add_sheet(self, name, widths=None, landscape=True, paper_size=8, print_area=None):
-        if (not isinstance(name, str) or not 1 <= len(name) <= 31
-                or re.search(r"[\[\]:*?/\\]", name) or name.startswith("'") or name.endswith("'")):
-            raise ValueError("Worksheet names require 1–31 characters without []:*?/\\ or edge apostrophes")
-        _text(name)
+        _sheet_name(name)
         if any(sheet.name.casefold() == name.casefold() for sheet in self.sheets):
             raise ValueError("Worksheet names must be unique")
         sheet = Worksheet(name, widths, landscape, paper_size, print_area)
         self.sheets.append(sheet)
         return sheet
 
+    def _validate_internal_links(self):
+        targets = {sheet.name.casefold(): sheet for sheet in self.sheets}
+        for sheet in self.sheets:
+            for source, (name, row, col) in sheet.internal_links.items():
+                if source not in sheet.cells:
+                    raise ValueError("Internal hyperlink source cell is missing: " + sheet.name)
+                target = targets.get(name.casefold())
+                if target is None:
+                    raise ValueError("Internal hyperlink target worksheet is missing: " + name)
+                if (row, col) not in target.cells:
+                    raise ValueError("Internal hyperlink target must be a written cell or merged anchor: "
+                                     + name + "!" + cell_reference(row, col))
+
     def save(self, path):
         if not self.sheets:
             raise ValueError("An XLSX workbook must contain at least one worksheet")
+        self._validate_internal_links()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         workbook = ET.Element("{" + MAIN + "}workbook")
