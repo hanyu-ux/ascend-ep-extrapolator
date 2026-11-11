@@ -23,7 +23,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261111.2.method3_html"
+RENDERER_VERSION = "20261111.3.acceptance_output_fraction"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -180,6 +180,20 @@ def _preview_report(path):
     cases = []
     for item in config["cases"]:
         normalized = {**config.get("defaults", {}), **item}
+        # Preview displays configuration only. Drop overridden default output
+        # declarations, without deriving Neff or estimating any performance.
+        output_fields = ("effective_tokens_per_round", "synthetic_acceptance_length",
+                         "synthetic_acception_length", "acceptance", "acceptance_semantics")
+        changes_rate_s = ("acceptance" in config.get("defaults", {})
+                          and any(key in item for key in ("draft_tokens", "num_speculative_tokens")))
+        if (any(key in item for key in output_fields) or changes_rate_s) and "effective_tokens_per_round" not in item:
+            normalized.pop("effective_tokens_per_round", None)
+        if "acceptance" in item and "acceptance_semantics" not in item:
+            normalized.pop("acceptance_semantics", None)
+        if any(key in item for key in ("synthetic_acceptance_length", "synthetic_acception_length")) and not any(
+                key in item for key in ("acceptance", "acceptance_semantics")):
+            normalized.pop("acceptance", None)
+            normalized.pop("acceptance_semantics", None)
         case_target = (_object(normalized["target_model"], path.parent)
                        if normalized.get("target_model") is not None else target)
         cases.append(dict(name=normalized.get("name", "未命名组合"), config=normalized,
@@ -467,11 +481,15 @@ SWEEP_PART_SPANS = S_OVERVIEW_SPANS
 SOURCE_METRIC_SPANS = ((1, 1), (2, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 12))
 CASE_PARAMETERS_TITLE = "采样配置对照"
 CASE_PARAMETERS_HEADERS = ["采样组合", "配置BS", "草稿S\n（num_speculative_tokens）", "SAL / Neff\n（含bonus）",
-                           "声明的平均草稿接受比例\n（配置假设，非实测）"]
+                           "声明的接受率及定义\n（配置假设，非实测）"]
 CASE_PARAMETERS_SPANS = ((1, 4), (5, 5), (6, 6), (7, 8), (9, 12))
 CASE_PARAMETERS_SCOPE = ("S为每轮草稿预测token数；SAL（synthetic_acceptance_length，兼容拼写synthetic_acception_length）"
     "按每请求每轮有效新token数Neff展示，含bonus。接受比例仅在明确声明且与S、Neff一致时展示，"
-    "属于配置假设；不从长度反推实测接受率。")
+    "属于配置假设；不从长度反推实测接受率。新口径SAL=(1+S)×r，r是含bonus的有效输出比例；"
+    "旧JSON的平均草稿接受比例按历史公式SAL=1+S×r原样显示，不转换旧结果。"
+    "仅改变r时，当前模型只换算有效输出量、吞吐和TPOT，不修正每轮耗时或ITL代理值。")
+ACCEPTANCE_OUTPUT_FRACTION = "mean_output_fraction_including_bonus"
+ACCEPTANCE_LEGACY_DRAFT_FRACTION = "mean_accepted_draft_fraction"
 
 
 def _parameter_text(value):
@@ -485,17 +503,71 @@ def _parameter_text(value):
     return format(value, ".6f").rstrip("0").rstrip(".")
 
 
+def _declared_acceptance(case):
+    """Recognize a consistent declaration without inferring or converting a rate."""
+    config = case.get("config") or {}
+    draft, effective = _s_value(case), config.get("effective_tokens_per_round")
+    rate = config.get("acceptance")
+    semantics = config.get("acceptance_semantics")
+    if not (type(draft) is int and draft >= 0 and _number(effective) and 1 <= effective <= 1 + draft
+            and _number(rate) and 0 <= rate <= 1):
+        return None
+    if semantics == ACCEPTANCE_OUTPUT_FRACTION:
+        # Reject the float immediately below the legal endpoint even when
+        # rounding or isclose would make its derived length appear to be 1.
+        if rate < 1 / (1 + draft):
+            return None
+        expected, formula, label = (1 + draft) * rate, "SAL=(1+S)×r", "含bonus有效输出比例"
+        policy = "fixed_output_fraction_including_bonus"
+    elif semantics == ACCEPTANCE_LEGACY_DRAFT_FRACTION:
+        expected, formula, label = 1 + draft * rate, "历史SAL=1+S×r", "平均草稿接受比例"
+        policy = "fixed_legacy_draft_acceptance_fraction"
+    else:
+        return None
+    if not math.isclose(effective, expected, rel_tol=1e-9, abs_tol=1e-9):
+        return None
+    return {"rate": rate, "percent": _parameter_text(100 * rate) + "%", "semantics": semantics,
+            "formula": formula, "label": label, "policy": policy}
+
+
+def _acceptance_note(case):
+    declaration = _display_acceptance(case)
+    if declaration is None:
+        return None
+    return ("声明的" + declaration["label"] + "r=" + _parameter_text(declaration["rate"])
+            + ("（配置输入，尚未产生估算；" if declaration.get("preview_only") else "（配置假设，非实测；")
+            + declaration["formula"] + "）")
+
+
+def _display_acceptance(case):
+    """Keep a preview's raw rate visible without deriving its missing Neff."""
+    declaration = _declared_acceptance(case)
+    if declaration is not None:
+        return declaration
+    config = case.get("config") or {}
+    if ((case.get("source") or {}).get("status") != "PREVIEW"
+            or config.get("effective_tokens_per_round") is not None):
+        return None
+    draft, rate = _s_value(case), config.get("acceptance")
+    if not (type(draft) is int and draft >= 0 and _number(rate) and 0 <= rate <= 1):
+        return None
+    semantics = config.get("acceptance_semantics", ACCEPTANCE_OUTPUT_FRACTION)
+    if semantics == ACCEPTANCE_OUTPUT_FRACTION and rate >= 1 / (1 + draft):
+        formula, label = "SAL=(1+S)×r", "含bonus有效输出比例"
+    elif semantics == ACCEPTANCE_LEGACY_DRAFT_FRACTION:
+        formula, label = "历史SAL=1+S×r", "平均草稿接受比例"
+    else:
+        return None
+    return {"rate": rate, "percent": _parameter_text(100 * rate) + "%", "semantics": semantics,
+            "formula": formula, "label": label, "preview_only": True}
+
+
 def _case_parameter_values(case):
     """Display declared inputs; the consistency check never supplies a rate."""
     config = case.get("config") or {}
     bs, draft, effective = config.get("bs"), _s_value(case), config.get("effective_tokens_per_round")
-    rate = config.get("acceptance")
-    declared_rate = "未声明"
-    if (config.get("acceptance_semantics") == "mean_accepted_draft_fraction"
-            and type(draft) is int and draft >= 0 and _number(effective) and 1 <= effective <= 1 + draft
-            and _number(rate) and 0 <= rate <= 1
-            and math.isclose(effective, 1 + draft * rate, rel_tol=1e-9, abs_tol=1e-9)):
-        declared_rate = _parameter_text(100 * rate) + "%"
+    declaration = _display_acceptance(case)
+    declared_rate = declaration["percent"] if declaration else "未声明"
     return [_parameter_text(bs) if type(bs) is int and bs > 0 else "未声明",
             _parameter_text(draft) if type(draft) is int and draft >= 0 else "未声明",
             _parameter_text(effective) if _number(effective) and effective >= 1 else "未声明", declared_rate]
@@ -504,11 +576,23 @@ def _case_parameter_values(case):
 def _case_parameters(case):
     bs, draft, effective, rate = _case_parameter_values(case)
     label = "BS=" + bs + "；草稿S=" + draft + "；Neff=" + effective + "（含bonus）"
-    return label if rate == "未声明" else label + "；声明的平均草稿接受比例=" + rate + "（配置假设，非实测）"
+    declaration = _display_acceptance(case)
+    return label if declaration is None else (label + "；声明的" + declaration["label"] + "=" + rate
+        + ("（配置输入，尚未产生估算；" if declaration.get("preview_only") else "（配置假设，非实测；")
+        + declaration["formula"] + "）")
 
 
 def _case_parameter_rows(report):
-    return [[case["name"], *_case_parameter_values(case)] for case in report["cases"]]
+    rows = []
+    for case in report["cases"]:
+        values = _case_parameter_values(case)
+        declaration = _display_acceptance(case)
+        if declaration is not None:
+            values[-1] += "；" + declaration["label"] + "；" + declaration["formula"]
+            if declaration.get("preview_only"):
+                values[-1] += "；配置输入，尚未产生估算"
+        rows.append([case["name"], *values])
+    return rows
 
 
 def _case_parameter_table(report):
@@ -553,6 +637,9 @@ def _bs_comparison_groups(report):
             + "；BS=" + _text([(case.get("config") or {}).get("bs") for case in group["cases"]])
             + "；S=" + _parameter_text(config.get("draft_tokens")) + "，Neff=" + _parameter_text(config.get("effective_tokens_per_round"))
             + "；目标DP=" + _text(config.get("target_dp")) + "，目标物理卡=" + _text(config.get("target_devices")))
+        acceptance_note = _acceptance_note(group["cases"][0])
+        if acceptance_note:
+            group["label"] += "；" + acceptance_note
         result.append(group)
     return result
 
@@ -589,10 +676,8 @@ def _s_comparison_groups(report):
         config = case.get("config") or {}
         bs = config.get("bs")
         valid_bs = type(bs) is int and bs > 0
-        rate = config.get("acceptance")
-        explicit_rate = (config.get("acceptance_semantics") == "mean_accepted_draft_fraction"
-                         and _number(rate) and 0 <= rate <= 1)
-        policy = "fixed_acceptance_fraction" if explicit_rate else "per_case_configured_neff"
+        declaration = _declared_acceptance(case)
+        policy = declaration["policy"] if declaration else "per_case_configured_neff"
         ranks = sorted({str(item["rank"]) for item in case.get("captures") or case.get("measurements") or []
                         if item.get("rank") is not None})
         coverage = []
@@ -623,9 +708,9 @@ def _s_comparison_groups(report):
         group["label"] = ("S对比组" + str(number) + " · " + _case_scope(group["cases"][0])
             + "；固定BS=" + (_parameter_text(config.get("bs")) if not group["invalid_bs"] else "无效或未声明")
             + "；S=" + _text([_s_value(case) for case in group["cases"]]))
-        if group["output_policy"] == "fixed_acceptance_fraction":
-            group["note"] = ("固定BS；声明的平均草稿接受比例r=" + _parameter_text(config.get("acceptance"))
-                + "（配置假设，非实测）；各S沿用case配置Neff，含bonus，不从Neff反推实测接受率。")
+        if group["output_policy"] != "per_case_configured_neff":
+            group["note"] = ("固定BS；" + _acceptance_note(group["cases"][0])
+                + "；各S沿用case配置Neff，含bonus，不从Neff反推实测接受率。")
         else:
             group["note"] = ("固定BS，各S沿用case配置Neff；非固定接受率的单变量对照，"
                 "不能把变化仅归因于S；Neff含bonus，不从长度反推实测接受率。")
@@ -804,9 +889,8 @@ def _trend_conditions(case, identity):
         ("captured_ranks", "expected_ranks", "source_logical_devices", "complete") if key in coverage}
     if "captured_rank_names" in coverage:
         declared_coverage["captured_rank_names"] = sorted(coverage["captured_rank_names"])
-    rate = config.get("acceptance")
-    policy = ("fixed_acceptance_fraction" if config.get("acceptance_semantics") == "mean_accepted_draft_fraction"
-              and _number(rate) and 0 <= rate <= 1 else "per_case_configured_neff")
+    declaration = _declared_acceptance(case)
+    policy = declaration["policy"] if declaration else "per_case_configured_neff"
     return {"source_model": case.get("source_model"), "target_model": case.get("target_model"),
             "conditions": conditions, "observed_ranks": observed, "coverage": declared_coverage,
             "output_policy": policy}
@@ -873,9 +957,9 @@ def _trend_families(report, axis, identity):
         family["label"] = ("条件组" + str(number) + " · " + _case_scope(family["cases"][0])
             + "；源DP=" + _text(config.get("source_dp")) + "，目标DP=" + _text(config.get("target_dp"))
             + "，源/目标物理卡=" + _text(config.get("source_devices")) + "/" + _text(config.get("target_devices")))
-        if family["scope"]["output_policy"] == "fixed_acceptance_fraction":
-            family["note"] = ("声明的平均草稿接受比例r=" + _parameter_text(config.get("acceptance"))
-                + "（配置假设，非实测）；各点Neff含bonus并沿用各case原值。")
+        if family["scope"]["output_policy"] != "per_case_configured_neff":
+            family["note"] = (_acceptance_note(family["cases"][0])
+                + "；各点Neff含bonus并沿用各case原值。")
         else:
             family["note"] = ("各点沿用case配置Neff（含bonus）；非固定接受率的单变量对照，不能将变化仅归因于"
                 + axis + "；不从长度反推实测接受率。")
@@ -2750,13 +2834,17 @@ def _formula_sheet(book, report):
     row = _table(sheet, 5, ["项目", "口径"], [
         ["层类别参考", LAYER_MEAN_SCOPE], ["完整周期", "主模型目标链＋草稿目标链＋轮次剩余区间；D/C/GMM增量已在层内，仅保留一次"],
         ["单卡指标", "使用核心per_device_tokens_s；按目标物理卡数均摊，不把全局产出当单卡吞吐"],
+        ["接受率与有效输出", CASE_PARAMETERS_SCOPE],
         ["层间衔接区间", LAYER_GAP_NOTE], ["轮次剩余区间", LAYER_RESIDUAL_NOTE]])
     for case in report["cases"]:
         row = _note(sheet, row, case["name"] + " · " + _case_scope(case), columns=12)
         config = case.get("config") or {}
         row = _table(sheet, row, ["配置", "核心原值"], [[key, config.get(key)] for key in (
-            "bs", "draft_tokens", "effective_tokens_per_round", "base_ep", "target_ep", "source_dp", "target_dp",
+            "bs", "draft_tokens", "effective_tokens_per_round", "acceptance", "acceptance_semantics",
+            "token_basis", "base_ep", "target_ep", "source_dp", "target_dp",
             "source_devices", "target_devices", "ranks_per_node") if key in config])
+        if _acceptance_note(case):
+            row = _note(sheet, row, _acceptance_note(case), columns=12)
         for identity in METHOD_IDS:
             method = _method(case, identity)
             row = _table(sheet, row, ["方法", "状态", "核心选中rank", "公式（仅显示）"],

@@ -60,3 +60,8 @@ jobs:
         run: |
           python -B -S -m unittest discover -s tests -p 'test_ep128_method3*.py' -v
           python -B -S -m unittest discover -s tests -p 'test_ep128_html_performance.py' -v
+      - name: Verify output-fraction acceptance and historical report semantics on Windows
+        if: ${{ !cancelled() }}
+        run: |
+          python -B -S -m unittest discover -s tests -p 'test_ep128_acceptance*.py' -v
+          python -B -S -m unittest discover -s tests -p 'test_ep128_v2_driver.py' -v

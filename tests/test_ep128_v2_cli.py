@@ -50,6 +50,45 @@ class CLIIntegrationTests(unittest.TestCase):
                                '--out', str(out), *args], cwd=manifest_path.parent,
                               text=True, capture_output=True, timeout=45)
 
+    def test_new_rate_changes_source_and_three_method_rates_without_retiming_capture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            path = manifest(base)
+            document = json.loads(path.read_text())
+            item = document['cases'][0]
+            item.pop('synthetic_acceptance_length')
+            cases = []
+            for rate, neff in ((.65, 5.2), (.8, 6.4)):
+                item['acceptance'] = rate
+                path.write_text(json.dumps(document))
+                output = base / ('rate-' + str(rate))
+                result = self.invoke(path, output, '--excel')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                report = json.loads((output / 'model_architecture_report.json').read_text())
+                case = report['cases'][0]
+                self.assertEqual(case['config']['effective_tokens_per_round'], neff)
+                self.assertEqual(case['config']['acceptance_semantics'], 'mean_output_fraction_including_bonus')
+                with (output / '最终结果.csv').open(encoding='utf-8-sig', newline='') as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual(len(rows), 3)
+                self.assertTrue(all(float(row['配置接受率']) == rate for row in rows))
+                self.assertTrue(all(row['接受率口径'] == 'mean_output_fraction_including_bonus' for row in rows))
+                self.assertIn('SAL=(1+S)×r', (output / '10T模型推理估算.html').read_text(encoding='utf-8'))
+                cases.append(case)
+            original, changed = cases
+            self.assertEqual(original['captures'], changed['captures'])
+            self.assertEqual(original['source']['aggregate']['cycle_ms'], changed['source']['aggregate']['cycle_ms'])
+            self.assertAlmostEqual(changed['source']['aggregate']['per_device_tokens_s']
+                                   / original['source']['aggregate']['per_device_tokens_s'], 6.4 / 5.2)
+            for before, after in zip(p.displayed_methods(original), p.displayed_methods(changed)):
+                self.assertEqual(before['id'], after['id'])
+                self.assertEqual(before['status'], after['status'])
+                self.assertEqual(before['cycle_ms'], after['cycle_ms'])
+                self.assertEqual(before['breakdown'], after['breakdown'])
+                if after['status'] == 'LAYER_MEAN_ESTIMATE':
+                    self.assertAlmostEqual(after['per_device_tokens_s'] / before['per_device_tokens_s'], 6.4 / 5.2)
+                    self.assertAlmostEqual(after['tpot_ms'] / before['tpot_ms'], 5.2 / 6.4)
+
     def test_default_estimate_with_missing_optional_reference_and_excel(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
@@ -434,7 +473,8 @@ raise SystemExit(p.main())
                 for row in own_rows:
                     self.assertEqual(int(row['草稿token数S']), speculative)
                     self.assertAlmostEqual(float(row['有效输出Neff(含bonus)']), effective)
-                    self.assertEqual(row['配置平均草稿接受比例'], '')
+                    self.assertEqual(row['配置接受率'], '')
+                    self.assertEqual(row['接受率口径'], '')
                 available = next(row for row in own_rows if row['周期(ms)'])
                 self.assertAlmostEqual(float(available['周期(ms)']), methods[name]['cycle_ms'])
                 self.assertAlmostEqual(float(available['TPOT(ms)']), methods[name]['cycle_ms'] / effective)

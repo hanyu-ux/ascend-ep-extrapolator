@@ -29,6 +29,55 @@ COMBINE = re.compile(r"MoeDistributeCombine", re.I)
 INDEXER = re.compile(r"LightningIndexer|IndexerTopK|SparseIndexer", re.I)
 NATIVE = re.compile(r"(?:aclnn)?MoeDistributeDispatch(?:V([123]))?", re.I)
 NS_PER_MS = 1_000_000
+ACCEPTANCE_SEMANTICS = 'mean_output_fraction_including_bonus'
+
+
+def output_token_layer(values, label):
+    """Normalize token aliases before defaults/case output-policy merging."""
+    if not isinstance(values, dict):
+        raise ValueError(label + ' must be an object')
+    result = dict(values)
+    for primary, alias in (('draft_tokens', 'num_speculative_tokens'),
+                           ('synthetic_acceptance_length', 'synthetic_acception_length')):
+        for field in (primary, alias):
+            if field not in result:
+                continue
+            value = result[field]
+            if primary == 'draft_tokens':
+                valid = type(value) is int and value >= 0
+            else:
+                valid = type(value) in (int, float) and math.isfinite(value) and value >= 1
+            if not valid:
+                raise ValueError(label + '.' + field + ' is invalid')
+        if alias in result:
+            if primary in result:
+                same = (result[primary] == result[alias] if primary == 'draft_tokens' else
+                        math.isclose(result[primary], result[alias], rel_tol=1e-9, abs_tol=1e-9))
+                if not same:
+                    raise ValueError(label + ': ' + primary + ' conflicts with ' + alias)
+            result[primary] = result.pop(alias)
+    return result
+
+
+def merge_output_case(defaults, item):
+    """Keep independent capture checks on the estimator's output-policy contract."""
+    defaults, item = output_token_layer(defaults, 'defaults'), output_token_layer(item, 'case')
+    if any(field in item for field in ('effective_tokens_per_round', 'synthetic_acceptance_length',
+                                       'acceptance', 'acceptance_semantics')):
+        defaults.pop('effective_tokens_per_round', None)
+        defaults.pop('synthetic_acceptance_length', None)
+    if 'synthetic_acceptance_length' in item and not any(
+            field in item for field in ('acceptance', 'acceptance_semantics')):
+        defaults.pop('acceptance', None)
+        defaults.pop('acceptance_semantics', None)
+    if 'acceptance' in item and 'acceptance_semantics' not in item:
+        defaults.pop('acceptance_semantics', None)
+    if ('draft_tokens' in item and 'acceptance' in defaults
+            and not any(field in item for field in ('effective_tokens_per_round',
+                                                    'synthetic_acceptance_length'))):
+        defaults.pop('effective_tokens_per_round', None)
+        defaults.pop('synthetic_acceptance_length', None)
+    return {**defaults, **item}
 
 
 def configured_effective_output(case):
@@ -38,13 +87,14 @@ def configured_effective_output(case):
     it is not an accepted-draft count to which one should be added. None of
     these configuration fields independently measures accepted output tokens.
     """
+    case = output_token_layer(case, 'case')
     s = case.get('draft_tokens')
     if type(s) is not int or s < 0:
         raise ValueError('draft_tokens must be an explicit nonnegative integer')
 
     def bounded(value, name, maximum):
         if (isinstance(value, bool) or not isinstance(value, (float, int))
-                or not math.isfinite(value) or not 0 < value <= maximum):
+                or not math.isfinite(value) or not 1 <= value <= maximum):
             raise ValueError('Invalid configured effective output length: ' + name)
         return float(value)
 
@@ -54,19 +104,42 @@ def configured_effective_output(case):
         if 'synthetic_acceptance_length' in case else None
     if explicit is not None and synthetic is not None and not math.isclose(explicit, synthetic, rel_tol=1e-9, abs_tol=1e-9):
         raise ValueError('effective_tokens_per_round conflicts with synthetic_acceptance_length')
+    semantics = case.get('acceptance_semantics')
+    if semantics == 'mean_accepted_draft_fraction':
+        raise ValueError('Legacy mean_accepted_draft_fraction is no longer accepted for new inputs; '
+                         'use mean_output_fraction_including_bonus with SAL=(1+S)*acceptance. '
+                         'To preserve an old SAL, migrate acceptance=SAL/(1+S).')
+    if semantics is not None and semantics != ACCEPTANCE_SEMANTICS:
+        raise ValueError('Unsupported acceptance_semantics: ' + str(semantics))
+    rate_effective = None
+    if 'acceptance' in case or semantics is not None:
+        fraction = case.get('acceptance')
+        if (type(fraction) not in (int, float) or not math.isfinite(fraction)
+                or not 0 <= fraction <= 1):
+            raise ValueError('acceptance must be a finite fraction in [0,1] for SAL=(1+S)*acceptance')
+        minimum_rate = 1 / (1 + s)
+        if fraction < minimum_rate:
+            raise ValueError('SAL=(1+S)*acceptance must remain in [1,S+1]; '
+                             'acceptance must be at least 1/(1+S) for this output contract')
+        # The nearest float for 1/(S+1), e.g. 1/3, can multiply slightly
+        # below one in Decimal(str(...)). Only that exact admitted endpoint
+        # represents SAL=1; smaller rates remain invalid, without tolerance.
+        rate_effective = (1. if fraction == minimum_rate else
+                          float(Decimal(1 + s) * Decimal(str(fraction))))
     if explicit is not None:
         value, field = explicit, 'effective_tokens_per_round'
     elif synthetic is not None:
         value, field = synthetic, 'synthetic_acceptance_length_including_bonus'
-    elif case.get('acceptance_semantics') == 'mean_accepted_draft_fraction':
-        fraction = case.get('acceptance')
-        if (isinstance(fraction, bool) or not isinstance(fraction, (float, int))
-                or not math.isfinite(fraction) or not 0 <= fraction <= 1):
-            raise ValueError('Invalid configured mean_accepted_draft_fraction')
-        value, field = 1 + s * fraction, '1+S*explicit_mean_accepted_draft_fraction'
+    elif rate_effective is not None:
+        value, field = rate_effective, '(1+S)*configured_mean_output_fraction_including_bonus'
     else:
         raise ValueError('Invalid configured effective output length: set Neff, synthetic length, or explicit acceptance semantics')
+    if rate_effective is not None and not math.isclose(value, rate_effective, rel_tol=1e-9, abs_tol=1e-9):
+        raise ValueError('effective output length conflicts with SAL=(1+S)*acceptance: expected '
+                         + str(rate_effective) + ', observed ' + str(value))
     return value, {'effective_tokens_per_round': value, 'source_field': field,
+                   'acceptance': case.get('acceptance'),
+                   'acceptance_semantics': ACCEPTANCE_SEMANTICS if rate_effective is not None else None,
                    'declared_token_basis': case.get('token_basis'),
                    'basis': 'CONFIGURED_NUMERATOR_ARITHMETIC_ONLY_NOT_MEASURED_ACCEPTED_OUTPUT',
                    'bonus': 'Synthetic length already includes bonus; no additional +1 is applied'}
@@ -575,6 +648,8 @@ def validate(manifest, stats_dir=None, *, measurement_only=False):
                   "capture_cohort_status": "NOT_ESTABLISHED",
                   "capture_cohort_scope": "Global rank names, file timestamps and complete counts do not prove one controller run"}
         try:
+            case = merge_output_case(config.get("defaults", {}), item)
+            case["measurement_only"] = record["measurement_only"]
             if case.get("draft_layers", 3) != 3 or case.get("draft_passes", 1) != 1:
                 raise ValueError("Expected one pass of three draft layers")
             case.setdefault("source_chips_per_card", 1)

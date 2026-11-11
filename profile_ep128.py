@@ -30,7 +30,8 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261111.1.method3"
+PROFILE_VERSION = "20261111.2.acceptance_output_fraction"
+ACCEPTANCE_SEMANTICS = "mean_output_fraction_including_bonus"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -996,6 +997,17 @@ def normalize_case(defaults, item, base):
         # an older default acceptance-rate policy must not constrain it.
         defaults.pop('acceptance', None)
         defaults.pop('acceptance_semantics', None)
+    if 'acceptance' in item and 'acceptance_semantics' not in item:
+        # A new per-case rate uses the current definition even when it
+        # replaces a default rate declared under an older convention.
+        defaults.pop('acceptance_semantics', None)
+    if ('draft_tokens' in item and 'acceptance' in defaults
+            and not any(field in item for field in ('effective_tokens_per_round',
+                                                    'synthetic_acceptance_length'))):
+        # S changes the denominator of the inherited rate. Inherited SAL/Neff
+        # may have been normalized for a different S and must be recomputed.
+        defaults.pop('effective_tokens_per_round', None)
+        defaults.pop('synthetic_acceptance_length', None)
     case = {**defaults, **item}
     if not isinstance(case.get('name'), str) or not case['name'].strip():
         raise ValueError('Each case needs a nonempty name')
@@ -1015,9 +1027,33 @@ def normalize_case(defaults, item, base):
         raise ValueError('The reviewed capture contract is three draft layers, one draft pass')
     case['trim_rounds'] = positive_int(case.get('trim_rounds', 2), 'trim_rounds', zero=True)
     rate_effective = None
-    if case.get('acceptance_semantics') == 'mean_accepted_draft_fraction':
+    semantics = case.get('acceptance_semantics')
+    if semantics == 'mean_accepted_draft_fraction':
+        raise ValueError('acceptance_semantics=mean_accepted_draft_fraction uses the historical '
+                         '1 + S*r formula and is no longer accepted for new analysis. '
+                         'Keep the intended SAL and migrate to acceptance=SAL/(1+S), '
+                         'acceptance_semantics=' + ACCEPTANCE_SEMANTICS
+                         + '; for example S=7, SAL=5.2 requires acceptance=0.65. '
+                         'Existing report JSON can still be rendered without changing its historical values.')
+    if semantics is not None and semantics != ACCEPTANCE_SEMANTICS:
+        raise ValueError('Unsupported acceptance_semantics; use ' + ACCEPTANCE_SEMANTICS
+                         + ' for SAL=(1+S)*acceptance, or omit rate fields and declare SAL/Neff directly')
+    if 'acceptance' in case:
         rate = finite_number(case.get('acceptance'), 'acceptance', minimum=0, maximum=1)
-        rate_effective = float(Decimal(1) + Decimal(case['draft_tokens']) * Decimal(str(rate)))
+        minimum_rate = 1 / (1 + case['draft_tokens'])
+        if rate < minimum_rate:
+            raise ValueError('SAL=(1+S)*acceptance must be >= 1; '
+                             'acceptance must be >= 1/(1+S) = '
+                             + str(minimum_rate)
+                             + ' for S=' + str(case['draft_tokens'])
+                             + ', observed acceptance=' + str(rate))
+        # A representable boundary such as r=1/3 must mean SAL=1. Check r
+        # strictly first, so its next lower float never slips in via rounding.
+        rate_effective = (1. if rate == minimum_rate else
+                          float(Decimal(1 + case['draft_tokens']) * Decimal(str(rate))))
+        case['acceptance_semantics'] = ACCEPTANCE_SEMANTICS
+    elif semantics is not None:
+        raise ValueError('acceptance_semantics requires acceptance; omit both fields to use explicit SAL/Neff')
     if 'effective_tokens_per_round' in case:
         effective = finite_number(case['effective_tokens_per_round'], 'effective_tokens_per_round', minimum=1, maximum=1 + case['draft_tokens'])
         if not isinstance(case.get('token_basis'), str) or not case['token_basis'].strip():
@@ -1027,17 +1063,19 @@ def normalize_case(defaults, item, base):
         case['token_basis'] = 'Configured synthetic mean new tokens per request per round, including the bonus token; not measured output'
     elif rate_effective is not None:
         effective = rate_effective
-        case['token_basis'] = 'Configured 1+S*r, r=mean accepted draft count/S; includes one bonus token; not measured output'
+        case['token_basis'] = ('Configured SAL=(1+S)*r, r=mean output count including bonus/(1+S); '
+                               'the bonus is already included; not measured output')
     else:
-        raise ValueError('Set effective_tokens_per_round plus token_basis; acceptance alone is ambiguous')
+        raise ValueError('Set acceptance for SAL=(1+S)*acceptance, synthetic_acceptance_length, '
+                         'or effective_tokens_per_round plus token_basis')
     if 'synthetic_acceptance_length' in case and not math.isclose(effective, finite_number(
             case['synthetic_acceptance_length'], 'synthetic_acceptance_length',
             minimum=1, maximum=1 + case['draft_tokens']), abs_tol=1e-9):
         raise ValueError('effective_tokens_per_round conflicts with synthetic_acceptance_length')
     if rate_effective is not None and not math.isclose(effective, rate_effective, abs_tol=1e-9):
-        raise ValueError('effective output length conflicts with acceptance: mean_accepted_draft_fraction '
-                         + 'requires 1 + draft_tokens * acceptance = ' + str(rate_effective)
-                         + ' (including one bonus token), observed ' + str(effective))
+        raise ValueError('effective output length conflicts with acceptance: ' + ACCEPTANCE_SEMANTICS
+                         + ' requires (1 + draft_tokens) * acceptance = ' + str(rate_effective)
+                         + ' (bonus already included), observed ' + str(effective))
     case['effective_tokens_per_round'] = effective
     for key in ('base_ep', 'expected_ranks'):
         positive_int(case.get(key), key)
@@ -3937,8 +3975,8 @@ def result_rows(report):
             rows.append({'采样组合': case['name'], '每DP请求BS': config.get('bs'),
                          '草稿token数S': config.get('draft_tokens'),
                          '有效输出Neff(含bonus)': config.get('effective_tokens_per_round'),
-                         '配置平均草稿接受比例': (config.get('acceptance') if config.get('acceptance_semantics')
-                                           == 'mean_accepted_draft_fraction' else None),
+                         '配置接受率': config.get('acceptance'),
+                         '接受率口径': config.get('acceptance_semantics'),
                          '目标EP': config.get('target_ep'),
                          '数据范围': '目标' + str((target.get('main') or {}).get('num_hidden_layers', '未知'))
                                     + '主＋' + str((target.get('draft') or {}).get('num_hidden_layers', '未知')) + '草稿条件估算',

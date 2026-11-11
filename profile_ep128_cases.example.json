@@ -145,28 +145,28 @@
       "path": "data/bs8_s7",
       "bs": 8,
       "num_speculative_tokens": 7,
-      "synthetic_acceptance_length": 5.2
+      "acceptance": 0.65
     },
     {
       "name": "bs16-s7",
       "path": "data/bs16_s7",
       "bs": 16,
       "num_speculative_tokens": 7,
-      "synthetic_acceptance_length": 5.2
+      "acceptance": 0.65
     },
     {
       "name": "bs32-s7",
       "path": "data/bs32_s7",
       "bs": 32,
       "num_speculative_tokens": 7,
-      "synthetic_acceptance_length": 5.2
+      "acceptance": 0.65
     },
     {
       "name": "bs64-s7",
       "path": "data/bs64_s7",
       "bs": 64,
       "num_speculative_tokens": 7,
-      "synthetic_acceptance_length": 5.2
+      "acceptance": 0.65
     }
   ],
   "schema_version": 2,

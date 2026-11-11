@@ -38,7 +38,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-三个运行脚本应放在同一目录。当前版本：统计 `20261111.1.method3`、Excel 生成器 `20261111.2.method3_html`、写入器 `20261111.1.internal_links`。
+三个运行脚本应放在同一目录。当前版本：统计 `20261111.2.acceptance_output_fraction`、Excel 生成器 `20261111.3.acceptance_output_fraction`、写入器 `20261111.1.internal_links`。
 
 ## 快速运行
 
@@ -69,7 +69,7 @@ ascend-ep-extrapolator/
      "name": "bs8-s7",
      "bs": 8,
      "num_speculative_tokens": 7,
-     "synthetic_acceptance_length": 5.2,
+     "acceptance": 0.65,
      "inputs": [
        {"rank": "dp0", "path": "data/bs8_s7/dp0/ASCEND_PROFILER_OUTPUT/kernel_details.csv"},
        {"rank": "dp1", "path": "data/bs8_s7/dp1/ASCEND_PROFILER_OUTPUT/kernel_details.csv"}
@@ -151,7 +151,7 @@ python -u build_ep128_leadership_excel.py --report ep128_report/model_architectu
 | `num_speculative_tokens` | 每组采样的草稿候选长度 S，旧名 `draft_tokens` 仍兼容；同层同时填写时必须相等 |
 | `synthetic_acceptance_length` | 每组采样的配置平均输出长度，已含 bonus，范围 `[1, S+1]`；也接受兼容拼写 `synthetic_acception_length` |
 | `effective_tokens_per_round` | 兼容旧配置的有效输出长度 Neff；与同组 SAL 同时提供时必须一致 |
-| `acceptance` / `acceptance_semantics` | 兼容旧接受率配置；每组直接填写 S、SAL 时不需要提供 |
+| `acceptance` / `acceptance_semantics` | 新接受率 r 为含 bonus 的有效输出比例，`SAL=(1+S)×r`；只写 acceptance 即采用新口径，规范化后语义为 `mean_output_fraction_including_bonus`。直接填 SAL 可省略这两项 |
 | `token_basis` | 旧显式 Neff 的来源说明；直接填写 SAL 时自动生成，不需要另外填写 |
 | `base_ep` / `target_ep` | 源/目标专家并行组大小；EP 不自动等于 DP 或物理卡数 |
 | `source_dp` / `target_dp` | 源/目标 DP 副本数量，用于系统吞吐折算 |
@@ -161,24 +161,30 @@ python -u build_ep128_leadership_excel.py --report ep128_report/model_architectu
 | `ranks_per_node` | 节点内参与的逻辑 rank 数，用于逻辑远端份额模型 |
 | `trim_rounds` | 每个 rank 首尾裁剪的轮次数，用于去除不稳定边界轮次 |
 
-模板不在 defaults 中填写接受率或固定 Neff；每个 case 单独填写 S 和 SAL。SAL 是**已包含 bonus 的配置假设**，不会再加一个 token，也不是设备 trace 测得的接受率。`with_stack=false` 是当前计时采样合同；不要将不同采样条件混为同一基线。
+模板不在 defaults 中填写接受率或固定 Neff；每个 case 单独填写 S 和接受率，由脚本计算 SAL。模板 S=7、r=0.65 对应 SAL=5.2，保留原输出量。SAL 是**已包含 bonus 的配置假设**，不会再加一个 token，也不是设备 trace 测得的接受率。`with_stack=false` 是当前计时采样合同；不要将不同采样条件混为同一基线。
 
 ### 一次统计多组：每组填写两个参数
 
-模型、拓扑等通用设置保留在 defaults；把 `num_speculative_tokens`、`synthetic_acceptance_length` 放到各自 case，不用填接受率、Neff 或 token_basis。例如同 BS8 比较四组独立采样：
+模型、拓扑等通用设置保留在 defaults；每个 case 填写 `num_speculative_tokens` 和 `acceptance`，即可按 **`SAL=(1+S)×r`** 计算有效输出量。r 可以逐 case 改变，写小数而非百分数。以下是固定新口径60%的四组独立采样：
 
 ```json
 [
-  {"name": "bs8-s3-r60", "bs": 8, "num_speculative_tokens": 3, "synthetic_acceptance_length": 2.8, "path": "data/bs8_s3_r60"},
-  {"name": "bs8-s5-r60", "bs": 8, "num_speculative_tokens": 5, "synthetic_acceptance_length": 4.0, "path": "data/bs8_s5_r60"},
-  {"name": "bs8-s7-r60", "bs": 8, "num_speculative_tokens": 7, "synthetic_acceptance_length": 5.2, "path": "data/bs8_s7_r60"},
-  {"name": "bs8-s9-r60", "bs": 8, "num_speculative_tokens": 9, "synthetic_acceptance_length": 6.4, "path": "data/bs8_s9_r60"}
+  {"name": "bs8-s3-r60", "bs": 8, "num_speculative_tokens": 3, "acceptance": 0.6, "path": "data/bs8_s3_r60"},
+  {"name": "bs8-s5-r60", "bs": 8, "num_speculative_tokens": 5, "acceptance": 0.6, "path": "data/bs8_s5_r60"},
+  {"name": "bs8-s7-r60", "bs": 8, "num_speculative_tokens": 7, "acceptance": 0.6, "path": "data/bs8_s7_r60"},
+  {"name": "bs8-s9-r60", "bs": 8, "num_speculative_tokens": 9, "acceptance": 0.6, "path": "data/bs8_s9_r60"}
 ]
 ```
 
-上面长度恰好对应之前60%的示例，但脚本直接使用每组填入的 SAL，不会强制60%。`synthetic_acception_length` 与标准拼写同义，只需选一种；同层同时填写却不一致会报错。
+对应 SAL 依次为2.4、3.6、4.8、6.0。也可以继续直接填写 `synthetic_acceptance_length`，兼容拼写 `synthetic_acception_length`；只填 SAL 时不推断实测接受率，同时填写 SAL/Neff/r 则必须与新公式一致。保持 S=7、SAL=5.2 时，新口径 r 为65%；如果改成80%，SAL 为6.4。
 
-case 显式填写 SAL 且没有自己声明接受率时，会替换继承的旧固定 Neff/SAL，并清除继承的旧接受率策略，避免 defaults 的旧值干扰。同一个 case 若另外明确填写 Neff 或接受率，则仍须相互一致。原接受率模式和显式 Neff 旧配置继续兼容。
+现有有效输出合同仍为 `1≤SAL≤1+S`，所以新接受率须满足 `1/(1+S)≤r≤1`；S=0 时 r 只能为1。无效值会报错，不补一个 bonus、不静默钳位。
+
+case 显式填写 SAL 且没有自己声明接受率时，会替换继承的固定 Neff/SAL，并清除继承的接受率策略。同一个 case 若另外明确填写 Neff 或接受率，仍须相互一致。默认接受率可复用，但不同 S 会重新按新公式计算 SAL；不把上一组派生的 SAL 继续沿用。
+
+新分析拒绝仍生效的旧语义 `mean_accepted_draft_fraction`，避免将同一个60%悄悄改义。旧口径迁移时，如需保持原输出量，先按 `r新=SAL/(1+S)` 换算，再删除旧语义或改为 `mean_output_fraction_including_bonus`。旧 JSON 离线重绘保留原始指标，并明确标注历史 `SAL=1+S×r`，不会自动修改历史结果。
+
+接受率只用于有效输出量、吞吐和TPOT换算；复用同一采样只改 r 属于固定每轮耗时的敏感性估算。它不会预测接受率变化导致的 KV、输入准备、上下文或调度耗时变化；验证真实影响仍需对应采样或校准模型。
 
 ```bash
 python -u profile_ep128.py cases.local.json --out ep128_report_multi --excel

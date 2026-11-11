@@ -62,12 +62,14 @@ class V2DriverTests(unittest.TestCase):
         c = p.normalize_case({}, case(), Path.cwd())
         self.assertEqual(c['effective_tokens_per_round'], 5.2)
 
-    def test_ambiguous_acceptance_rejected(self):
+    def test_acceptance_defaults_to_output_fraction_and_old_semantics_is_rejected(self):
         c = case(); del c['effective_tokens_per_round']; del c['token_basis']; c['acceptance'] = .6
-        with self.assertRaisesRegex(ValueError, 'ambiguous'):
-            p.normalize_case({}, c, Path.cwd())
+        result = p.normalize_case({}, c, Path.cwd())
+        self.assertEqual(result['effective_tokens_per_round'], 4.8)
+        self.assertEqual(result['acceptance_semantics'], 'mean_output_fraction_including_bonus')
         c['acceptance_semantics'] = 'mean_accepted_draft_fraction'
-        self.assertEqual(p.normalize_case({}, c, Path.cwd())['effective_tokens_per_round'], 5.2)
+        with self.assertRaisesRegex(ValueError, 'historical|旧'):
+            p.normalize_case({}, c, Path.cwd())
 
     def test_neff_and_integer_guards(self):
         for key, value in [('bs', True), ('draft_tokens', 7.1), ('effective_tokens_per_round', 9), ('target_devices', 0), ('source_chips_per_card', 0)]:
@@ -137,7 +139,7 @@ class MixedSpeculationConfigTests(unittest.TestCase):
         for key in ('name', 'bs', 'draft_tokens', 'effective_tokens_per_round', 'token_basis'):
             values.pop(key)
         if rate:
-            values.update(acceptance=.6, acceptance_semantics='mean_accepted_draft_fraction')
+            values.update(acceptance=.6, acceptance_semantics='mean_output_fraction_including_bonus')
         return values
 
     def normalize(self, defaults, item):
@@ -162,7 +164,7 @@ class MixedSpeculationConfigTests(unittest.TestCase):
                     {'name': 'independent-sample', 'bs': 8, **local})
                 self.assertEqual(result['draft_tokens'], expected)
                 self.assertNotIn('num_speculative_tokens', result)
-                self.assertEqual(result['effective_tokens_per_round'], {7: 5.2, 9: 6.4}[expected])
+                self.assertEqual(result['effective_tokens_per_round'], {7: 4.8, 9: 6.0}[expected])
 
     def test_same_layer_conflicting_token_names_are_rejected_even_when_overridden(self):
         for common, local in (
@@ -189,7 +191,7 @@ class MixedSpeculationConfigTests(unittest.TestCase):
     def test_sixty_percent_policy_gives_exact_lengths_for_independent_samples(self):
         common = self.defaults()
         normalized = []
-        for length, expected in ((3, 2.8), (5, 4.0), (7, 5.2), (9, 6.4)):
+        for length, expected in ((3, 2.4), (5, 3.6), (7, 4.8), (9, 6.0)):
             local = {'name': f'bs8-s{length}', 'bs': 8, 'num_speculative_tokens': length,
                      'path': f'generic-independent-samples/s{length}'}
             with self.subTest(length=length):
@@ -204,10 +206,10 @@ class MixedSpeculationConfigTests(unittest.TestCase):
     def test_case_token_selectors_replace_inherited_fixed_length_and_basis(self):
         old_basis = 'Old explicit S7 assumption including bonus'
         selectors = (
-            {'effective_tokens_per_round': 6.4, 'token_basis': 'New explicit S9 assumption including bonus'},
-            {'synthetic_acceptance_length': 6.4},
+            {'effective_tokens_per_round': 6.0, 'token_basis': 'New explicit S9 assumption including bonus'},
+            {'synthetic_acceptance_length': 6.0},
             {'acceptance': .6},
-            {'acceptance_semantics': 'mean_accepted_draft_fraction'},
+            {'acceptance_semantics': 'mean_output_fraction_including_bonus'},
         )
         for inherited in ('effective_tokens_per_round', 'synthetic_acceptance_length'):
             for selector in selectors:
@@ -215,7 +217,7 @@ class MixedSpeculationConfigTests(unittest.TestCase):
                 local = {'name': 's9-independent', 'bs': 8, 'num_speculative_tokens': 9, **selector}
                 with self.subTest(inherited=inherited, selector=selector):
                     result = self.normalize(common, local)
-                    self.assertEqual(result['effective_tokens_per_round'], 6.4)
+                    self.assertEqual(result['effective_tokens_per_round'], 6.0)
                     self.assertNotEqual(result['token_basis'], old_basis)
                     self.assertTrue(result['token_basis'])
         # Preserve the legacy explicit-Neff contract: its explanation may
@@ -231,10 +233,10 @@ class MixedSpeculationConfigTests(unittest.TestCase):
 
     def test_explicit_lengths_and_recognized_acceptance_rate_must_agree(self):
         valid = {'name': 'consistent-s9', 'bs': 8, 'draft_tokens': 9,
-                 'effective_tokens_per_round': 6.4, 'synthetic_acceptance_length': 6.4,
+                 'effective_tokens_per_round': 6.0, 'synthetic_acceptance_length': 6.0,
                  'token_basis': 'Configured including one bonus token', 'acceptance': .6,
-                 'acceptance_semantics': 'mean_accepted_draft_fraction'}
-        self.assertEqual(self.normalize(self.defaults(), valid)['effective_tokens_per_round'], 6.4)
+                 'acceptance_semantics': 'mean_output_fraction_including_bonus'}
+        self.assertEqual(self.normalize(self.defaults(), valid)['effective_tokens_per_round'], 6.0)
         for altered in (
             {'synthetic_acceptance_length': 5.2},
             {'effective_tokens_per_round': 5.2},
@@ -361,14 +363,14 @@ class MixedSpeculationConfigTests(unittest.TestCase):
                 self.assertEqual(result['effective_tokens_per_round'], 5.2)
                 self.assertEqual(result['token_basis'], common['token_basis'])
                 self.assertNotIn('acceptance', result)
-        # An acceptance value lacking the recognized semantics remains
-        # ambiguous for deriving Neff, and does not override an explicit Neff.
+        # New acceptance values always constrain Neff; unknown semantics and
+        # inconsistent rate/explicit-length declarations cannot be ignored.
         for semantics in (None, 'request_success_fraction'):
             explicit = {**case(), 'acceptance': .1}
             if semantics is not None:
                 explicit['acceptance_semantics'] = semantics
-            with self.subTest(unrecognized_semantics=semantics):
-                self.assertEqual(self.normalize({}, explicit)['effective_tokens_per_round'], 5.2)
+            with self.subTest(unrecognized_semantics=semantics), self.assertRaises(ValueError):
+                self.normalize({}, explicit)
 
 
 if __name__ == '__main__': unittest.main()
