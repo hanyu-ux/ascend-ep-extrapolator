@@ -122,7 +122,7 @@ class FocusExcelTests(unittest.TestCase):
             bars = [root for root in roots if "互斥细项均值" in "".join(root.itertext())]
             self.assertEqual(len(bars), 2)
         focus_headings = re.findall(r"<h4\b[^>]*>([^<]*)</h4>", page)
-        self.assertEqual(focus_headings.count("两项U重点诊断 · 固定rank逐轮变化与函数入口对照"), 2)
+        self.assertEqual(focus_headings.count("两项U重点诊断 · 固定rank逐轮变化与函数入口对照"), 3)
         self.assertIn("SYNTHETIC_FULL_NATIVE_NAME_", page)
         self.assertIn("SYNTHETIC_NATIVE_WHOLE_CALL_ONLY", page)
         self.assertIn("原HC轮次ID（等距；非ProfilerStep）", page)

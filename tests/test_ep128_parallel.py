@@ -120,7 +120,8 @@ class ParallelCaseTests(unittest.TestCase):
                           + self.report_differences(normalized_a, normalized_b))
             for case in b['cases']:
                 self.assertEqual({method['id']: method['status'] for method in core.displayed_methods(case)},
-                                 {'method1': 'LAYER_MEAN_ESTIMATE', 'method2': 'LAYER_MEAN_ESTIMATE'})
+                                 {'method1': 'LAYER_MEAN_ESTIMATE', 'method2': 'LAYER_MEAN_ESTIMATE',
+                                  'method3': 'LAYER_MEAN_ESTIMATE'})
             self.assertIn('layer_mean', b['contract'])
             self.assertTrue(all('_prepared_layer_means' not in case for case in b['cases']))
             left = {path.relative_to(serial_dir): path for path in serial_dir.rglob('*.csv')}

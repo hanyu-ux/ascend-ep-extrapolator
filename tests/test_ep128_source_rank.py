@@ -58,7 +58,7 @@ class CommonSourceRankTests(unittest.TestCase):
         before_source = copy.deepcopy(report["cases"][0]["source"])
         before_measurements = copy.deepcopy(report["cases"][0]["measurements"])
         methods = attach(report, native)
-        self.assertEqual([method["selected_rank"] for method in methods], ["dp0", "dp0"])
+        self.assertEqual([method["selected_rank"] for method in methods], ["dp0", "dp0", "dp0"])
         self.assertEqual(report["cases"][0]["source"], before_source)
         self.assertEqual(report["cases"][0]["measurements"], before_measurements)
         for method in methods:
@@ -103,7 +103,7 @@ class CommonSourceRankTests(unittest.TestCase):
         # Put the source slowest second, so source evidence cannot silently
         # fall back to the first captured rank when method2 has no reference.
         report, native = source_rank_report((("dp1", [2., 2.], 10), ("dp0", [1., 1.], 1000)), reference=False)
-        first, second = attach(report, native)
+        first, second = attach(report, native)[:2]
         self.assertEqual(first["selected_rank"], "dp0")
         self.assertEqual(second["status"], "UNAVAILABLE")
         self.assertIsNone(second["selected_rank"])
@@ -159,7 +159,7 @@ class CommonSourceRankTests(unittest.TestCase):
         first["cases"].extend(second["cases"])
         attach(first, {**native_first, **native_second})
         self.assertEqual([[method["selected_rank"] for method in case["projection"]["layer_mean_methods"]]
-                          for case in first["cases"]], [["A_source", "A_source"], ["B_source", "B_source"]])
+                          for case in first["cases"]], [["A_source"] * 3, ["B_source"] * 3])
 
 
 if __name__ == "__main__":

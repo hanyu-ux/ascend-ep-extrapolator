@@ -137,7 +137,9 @@ class SweepViewTests(unittest.TestCase):
                                     expected_method_set="layer_mean_methods")
         self.assertEqual(report, before)
         book, _ = excel_tests.read_book(out)
-        self.assertEqual(len(book), 9)
+        self.assertEqual(len(book), 10)
+        self.assertIn("核心未提供本方法", book["方法3估算"][1].values())
+        self.assertIn("核心报告未输出方法三", " ".join(map(str, book["方法3估算"][1].values())))
         return out, book, self.tools.chart_parts_by_sheet(out, book)
 
     def title(self, chart):

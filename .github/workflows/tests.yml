@@ -55,3 +55,8 @@ jobs:
           python -B -S -m unittest discover -s tests -p 'test_ep128_focus_source.py' -v
           python -B -S -m unittest discover -s tests -p 'test_ep128_internal_links.py' -v
           python -B -S -m unittest discover -s tests -p 'test_ep128_report_navigation.py' -v
+      - name: Verify method3 and linear HTML export on Windows
+        if: ${{ !cancelled() }}
+        run: |
+          python -B -S -m unittest discover -s tests -p 'test_ep128_method3*.py' -v
+          python -B -S -m unittest discover -s tests -p 'test_ep128_html_performance.py' -v

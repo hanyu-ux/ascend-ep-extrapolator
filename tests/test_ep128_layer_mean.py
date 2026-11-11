@@ -185,8 +185,8 @@ class LayerMeanTests(unittest.TestCase):
         reference = Path(__file__).resolve().parents[1] / "examples/communication-reference.synthetic.csv"
         report["communication_reference"] = {"rows": core.read_reference(reference)}
         with patch.object(core, "METHOD1_EXTRA_US", 0.):
-            plain_first, plain_second = attach(report, native)
-        fixed_first, fixed_second = attach(report, native)
+            plain_first, plain_second = attach(report, native)[:2]
+        fixed_first, fixed_second = attach(report, native)[:2]
 
         self.assertEqual(fixed_first["communication"]["extra_ms_per_call"], .014)
         self.assertEqual(fixed_second["communication"]["extra_ms_per_call"], 0.)
@@ -278,7 +278,7 @@ class LayerMeanTests(unittest.TestCase):
 
     def test_no_historical_reference_only_disables_method2_preserving_source_evidence(self):
         report, native = synthetic_report()
-        first, second = attach(report, native)
+        first, second = attach(report, native)[:2]
         self.assertEqual(first["status"], "LAYER_MEAN_ESTIMATE", first["reasons"])
         self.assertEqual(second["status"], "UNAVAILABLE")
         self.assertIsNone(second["cycle_ms"])
@@ -294,7 +294,7 @@ class LayerMeanTests(unittest.TestCase):
         report, native = synthetic_report()
         reference = Path(__file__).resolve().parents[1] / "examples/communication-reference.synthetic.csv"
         report["communication_reference"] = {"rows": core.read_reference(reference)}
-        first, second = attach(report, native)
+        first, second = attach(report, native)[:2]
         self.assertEqual(second["status"], "LAYER_MEAN_ESTIMATE", second["reasons"])
         # DEMO reference: send EP128 / fitted EP16 = 4, return = 2.5;
         # the configured TopK increase contributes another factor of 1.5.
@@ -397,7 +397,7 @@ class OperatorMeanTests(unittest.TestCase):
         report["communication_reference"] = {"rows": core.read_reference(reference)}
         with patch.object(core, "ATimeIndex", wraps=core.ATimeIndex) as indices, \
              patch.object(core, "_lm_operator_source_means", wraps=core._lm_operator_source_means) as means:
-            first, second = attach(report, native)
+            first, second = attach(report, native)[:2]
         self.assertEqual(first["selected_rank"], "dp1")
         self.assertEqual(second["selected_rank"], "dp1")
         self.assertEqual(indices.call_count, 2)

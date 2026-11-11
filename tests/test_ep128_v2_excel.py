@@ -170,10 +170,14 @@ class RendererV2Tests(unittest.TestCase):
         self.assertEqual(result, out)
         return out, read_book(out)
 
-    def test_nine_sheets_copy_core_numbers_without_prediction_recalculation(self):
+    def test_ten_sheets_copy_core_numbers_and_leave_missing_method3_unavailable(self):
         data = fixture()
         out, (book, files) = self.build(data)
         self.assertEqual(tuple(book), renderer.SHEETS)
+        self.assertEqual(len(book), 10)
+        self.assertEqual([method['id'] for method in data['cases'][0]['projection']['layer_mean_methods']],
+                         ['method1', 'method2'])  # A legacy fixture must stay a two-method input.
+        self.assertIn('核心未提供本方法', str(book['方法3估算'][1]))
         for method in data['cases'][0]['projection']['layer_mean_methods']:
             for field in ('cycle_ms', 'per_device_tokens_s', 'tpot_ms'):
                 self.assertIn(method[field], book['估算总览'][1].values())
@@ -246,12 +250,13 @@ class RendererV2Tests(unittest.TestCase):
         overview = book['估算总览'][1]
         for label in ('完整周期 · ms', 'TPOT · ms/token', '预测单卡吞吐 · token/s/card'):
             cards = [cell for cell, value in overview.items() if value == label]
-            self.assertEqual(len(cards), 2)
+            self.assertEqual(len(cards), 3)
             for cell in cards:
                 column = ''.join(c for c in cell if c.isalpha())
                 row = int(''.join(c for c in cell if c.isdigit()))
                 self.assertEqual(overview[column + str(row + 1)], renderer.PENDING)
         self.assertIn('版式预览', str(overview))
+        self.assertIn('方法三', str(book['方法3估算'][1]))
         with self.assertRaisesRegex(ValueError, 'preview'):
             renderer.build_workbook(out, cases=config)
 
@@ -319,15 +324,37 @@ class RendererV2Tests(unittest.TestCase):
 
     def test_renderer_has_no_estimator_or_legacy_import(self):
         tree = ast.parse(RENDERER.read_text())
-        imports = [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names]
+        bridge = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_add_method3')
+        bridge_nodes = set(ast.walk(bridge))
+        imports = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == 'profile_ep128':
+                        # The feature-detected bridge needs module identity for
+                        # actionable errors when an older core is installed.
+                        self.assertIn(node, bridge_nodes)
+                        self.assertEqual(alias.asname, 'core')
+                    else:
+                        imports.append(alias.name)
+            if (node in bridge_nodes and isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name) and node.value.id == 'core'):
+                self.assertEqual(node.attr, '__file__')
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'getattr'
+                    and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == 'core'):
+                self.assertIn(node, bridge_nodes)
+                self.assertIsInstance(node.args[1], ast.Constant)
+                self.assertIn(node.args[1].value, ('add_method3_report', 'PROFILE_VERSION'))
         for node in ast.walk(tree):
             if not isinstance(node, ast.ImportFrom):
                 continue
             if node.module == 'profile_ep128':
-                # Core owns source summaries/offline rank alignment; the renderer
-                # may persist that derived JSON but never imports estimators.
+                # Only the core owns source summaries and pure offline derived
+                # reports; the renderer never imports raw-data estimators.
                 allowed = {'source_sweep_summary', 'align_report_source_rank', 'atomic_json',
-                           'refresh_report_operator_bounds', 'operator_bound_profile_template'}
+                           'refresh_report_operator_bounds', 'operator_bound_profile_template',
+                           'add_method3_report'}
                 self.assertTrue({alias.name for alias in node.names} <= allowed)
             else:
                 imports.append(node.module or '')

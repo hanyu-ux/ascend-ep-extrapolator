@@ -90,7 +90,7 @@ class TargetStageTests(unittest.TestCase):
         report, native = native_stage_report()
         reference = Path(__file__).resolve().parents[1] / "examples/communication-reference.synthetic.csv"
         report["communication_reference"] = {"rows": core.read_reference(reference)}
-        first, second = attach(report, native)
+        first, second = attach(report, native)[:2]
         self.assertEqual(first["communication"]["extra_ms_per_call"], .014)
         self.assertEqual(second["communication"]["extra_ms_per_call"], 0)
         self.assert_closes(first)
