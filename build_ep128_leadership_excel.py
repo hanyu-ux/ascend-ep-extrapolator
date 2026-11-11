@@ -16,18 +16,20 @@ import math
 from pathlib import Path
 import re
 import sys
+import time
 import traceback
 import unicodedata
 
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261111.1.trends_navigation"
+RENDERER_VERSION = "20261111.2.method3_html"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
+METHOD_IDS = ("method1", "method2", "method3")
 SHEETS = ("估算总览", "源采样基线", "层与组件实测", "时间账本", "方法1估算",
-          "方法2估算", "通信参考原表", "公式与假设", "复核记录")
+          "方法2估算", "通信参考原表", "公式与假设", "复核记录", "方法3估算")
 WIDTHS = [29, 12, 19, 19, 19, 19, 19, 19, 22, 22, 47, 24]
 DEFAULT_DETAIL_ROWS = 1000
 # Excel cells allow 32,767 UTF-16 code units; leave room for continuation labels.
@@ -36,6 +38,9 @@ TIME_FIELDS = ("cycle_ms", "per_device_tokens_s", "global_tokens_s", "tpot_ms")
 LAYER_MEAN_SCOPE = "采样均值条件估算；主0不作参考，主/草稿分别取样，轮次剩余区间只计一次"
 LAYER_GAP_NOTE = "层间衔接区间（HCPost结束→下层HCPre开始，含该段记录任务）"
 LAYER_RESIDUAL_NOTE = "轮次剩余区间（主草稿切换及轮次尾部，保留一次）"
+METHOD3_SCOPE = ("方法三：每层Dispatch/Combine沿用源参考值，不加通信倍率或每次附加成本；"
+                 "仅专家计算按核心配置增加。目标层数和层间衔接仍沿用原外推口径，"
+                 "因此不表示整轮通信总量必定与源模型相同。")
 NA = "—"
 LABELS = {"rank": "采样rank", "role": "主/草稿", "attention": "注意力类型",
           "source_cycle_ms": "源周期(ms)", "source_main_chain_ms": "源主模型层链(ms)",
@@ -120,15 +125,15 @@ def _validate_report(report):
         if not isinstance(methods, list) or any(not isinstance(item, dict) for item in methods):
             raise ValueError("projection." + METHOD_SET + " must be a list of method objects")
         identities = [item.get("id") for item in methods]
-        if any(item not in ("method1", "method2") for item in identities) or len(set(identities)) != len(identities):
-            raise ValueError("方法id须为唯一的method1/method2")
+        if any(item not in METHOD_IDS for item in identities) or len(set(identities)) != len(identities):
+            raise ValueError("方法id须为唯一的method1/method2/method3")
         selection = projection.get("rank_selection") or {}
         shared_rank = selection.get("selected_rank") if selection.get("policy") == "max_of_captured_rank_mean_source_cycle" else None
         declared_shared = [item.get("selected_rank") for item in [selection, *[method.get("rank_selection") or {} for method in methods]]
             if item.get("policy") == "max_of_captured_rank_mean_source_cycle" and item.get("status") == "SELECTED"]
         if declared_shared:
             if None in declared_shared or len(set(declared_shared)) != 1:
-                raise ValueError("共同源rank元数据矛盾；同一case的两种方法不能声明不同rank")
+                raise ValueError("共同源rank元数据矛盾；同一case各方法不能声明不同rank")
             shared_rank = declared_shared[0]
             source_rank = _source(case).get("selected_rank")
             if source_rank is not None and source_rank != shared_rank:
@@ -152,7 +157,7 @@ def _validate_report(report):
             if method_selection.get("policy") == "max_of_captured_rank_mean_source_cycle":
                 declared_rank = method_selection.get("selected_rank")
                 if declared_rank is None or selected_rank != declared_rank or shared_rank is not None and selected_rank != shared_rank:
-                    raise ValueError("共享源rank口径不一致；两种方法必须使用外推前选定的同一rank")
+                    raise ValueError("共享源rank口径不一致；各方法必须使用外推前选定的同一rank")
             if shared_rank is not None and selected_rank != shared_rank:
                 raise ValueError("共享源rank口径不一致；不能混用旧方法所选rank")
     return report
@@ -182,7 +187,7 @@ def _preview_report(path):
             source=dict(status="PREVIEW", per_rank=[], aggregate=dict(scope="PREVIEW")),
             projection=dict(display_method_set=METHOD_SET, layer_mean_methods=[
                 dict(id=identity, status="PENDING", reasons=["仅配置版式预览；未读取kernel CSV，未产生性能数值"])
-                for identity in ("method1", "method2")])))
+                for identity in METHOD_IDS])))
     return dict(schema_version=2, generated_at=datetime.now(timezone.utc).isoformat(),
                 source_kind="configuration_preview", cases=cases, failures=[])
 
@@ -190,7 +195,11 @@ def _preview_report(path):
 def _method(case, identity):
     return next((item for item in (case.get("projection") or {}).get(METHOD_SET, [])
                  if item.get("id") == identity),
-                dict(id=identity, status="PENDING", reasons=["核心报告未输出本方法：" + identity]))
+                (dict(id=identity, status="UNAVAILABLE", report_value_missing=True,
+                      reasons=["核心报告未输出方法三；可用--add-method3从已有源分区和参考层均值离线补算，"
+                               "不读取CSV；缺少必要依据时仍保持不可用。"])
+                 if identity == "method3" else
+                 dict(id=identity, status="PENDING", reasons=["核心报告未输出本方法：" + identity])))
 
 
 def _layer_mean_publishable(method):
@@ -430,6 +439,9 @@ BS_OVERVIEW_HEADERS = ["配置BS\n（每DP请求数）", "采样组合", "方法
     "方法二TPOT\n(ms/token)", "方法状态"]
 BS_OVERVIEW_SPANS = ((1, 1), (2, 3), (4, 4), (5, 5), (6, 6), (7, 7),
                      (8, 8), (9, 9), (10, 10), (11, 11), (12, 12))
+EXTRA_BS_OVERVIEW_HEADERS = ["配置BS\n（每DP请求数）", "采样组合", "方法三rank",
+    "方法三单卡吞吐\n(token/s/卡)", "方法三完整周期\n(ms)", "方法三TPOT\n(ms/token)", "方法状态"]
+EXTRA_BS_OVERVIEW_SPANS = ((1, 1), (2, 4), (5, 5), (6, 7), (8, 9), (10, 10), (11, 12))
 BS_METHOD_HEADERS = ["配置BS\n（每DP请求数）", "采样组合", "所选rank",
     *[label + "\n(ms)" for _, label, _ in BS_PARTS], "完整周期\n(ms)", "状态"]
 BS_METHOD_SPANS = ((1, 1), (2, 3), (4, 4), (5, 5), (6, 6), (7, 7),
@@ -448,6 +460,9 @@ S_OVERVIEW_HEADERS = ["投机步长S", "采样组合", "SAL / Neff\n（含bonus�
     "方法一单卡吞吐\n(token/s/卡)", "方法一TPOT\n(ms/token)", "方法一ITL代理\n(ms/轮)",
     "方法二rank / 状态", "方法二单卡吞吐\n(token/s/卡)", "方法二TPOT\n(ms/token)", "方法二ITL代理\n(ms/轮)"]
 S_OVERVIEW_SPANS = ((1, 1), (2, 3), *[(col, col) for col in range(4, 13)])
+EXTRA_S_OVERVIEW_HEADERS = ["投机步长S", "采样组合", "SAL / Neff\n（含bonus）", "方法三rank / 状态",
+    "方法三单卡吞吐\n(token/s/卡)", "方法三TPOT\n(ms/token)", "方法三ITL代理\n(ms/轮)"]
+EXTRA_S_OVERVIEW_SPANS = ((1, 1), (2, 3), (4, 4), (5, 6), (7, 8), (9, 10), (11, 12))
 SWEEP_PART_SPANS = S_OVERVIEW_SPANS
 SOURCE_METRIC_SPANS = ((1, 1), (2, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 12))
 CASE_PARAMETERS_TITLE = "采样配置对照"
@@ -512,7 +527,7 @@ def _bs_comparison_groups(report):
         ranks = sorted({str(item["rank"]) for item in case.get("captures") or case.get("measurements") or []
                         if item.get("rank") is not None})
         coverage = []
-        for identity in ("method1", "method2"):
+        for identity in METHOD_IDS:
             original = _method(case, identity).get("coverage") or {}
             fields = {key: original[key] for key in ("captured_ranks", "expected_ranks", "source_logical_devices", "complete")
                       if key in original}
@@ -581,7 +596,7 @@ def _s_comparison_groups(report):
         ranks = sorted({str(item["rank"]) for item in case.get("captures") or case.get("measurements") or []
                         if item.get("rank") is not None})
         coverage = []
-        for identity in ("method1", "method2"):
+        for identity in METHOD_IDS:
             original = _method(case, identity).get("coverage") or {}
             fields = {key: original[key] for key in ("captured_ranks", "expected_ranks", "source_logical_devices", "complete")
                       if key in original}
@@ -641,7 +656,7 @@ def _bs_index_rows(groups):
     rows = []
     for case, group in indexed:
         state = "；".join("方法" + str(number) + "=" + _layer_mean_status(_method(case, identity))
-                          for number, identity in enumerate(("method1", "method2"), 1))
+                          for number, identity in enumerate(METHOD_IDS, 1))
         state += "。" + (_bs_chart_reason(group) or "本组原值表及趋势图见下方。")
         rows.append([(case.get("config") or {}).get("bs"), group["label"].split(" · ")[0], case["name"], state])
     return rows
@@ -660,7 +675,7 @@ def _input_report_diagnostics(report, origin, reused=False):
     for case in report["cases"]:
         messages.append("输入组合：" + case["name"] + "；config.bs=" + repr((case.get("config") or {}).get("bs"))
             + "；" + "；".join("方法" + str(number) + "=" + _layer_mean_status(_method(case, identity))
-                for number, identity in enumerate(("method1", "method2"), 1)))
+                for number, identity in enumerate(METHOD_IDS, 1)))
     messages.extend("BS分组：" + group["label"] for group in _bs_comparison_groups(report))
     messages.extend("失败组合：" + _text(item.get("case")) + "；" + _text(item.get("error"))
                     for item in report.get("failures") or [])
@@ -677,12 +692,28 @@ def _bs_overview_rows(group):
     for case in group["cases"]:
         row = [(case.get("config") or {}).get("bs"), case["name"]]
         states = []
-        for number, identity in enumerate(("method1", "method2"), 1):
+        for number, identity in enumerate(METHOD_IDS[:2], 1):
             method = _method(case, identity)
             row.extend([method.get("selected_rank") if _layer_mean_publishable(method) else NA,
                         *[_bs_value(method, field) for field, _, _ in BS_METRICS]])
             states.append("方法" + str(number) + "：" + _layer_mean_status(method))
         rows.append([*row, "\n".join(states)])
+    return rows
+
+
+def _extra_overview_rows(group, axis):
+    """Method three has its own raw table; preserve the first two methods' cells."""
+    rows = []
+    for case in group["cases"]:
+        method = _method(case, "method3")
+        rank = method.get("selected_rank") if _layer_mean_publishable(method) else NA
+        status = _layer_mean_status(method)
+        if axis == "S":
+            rows.append([_s_value(case), case["name"], (case.get("config") or {}).get("effective_tokens_per_round"),
+                _rank_note(method) + "\n" + status, *[_bs_value(method, field) for field, _, _ in SWEEP_METRICS]])
+        else:
+            rows.append([(case.get("config") or {}).get("bs"), case["name"], rank,
+                *[_bs_value(method, field) for field, _, _ in BS_METRICS], status])
     return rows
 
 
@@ -941,10 +972,12 @@ def _bs_overview_section(sheet, row, report):
         row = _note(sheet, row, group["label"] + " · 原始分组表")
         row, _ = _bs_table(sheet, row, BS_OVERVIEW_HEADERS, _bs_overview_rows(group), BS_OVERVIEW_SPANS,
                            (1, 4, 5, 6, 8, 9, 10))
+        row, _ = _bs_table(sheet, row, EXTRA_BS_OVERVIEW_HEADERS, _extra_overview_rows(group, "BS"),
+                           EXTRA_BS_OVERVIEW_SPANS, (1, 4, 5, 6))
         reason = _bs_chart_reason(group)
         if reason and (group["duplicate_bs"] or group["invalid_bs"]):
             row = _note(sheet, row, reason, warning=True)
-    return _trend_excel_section(sheet, row, report, "BS", ("method1", "method2"))
+    return _trend_excel_section(sheet, row, report, "BS", METHOD_IDS)
 
 
 def _bs_method_section(sheet, row, report, identity):
@@ -973,6 +1006,17 @@ def _source_sweep(case):
 def _align_source_rank(report):
     from profile_ep128 import align_report_source_rank
     return align_report_source_rank(report)
+
+
+def _add_method3(report):
+    import profile_ep128 as core
+    derive = getattr(core, "add_method3_report", None)
+    if not callable(derive):
+        raise ValueError("统计脚本缺少方法三离线补算接口；请同步更新profile_ep128.py和"
+                         "build_ep128_leadership_excel.py。实际统计脚本："
+                         + str(Path(core.__file__).resolve()) + "（"
+                         + str(getattr(core, "PROFILE_VERSION", "unversioned")) + "）")
+    return derive(report)
 
 
 def _save_source_rank_report(path, report):
@@ -1006,7 +1050,7 @@ def _s_overview_rows(group):
     rows = []
     for case in group["cases"]:
         row = [_s_value(case), case["name"], (case.get("config") or {}).get("effective_tokens_per_round")]
-        for identity in ("method1", "method2"):
+        for identity in METHOD_IDS[:2]:
             method = _method(case, identity)
             row.extend([_rank_note(method) + "\n" + _layer_mean_status(method),
                         *[_bs_value(method, field) for field, _, _ in SWEEP_METRICS]])
@@ -1091,10 +1135,12 @@ def _s_overview_section(sheet, row, report):
         row = _note(sheet, row, group["label"] + " · 原始分组表。" + group["note"])
         row, _ = _bs_table(sheet, row, S_OVERVIEW_HEADERS, _s_overview_rows(group), S_OVERVIEW_SPANS,
                            (1, 3, 5, 6, 7, 9, 10, 11))
+        row, _ = _bs_table(sheet, row, EXTRA_S_OVERVIEW_HEADERS, _extra_overview_rows(group, "S"),
+                           EXTRA_S_OVERVIEW_SPANS, (1, 3, 5, 6, 7))
         reason = _s_chart_reason(group)
         if reason and (group["duplicate_s"] or group["invalid_s"] or group["invalid_bs"]):
             row = _note(sheet, row, reason, warning=True)
-    return _trend_excel_section(sheet, row, report, "S", ("method1", "method2"))
+    return _trend_excel_section(sheet, row, report, "S", METHOD_IDS)
 
 
 def _s_method_section(sheet, row, report, identity):
@@ -1193,11 +1239,14 @@ def _layer_mean_value(method, value, target=False):
 
 
 def _layer_mean_status(method):
+    if method.get("report_value_missing"):
+        return "核心未提供本方法"
     return "条件估算" if _layer_mean_publishable(method) else "缺少实际输入"
 
 
 def _layer_mean_name(method):
-    return {"method1": "方法一（逻辑通信倍率）", "method2": "方法二（历史通信比值）"}.get(method.get("id"), "条件估算")
+    return {"method1": "方法一（逻辑通信倍率）", "method2": "方法二（历史通信比值）",
+            "method3": "方法三（单层通信不增，仅专家计算增量）"}.get(method.get("id"), "条件估算")
 
 
 def _rank_note(method):
@@ -1215,7 +1264,7 @@ def _rank_selection_text(method):
             return "共同源rank未选定；见方法不可用原因，不以其他rank补齐结果。"
         return ("先按外推前源整轮平均耗时选rank=" + _text(selection.get("selected_rank"))
             + "（源均值=" + _text(selection.get("selected_source_cycle_ms"))
-            + "ms）；同一case两种方法共用，外推后不重选；最大值范围仅为已采rank。")
+            + "ms）；同一case各方法共用，外推后不重选；最大值范围仅为已采rank。")
     if method.get("status") in ("PENDING", "UNAVAILABLE"):
         return "方法不可用；不以其他rank补齐目标结果。"
     return ("旧报告保留所存选中rank；未采用共同源rank新口径。"
@@ -1319,11 +1368,13 @@ def _overview(book, report):
         _navigation_case(sheet, row, case)
         row = _note(sheet, row, case["name"] + " · " + _case_scope(case), columns=12)
         row = _note(sheet, row, _case_parameters(case), columns=12)
-        for identity in ("method1", "method2"):
+        for identity in METHOD_IDS:
             method = _method(case, identity)
             row = _note(sheet, row, _layer_mean_name(method) + " / " + _layer_mean_status(method) +
                         " / " + _rank_note(method) + " / 采样均值", columns=12)
             row = _note(sheet, row, _rank_selection_text(method), columns=12)
+            if identity == "method3":
+                row = _note(sheet, row, METHOD3_SCOPE, columns=12)
             row = _layer_mean_cards(sheet, row, method, case_index, identity)
             row = _table(sheet, row, ["整轮组成/指标", "核心原值", "说明"], _layer_mean_closure_rows(method))
             row = _note(sheet, row, _explanation(method), warning=True, columns=12)
@@ -1336,6 +1387,8 @@ def _layer_mean_method_section(sheet, row, case, case_index, identity, method):
                 " / " + _rank_note(method) + " / " + _layer_mean_status(method), columns=12)
     row = _note(sheet, row, _case_parameters(case), columns=12)
     row = _note(sheet, row, _rank_selection_text(method), columns=12)
+    if identity == "method3":
+        row = _note(sheet, row, METHOD3_SCOPE, columns=12)
     row = _layer_mean_cards(sheet, row, method, case_index, identity)
     rank_scope = ("以下为核心所选rank的均值；不独立取主/草稿或某组件的最大值。"
                   if _layer_mean_publishable(method) else "源参考均值保留；目标输入不足时不选择目标rank。")
@@ -2351,8 +2404,10 @@ def _focus_source_anchor(case, rank, case_index=None):
 def _focus_source_entries(case):
     """One actual source table per selected rank, including legacy rank choices."""
     entries = {}
-    for identity in ("method1", "method2"):
+    for identity in METHOD_IDS:
         method = _method(case, identity)
+        if method.get("report_value_missing"):
+            continue
         data = _method_focus_data(case, method)
         if data["rank"] not in entries:
             entries[data["rank"]] = dict(data=data, methods=[])
@@ -2611,7 +2666,7 @@ def _ledger_sheet(book, report):
               "cross_role_tail_residual_ms", "partition_total_ms", "closed", "scope")
     for case in report["cases"]:
         row = _note(sheet, row, case["name"] + "；" + LAYER_RESIDUAL_NOTE)
-        for identity in ("method1", "method2"):
+        for identity in METHOD_IDS:
             method = _method(case, identity)
             row = _note(sheet, row, _layer_mean_name(method))
             records = (dict(rank=rank.get("rank"), **(rank.get("source_partition") or {}))
@@ -2675,7 +2730,7 @@ def _layers_sheet(book, report):
     row = 5
     for case in report["cases"]:
         row = _note(sheet, row, case["name"] + "：参考层号和样本数由核心给定；主/草稿独立统计。", columns=12)
-        for identity in ("method1", "method2"):
+        for identity in METHOD_IDS:
             method = _method(case, identity)
             rows = [[case["name"], _layer_mean_name(method), rank.get("rank"), item.get("role"), item.get("attention"),
                      item.get("reference_layers"), item.get("samples"), item.get("wall_ms"), item.get("dispatch_ms"),
@@ -2702,7 +2757,7 @@ def _formula_sheet(book, report):
         row = _table(sheet, row, ["配置", "核心原值"], [[key, config.get(key)] for key in (
             "bs", "draft_tokens", "effective_tokens_per_round", "base_ep", "target_ep", "source_dp", "target_dp",
             "source_devices", "target_devices", "ranks_per_node") if key in config])
-        for identity in ("method1", "method2"):
+        for identity in METHOD_IDS:
             method = _method(case, identity)
             row = _table(sheet, row, ["方法", "状态", "核心选中rank", "公式（仅显示）"],
                          [[_layer_mean_name(method), _layer_mean_status(method), method.get("selected_rank"), method.get("formula")]])
@@ -2712,9 +2767,14 @@ def _formula_sheet(book, report):
                 note = ("方法一每次Dispatch/Combine附加14μs；已计入核心增量"
                         if identity == "method1" and extra == .014 else
                         "方法二按历史通信倍率换算，无额外14μs"
-                        if identity == "method2" and extra == 0 else "核心给定的每次附加通信成本")
+                        if identity == "method2" and extra == 0 else
+                        "方法三每层通信保持源参考值；不附加每次通信成本"
+                        if identity == "method3" and extra == 0 else "核心给定的每次附加通信成本")
                 row = _table(sheet, row, ["通信参数", "核心原值(ms/次)", "说明"],
                              [["extra_ms_per_call", extra, note]])
+            if identity == "method3":
+                row = _note(sheet, row, METHOD3_SCOPE, columns=12)
+                row = _table(sheet, row, ["方法三通信模型字段", "核心原值"], list(_flatten(communication)))
             for field in ("assumptions", "warnings", "reasons"):
                 row = _table(sheet, row, ["本次条件/限制", "核心原文"], [[field, value] for value in method.get(field) or []])
     return sheet
@@ -2726,7 +2786,7 @@ def _review_sheet(book, report, origin):
                     ["profile_version", report.get("profile_version")], ["generated_at", report.get("generated_at")]])
     for case in report["cases"]:
         row = _note(sheet, row, case["name"], columns=12)
-        for identity in ("method1", "method2"):
+        for identity in METHOD_IDS:
             method = _method(case, identity)
             row = _table(sheet, row, ["方法", "状态", "核心选中rank", "汇总方式"],
                          [[_layer_mean_name(method), _layer_mean_status(method), method.get("selected_rank"), _rank_selection_text(method)]])
@@ -3083,8 +3143,9 @@ def _bs_comparison_html(report):
     for group in groups:
         parts.append('<h3>' + esc(group['label'] + ' · 原始分组表') + '</h3>')
         parts.append(_sweep_html_table(BS_OVERVIEW_HEADERS, _bs_overview_rows(group)))
-    parts.append(_trend_html_section(report, 'BS', ('method1', 'method2')))
-    for identity in ('method1', 'method2'):
+        parts.append(_sweep_html_table(EXTRA_BS_OVERVIEW_HEADERS, _extra_overview_rows(group, "BS")))
+    parts.append(_trend_html_section(report, 'BS', METHOD_IDS))
+    for identity in METHOD_IDS:
         for group in groups:
             parts.append('<h3>' + esc(_layer_mean_name({'id': identity}) + ' · ' + group['label'] + ' · 原始分组表') + '</h3>')
             parts.append(_sweep_html_table(BS_METHOD_HEADERS, _bs_method_rows(group, identity)))
@@ -3145,8 +3206,9 @@ def _s_comparison_html(report):
     for group in groups:
         parts.append('<h3>' + esc(group['label'] + ' · 原始分组表') + '</h3><p>' + esc(group['note']) + '</p>')
         parts.append(_sweep_html_table(S_OVERVIEW_HEADERS, _s_overview_rows(group)))
-    parts.append(_trend_html_section(report, 'S', ('method1', 'method2')))
-    for identity in ('method1', 'method2'):
+        parts.append(_sweep_html_table(EXTRA_S_OVERVIEW_HEADERS, _extra_overview_rows(group, "S")))
+    parts.append(_trend_html_section(report, 'S', METHOD_IDS))
+    for identity in METHOD_IDS:
         for group in groups:
             parts.append('<h3>' + esc(_layer_mean_name({'id': identity}) + ' · ' + group['label'] + ' · 原始分组表') + '</h3>')
             parts.append(_sweep_html_table(_sweep_part_headers('S'), _s_method_rows(group, identity)))
@@ -3203,7 +3265,7 @@ class _HTMLNavigationParser(HTMLParser):
         if values.get('id'):
             self.existing_ids.add(values['id'])
         chart_div = tag == 'div' and values.get('role') == 'img' and 'u-bars' in values.get('class', '').split()
-        if re.fullmatch('h[2-5]', tag) or tag in ('table', 'svg') or chart_div:
+        if tag in ('h2', 'h3', 'h4', 'h5', 'table', 'svg') or chart_div:
             line, column = self.getpos()
             block = {'tag': tag, 'position': self.line_offsets[line - 1] + column,
                 'raw': self.get_starttag_text(), 'id': values.get('id'), 'depth': self.tag_depths[tag],
@@ -3220,7 +3282,7 @@ class _HTMLNavigationParser(HTMLParser):
 
     def handle_data(self, data):
         for block in self.active:
-            if re.fullmatch('h[2-5]', block['tag']) or block['tag'] == 'svg' and self.title_depth and not block.get('title_complete'):
+            if block['tag'] in ('h2', 'h3', 'h4', 'h5') or block['tag'] == 'svg' and self.title_depth and not block.get('title_complete'):
                 block['parts'].append(data)
             elif block['tag'] == 'table' and self.header_depth and len(block['parts']) < 3:
                 block['parts'].append(data)
@@ -3246,6 +3308,21 @@ class _HTMLNavigationParser(HTMLParser):
                 self.subcontext = block['label']
             break
         self.tag_depths[tag] = max(0, self.tag_depths[tag] - 1)
+
+
+def _html_insertions(document, insertions):
+    """Apply ordered insertions in one pass, copying each source character once.
+
+    Every position uses the original document's coordinates. Rebuilding the
+    entire HTML once per chart/table becomes quadratic on large reports.
+    """
+    parts, cursor = [], 0
+    for position, text in insertions:
+        parts.append(document[cursor:position])
+        parts.append(text)
+        cursor = position
+    parts.append(document[cursor:])
+    return ''.join(parts)
 
 
 def _html_navigation(document):
@@ -3275,8 +3352,6 @@ def _html_navigation(document):
         if block['subcontext'] and block['tag'] in ('table', 'svg', 'div'):
             label = block['subcontext'] + ' · ' + label
         groups.setdefault(block['context'], []).append((block['id'], block['kind'] + ' · ' + label))
-    for position, text in reversed(insertions):
-        document = document[:position] + text + document[position:]
     contents = ['<nav id="' + directory_id + '" class="report-directory" aria-label="图表目录">',
         '<h2>图表目录</h2><p>按采样组合及分析部分展开，点击可跳转到图或表；可输入case、方法或图表名筛选。</p>',
         '<label for="' + filter_id + '">查找图表：</label><input id="' + filter_id + '" type="search" placeholder="例如 BS16、方法一、逐轮、bound">']
@@ -3329,15 +3404,27 @@ else if(location.hash)showTarget(location.hash);
     if position < 0:
         raise ValueError('HTML目录缺少报告主标题锚点')
     position += len('</h1>')
-    return document[:position] + ''.join(contents) + document[position:]
+    # Parser targets are already in source order; merge the single directory
+    # insertion into that order instead of rebuilding the document per target.
+    directory = (position, ''.join(contents))
+    index = next((index for index, item in enumerate(insertions) if item[0] >= position), len(insertions))
+    insertions.insert(index, directory)
+    return _html_insertions(document, insertions)
 
 
-def _html_preview(report, out):
+def _html_preview(report, out, progress=None):
+    started = time.perf_counter()
+
+    def mark(message):
+        if progress is not None:
+            progress("HTML：" + message + "；累计 " + format(time.perf_counter() - started, ".2f") + "s")
+
+    mark("生成趋势图与源表")
     esc = lambda value: html.escape(_text(value), quote=True)
     parts = ['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
              '<title>10T模型推理估算</title><style>body{margin:24px;font:16px system-ui;color:#173451}table{border-collapse:collapse;width:100%;margin:20px 0}th,td{border:1px solid #d2dde8;padding:10px}th{background:#edf2f7}p{line-height:1.7}section{margin:32px 0}code{white-space:pre-wrap;overflow-wrap:anywhere}.stages table{table-layout:fixed}.stages th:first-child{width:42%}.stages th:last-child{width:14%}.stages th,.stages td{overflow-wrap:anywhere}.sources th:first-child{width:31%}.sources td:last-child{white-space:pre-line}.method-residual th:nth-child(2){width:45%}.u-bars{margin:24px 0}.u-bar{display:grid;grid-template-columns:minmax(16em,2fr) 3fr 8em;gap:12px;align-items:center;margin:10px 0}.u-track{background:#edf2f7;height:18px}.u-track i{display:block;background:#168b8d;height:100%}.u-bar>span:last-child{text-align:right;font-variant-numeric:tabular-nums}</style>',
              '<h1>10T模型推理估算</h1><p>' + esc(LAYER_MEAN_SCOPE) + '</p>',
-             '<p><a href="' + esc(Path(out).name) + '">打开Excel（9个工作表）</a>；来源：' + esc(report.get('source_kind')) + '</p>']
+             '<p><a href="' + esc(Path(out).name) + '">打开Excel（10个工作表）</a>；来源：' + esc(report.get('source_kind')) + '</p>']
     parts.append('<style>.bs-table{overflow-x:auto}.bs-table table{min-width:1200px}.bs-table th,.bs-table td{white-space:pre-line}.bs-trend{margin:28px 0;max-width:1120px}.bs-trend svg{display:block;width:100%;font:14px system-ui}.bs-trend figcaption{font-weight:600}</style>')
     parts.append('<style>.operator-chart svg{width:100%;font:12px system-ui;display:block;margin:24px 0}.operator-drilldown table{table-layout:fixed;font-size:13px}.operator-drilldown th:first-child{width:34%}.operator-drilldown th:last-child{width:29%}.operator-drilldown td{overflow-wrap:anywhere;white-space:pre-line}.operator-drilldown pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>')
     parts.append('<style>.u-focus table{table-layout:fixed;font-size:13px}.u-focus td,.u-focus th{white-space:pre-line;overflow-wrap:anywhere}.u-focus th:first-child{width:25%}.u-focus th:last-child{width:25%}.pmu-metrics{overflow-x:auto}.pmu-metrics table{min-width:1500px}.pmu-metrics th:first-child{width:20%}.pmu-metrics th:last-child{width:14%}details>summary{cursor:pointer;font-weight:600;padding:12px;background:#edf2f7}</style>')
@@ -3351,15 +3438,18 @@ def _html_preview(report, out):
     parts.append(_focus_source_html(report))
     case_counts = collections.Counter(case['name'] for case in report['cases'])
     for case_index, case in enumerate(report["cases"]):
+        mark("生成case " + str(case_index + 1) + "/" + str(len(report['cases'])) + "：" + case['name'])
         focus_case_index = case_index if case_counts[case['name']] > 1 else None
         heading = case['name'] + (' · 组合序号' + str(case_index + 1) if focus_case_index is not None else '')
         parts.append('<h2>' + esc(heading) + '</h2><p>' + esc(_case_scope(case)) + '</p>')
         parts.append('<p>' + esc(_case_parameters(case)) + '</p>')
-        for identity in ("method1", "method2"):
+        for identity in METHOD_IDS:
             method = _method(case, identity)
             parts.append('<section><h3>' + esc(_layer_mean_name(method)) + '</h3><p>' +
                          esc(_rank_note(method)) + '；采样均值</p>')
             parts.append('<p>' + esc(_rank_selection_text(method)) + '</p>')
+            if identity == "method3":
+                parts.append('<p>' + esc(METHOD3_SCOPE) + '</p>')
             parts.append('<p>' + esc(_case_parameters(case)) + '</p>')
             parts.append(_html_table(["完整周期(ms)", "TPOT(ms/token)", "预测单卡吞吐(token/s/card)", "状态"],
                          [[_target(method, "cycle_ms"), _target(method, "tpot_ms"), _target(method, "per_device_tokens_s"), _layer_mean_status(method)]]))
@@ -3378,7 +3468,12 @@ def _html_preview(report, out):
                 parts.append(_residual_html(diagnostic, capture.get("rank")))
     parts.append('</html>')
     path = Path(out).with_suffix('.html')
-    path.write_text(_html_navigation(''.join(parts)), encoding='utf-8')
+    document = ''.join(parts)
+    mark("正文生成完成（" + format(len(document) / (1024 * 1024), ".2f") + " Mi字符）；组装图表目录")
+    document = _html_navigation(document)
+    mark("图表目录完成；写入HTML文件")
+    path.write_text(document, encoding='utf-8')
+    mark("HTML写入完成")
     return path
 
 
@@ -3397,7 +3492,7 @@ def _check_result_cells(book, report):
     sheets = {sheet.name: sheet for sheet in book.sheets}
     for case_index, case in enumerate(report["cases"]):
         canonical = {method.get("id"): method for method in (case.get("projection") or {}).get(METHOD_SET, [])}
-        for identity, method_sheet in (("method1", SHEETS[4]), ("method2", SHEETS[5])):
+        for identity, method_sheet in (("method1", SHEETS[4]), ("method2", SHEETS[5]), ("method3", SHEETS[9])):
             method = canonical.get(identity) or {}
             publishable = method.get("status") == "LAYER_MEAN_ESTIMATE" and not method.get("reasons")
             for sheet_name in (SHEETS[0], method_sheet):
@@ -3421,7 +3516,7 @@ def _check_result_cells(book, report):
 def build_workbook(out, *, report=None, report_data=None, cases=None, reference=None,
                    reference_unit='unknown', preview=False, detail_rows=DEFAULT_DETAIL_ROWS, progress=None,
                    expected_method_set=None, align_source_rank=False, refresh_bound=False,
-                   bound_profile=None, bound_template=None):
+                   bound_profile=None, bound_template=None, add_method3=False):
     """Render a core report or an honestly empty configuration preview.
 
     ``report_data`` reuses an already loaded report without parsing its JSON
@@ -3451,15 +3546,18 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
         raise ValueError('--preview只用于--cases；真实报告状态由核心JSON决定')
     if align_source_rank and (cases is not None or preview):
         raise ValueError('--align-source-rank只用于已有报告JSON，不能用于配置预览')
+    if add_method3 and (cases is not None or preview):
+        raise ValueError('--add-method3只用于已有报告JSON，不能用于配置预览')
     refresh_bound = refresh_bound or bound_profile is not None
     if (refresh_bound or bound_template is not None) and (cases is not None or preview):
         raise ValueError('bound更新及模板只用于已有报告JSON，不能用于配置预览')
     aligned_path = Path(out).with_suffix('.source_rank.json') if align_source_rank else None
     bound_path = Path(out).with_suffix('.bound.json') if refresh_bound else None
+    method3_path = Path(out).with_suffix('.method3.json') if add_method3 else None
     if aligned_path is not None and aligned_path.resolve() == Path(report).resolve():
         raise ValueError('对齐后的JSON不能覆盖输入报告；请为--out选择另一个文件名')
     protected = [Path(value).resolve() for value in (report, bound_profile) if value is not None]
-    outputs = [Path(value).resolve() for value in (out, Path(out).with_suffix('.html'), aligned_path, bound_path, bound_template)
+    outputs = [Path(value).resolve() for value in (out, Path(out).with_suffix('.html'), aligned_path, bound_path, method3_path, bound_template)
                if value is not None]
     if len(outputs) != len(set(outputs)) or any(value in protected for value in outputs):
         raise ValueError('输出及bound模板必须使用独立路径，不能覆盖输入报告或profile')
@@ -3489,8 +3587,11 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
                         lambda: _preview_report(cases) if cases is not None else _read_json(report))
     stage("校验核心报告", lambda: _validate_report(payload))
     if align_source_rank:
-        payload = stage("按外推前源整轮均值对齐两方法rank", lambda: _align_source_rank(payload))
+        payload = stage("按外推前源整轮均值对齐各方法rank", lambda: _align_source_rank(payload))
         stage("校验共同源rank报告", lambda: _validate_report(payload))
+    if add_method3:
+        payload = stage("从已存源证据补充方法3（通信零增量）", lambda: _add_method3(payload))
+        stage("校验方法3报告", lambda: _validate_report(payload))
     if refresh_bound:
         profile = stage("读取bound硬件与工作量依据", lambda: _read_json(bound_profile)) if bound_profile is not None else None
         payload = stage("离线更新流水候选和Roofline证据", lambda: _refresh_operator_bounds(payload, profile))
@@ -3515,13 +3616,16 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
     stage(SHEETS[6], lambda: _reference_sheet(book,payload,reference,reference_unit))
     stage(SHEETS[7], lambda: _formula_sheet(book,payload))
     stage(SHEETS[8], lambda: _review_sheet(book,payload,report or cases))
+    stage(SHEETS[9], lambda: _method_sheet(book,payload,'method3',SHEETS[9]))
     stage("核对Excel关键结果", lambda: _check_result_cells(book, payload))
     path = stage("写入XLSX", lambda: book.save(out))
-    stage("写入HTML预览", lambda: _html_preview(payload,path))
+    stage("写入HTML预览", lambda: _html_preview(payload,path,progress=progress))
     if aligned_path is not None:
         stage("保存共同源rank核心JSON", lambda: _save_source_rank_report(aligned_path, payload))
     if bound_path is not None:
         stage("保存bound更新核心JSON", lambda: _save_source_rank_report(bound_path, payload))
+    if method3_path is not None:
+        stage("保存方法3核心JSON", lambda: _save_source_rank_report(method3_path, payload))
     return Path(path)
 
 
@@ -3536,7 +3640,9 @@ def main():
     parser.add_argument('--reference-unit',choices=('unknown','us','ms'),default='unknown')
     parser.add_argument('--out',type=Path,default=Path('10T模型推理估算.xlsx'))
     parser.add_argument('--align-source-rank',action='store_true',
-                        help='将旧JSON按外推前源整轮均值最大rank对齐两方法；不读CSV，另存.source_rank.json')
+                        help='将旧JSON按外推前源整轮均值最大rank对齐各方法；不读CSV，另存.source_rank.json')
+    parser.add_argument('--add-method3',action='store_true',
+                        help='由已存源证据补充通信零增量方法3；不读CSV，另存.method3.json')
     parser.add_argument('--refresh-bound',action='store_true',
                         help='用已存PMU离线更新流水候选及缺失证据；另存.bound.json，不读取CSV')
     parser.add_argument('--bound-profile',type=Path,
@@ -3556,6 +3662,7 @@ def main():
         path=build_workbook(args.out,report=args.report,cases=args.cases,reference=args.reference,
                             reference_unit=args.reference_unit,preview=args.preview,detail_rows=args.detail_rows,
                             align_source_rank=args.align_source_rank,
+                            add_method3=args.add_method3,
                             refresh_bound=args.refresh_bound, bound_profile=args.bound_profile,
                             bound_template=args.bound_template,
                             progress=lambda name: print('Excel阶段：'+name, file=sys.stderr, flush=True))
@@ -3566,6 +3673,8 @@ def main():
     print('HTML预览：'+str(path.with_suffix('.html').resolve()))
     if args.align_source_rank:
         print('共同源rank核心JSON：'+str(path.with_suffix('.source_rank.json').resolve()))
+    if args.add_method3:
+        print('方法3核心JSON：'+str(path.with_suffix('.method3.json').resolve()))
     if args.refresh_bound or args.bound_profile is not None:
         print('bound更新核心JSON：'+str(path.with_suffix('.bound.json').resolve()))
     if args.bound_template is not None:

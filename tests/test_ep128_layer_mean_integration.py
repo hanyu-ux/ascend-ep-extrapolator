@@ -583,7 +583,7 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
         reference = HERE / 'examples/communication-reference.synthetic.csv'
         report['communication_reference'] = {'rows': core.read_reference(reference)}
         methods = self.attach(report, native)
-        self.assertEqual([row['selected_rank'] for row in methods], ['dp1', 'dp1'])
+        self.assertEqual([row['selected_rank'] for row in methods], ['dp1', 'dp1', 'dp1'])
         # Method2's target-model maximum is dp0, but the source full-round
         # mean selects dp1 before either extrapolation is evaluated.
         target_ranks = {row['rank']: row for row in methods[1]['per_rank']}
@@ -648,7 +648,7 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
             self.assertEqual(payload, before)
             with ZipFile(out) as archive:
                 self.assertIsNone(archive.testzip())
-                for index, method in zip((5, 6), methods):
+                for index, method in zip((5, 6, 10), methods):
                     # Follow the worksheet -> drawing -> chart relationships,
                     # so an unattached chart part cannot satisfy this test.
                     rels = ET.fromstring(archive.read(f'xl/worksheets/_rels/sheet{index}.xml.rels'))
@@ -690,7 +690,7 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
                     self.assertIn('SYNTHETIC_U_main_to_draft_1', xml)
                     self.assertIn('SYNTHETIC_U_draft_to_nextmain_7', xml)
             html = out.with_suffix('.html').read_text(encoding='utf-8')
-            self.assertEqual(html.count('class="operator-drilldown"'), 6)
+            self.assertEqual(html.count('class="operator-drilldown"'), 9)
             self.assertIn('operator-ledger', html)
             self.assertIn('operator-hotspots', html)
             self.assertIn('PayloadCopy', html)

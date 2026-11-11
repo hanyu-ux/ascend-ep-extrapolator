@@ -74,9 +74,14 @@ class ExcelDiagnosticsTests(unittest.TestCase):
         self.assertIn(519.4321, book["估算总览"][1].values())
         self.assertIn(str(source), book["复核记录"][1].values())
         self.assertTrue(out.with_suffix(".html").is_file())
-        self.assertEqual([message for message in stages if not message.startswith(INPUT_DIAGNOSTIC_PREFIXES)],
+        self.assertEqual([message for message in stages if not message.startswith((*INPUT_DIAGNOSTIC_PREFIXES, "HTML："))],
                          ["复用已加载核心报告", "校验核心报告", *renderer.SHEETS,
                           "核对Excel关键结果", "写入XLSX", "写入HTML预览"])
+        html_stages = [message for message in stages if message.startswith("HTML：")]
+        self.assertEqual(len(html_stages), 5)
+        self.assertIn("生成case 1/1", html_stages[1])
+        self.assertIn("组装图表目录", html_stages[2])
+        self.assertIn("HTML写入完成", html_stages[-1])
         origin = next(message for message in stages if message.startswith("输入报告："))
         self.assertIn("复用内存报告（来源路径仅为标签）", origin)
         self.assertIn(str(source.resolve()), origin)
@@ -130,7 +135,7 @@ class ExcelDiagnosticsTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "阶段=校验核心报告"):
                 renderer.build_workbook(self.base / "invalid.xlsx", report=self.base / "source.json",
                                         report_data=data, progress=stages.append)
-            self.assertEqual([message for message in stages if not message.startswith(INPUT_DIAGNOSTIC_PREFIXES)],
+            self.assertEqual([message for message in stages if not message.startswith((*INPUT_DIAGNOSTIC_PREFIXES, "HTML："))],
                              ["复用已加载核心报告", "校验核心报告"])
         self.assertFalse((self.base / "invalid.xlsx").exists())
 

@@ -307,6 +307,24 @@ class LayerMeanRendererTests(unittest.TestCase):
         self.assertEqual(report, before)
         return out, read_book(out)
 
+    def bs_overview_original_rows(self, cells):
+        """Read only the original method1/2 table, identified by its D header.
+
+        Method3 has a separate raw table with the same case names. Those rows
+        must not satisfy checks of the original two methods' saved values.
+        """
+        rows = []
+        headers = sorted(int(cell[1:]) for cell, value in cells.items()
+                         if re.fullmatch(r'D\d+', cell) and value == '方法一rank')
+        for header in headers:
+            self.assertEqual(cells.get('B' + str(header)), '采样组合')
+            self.assertEqual(cells.get('H' + str(header)), '方法二rank')
+            row = header + 1
+            while 'B' + str(row) in cells:
+                rows.append((row, cells['B' + str(row)]))
+                row += 1
+        return rows
+
     def chart_parts_by_sheet(self, out, book):
         """Follow actual OOXML relationships, independent of chart numbering."""
         ns = {'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
@@ -493,7 +511,7 @@ class LayerMeanRendererTests(unittest.TestCase):
         for name, *_ in declarations:
             self.assertIn('<td>' + name + '</td>', table)
         for line in parameter_lines:
-            self.assertEqual(preview.count('<p>' + line + '</p>'), 3)
+            self.assertEqual(preview.count('<p>' + line + '</p>'), 4)  # case plus three method sections
         self.assertNotIn('Neff=6.399999', preview)
         self.assertIn('非实测', table)
         self.assertRegex(renderer.RENDERER_VERSION, r'^\d{8}\.\d+\.')
@@ -617,7 +635,7 @@ class LayerMeanRendererTests(unittest.TestCase):
             self.assertEqual(int(title_cell.get('s')), renderer.xlsx_writer.STYLE_IDS['section'])
             self.assertEqual(book[sheet_name][0].find('.//{*}row[@r="' + title[1:] + '"]').get('ht'), '30')
         preview = out.with_suffix('.html').read_text(encoding='utf-8')
-        self.assertEqual(preview.count('class="operator-drilldown"'), 6)
+        self.assertEqual(preview.count('class="operator-drilldown"'), 9)
         self.assertEqual(preview.count('class="operator-chart"'), 12)
         self.assertIn('关键路径及优化收益尚未验证', preview)
         self.assertIn('SYNTHETIC_OPERATOR_SCOPE', preview)
@@ -850,8 +868,8 @@ class LayerMeanRendererTests(unittest.TestCase):
                 start = preview.index('class="case-parameters"')
                 table = preview[start:preview.index('</table>', start)]
                 self.assertEqual(table.count('<th>'), 5 if with_legacy_rate else 4)
-                self.assertEqual(preview.count('<p>' + first_line + '</p>'), 3)
-                self.assertEqual(preview.count('<p>' + second_line + '</p>'), 3)
+                self.assertEqual(preview.count('<p>' + first_line + '</p>'), 4)
+                self.assertEqual(preview.count('<p>' + second_line + '</p>'), 4)
                 self.assertNotIn('声明的平均草稿接受比例=未声明', preview)
                 # Spellings are explained once, rather than repeated in every case.
                 self.assertEqual(preview.count('synthetic_acceptance_length'), 1)
@@ -1161,9 +1179,8 @@ class LayerMeanRendererTests(unittest.TestCase):
         s_section = next(int(cell[1:]) for cell, value in cells.items()
                          if re.fullmatch(r'A\d+', cell) and isinstance(value, str)
                          and value.startswith('固定BS，不同投机步长S'))
-        rows = [(int(cell[1:]), value) for cell, value in cells.items()
-                if re.fullmatch(r'B\d+', cell) and int(cell[1:]) < s_section
-                and value in {case['name'] for case in report['cases']}]
+        rows = [(row, value) for row, value in self.bs_overview_original_rows(cells)
+                if row < s_section and value in {case['name'] for case in report['cases']}]
         self.assertEqual(len(rows), 5)
         cases = {case['name']: case for case in report['cases']}
         for row, name in rows:
@@ -1216,8 +1233,10 @@ class LayerMeanRendererTests(unittest.TestCase):
         self.assertIn('一个BS', cells['G' + str(index_rows[-1][0])])
         single = ordered[-1]
         for name in ('估算总览', '方法1估算', '方法2估算'):
-            original_rows = [int(cell[1:]) for cell, value in book[name][1].items()
-                             if re.fullmatch(r'B\d+', cell) and value == single['name']]
+            original_rows = ([row for row, value in self.bs_overview_original_rows(book[name][1])
+                              if value == single['name']] if name == '估算总览' else
+                             [int(cell[1:]) for cell, value in book[name][1].items()
+                              if re.fullmatch(r'B\d+', cell) and value == single['name']])
             self.assertEqual(len(original_rows), 1)
             self.assertEqual(book[name][1]['A' + str(original_rows[0])], 16.)
         ns = {'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart'}
@@ -1943,8 +1962,8 @@ class LayerMeanRendererTests(unittest.TestCase):
             self.assertEqual(cells['I' + str(card_row + 1)], method['per_device_tokens_s'])
         preview = out.with_suffix('.html').read_text()
         for title in titles:
-            self.assertEqual(len(re.findall(r'<h4(?:\s[^>]*)?>' + re.escape(title), preview)), 2, title)
-        self.assertEqual(preview.count('class="method-stage-expansion"'), 10)
+            self.assertEqual(len(re.findall(r'<h4(?:\s[^>]*)?>' + re.escape(title), preview)), 3, title)
+        self.assertEqual(preview.count('class="method-stage-expansion"'), 15)
 
     def test_incomplete_main_attention_class_keeps_table_and_suppresses_only_its_chart(self):
         for attention, title in zip(('CSA', 'HCA'), MAIN_DRILLDOWN_TITLES):

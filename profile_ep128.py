@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Offline HC layer means, two communication estimates and per-card throughput.
+"""Offline HC layer means, three communication scenarios and per-card throughput.
 
 Standard library only. Measure eight main and three draft layers from native
 kernel CSVs, exclude main0 from reference means, and select one shared rank by
-its source full-cycle mean before both estimates. The renderer consumes the
+its source full-cycle mean before all estimates. The renderer consumes the
 results without estimating again.
 """
 import argparse
@@ -30,7 +30,7 @@ import tempfile
 import time
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261110.6.operator_bound_evidence"
+PROFILE_VERSION = "20261111.1.method3"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
 
@@ -3955,6 +3955,12 @@ def result_rows(report):
 
 
 LAYER_MEAN_STATUS = "LAYER_MEAN_ESTIMATE"
+LAYER_MEAN_METHOD_IDS = ("method1", "method2", "method3")
+LAYER_MEAN_METHOD_NAMES = {
+    "method1": "方法1：按层类型均值＋逻辑通信倍率",
+    "method2": "方法2：按层类型均值＋历史通信倍率",
+    "method3": "方法3：按层类型均值＋通信不变、仅专家计算增量",
+}
 LAYER_MEAN_ASSUMPTIONS = [
     "Per-rank/per-round means group by model role and attention kind, pooling hash and normal routing; main layer0 is excluded from reference means by default.",
     "A layer wall is its first HCPre start to final HCPost end, not proof of complete Python-layer ownership. Target depth multiplies these observed wall means.",
@@ -3975,6 +3981,33 @@ def _lm_number(value, label, positive=False):
     if type(value) not in (int, float) or not math.isfinite(value) or positive and value <= 0:
         raise ValueError(label + " must be " + ("positive " if positive else "") + "finite")
     return float(value)
+
+
+def _lm_method_assumptions(method_id):
+    assumptions = list(LAYER_MEAN_ASSUMPTIONS)
+    if method_id == "method3":
+        assumptions[4] = ("Method3 retains each target layer's observed Dispatch/Combine duration: "
+            "both multipliers are exactly 1 and extra_ms_per_call is 0. Only the named routed GMM "
+            "receives the existing role TopK delta; target layer counts and boundary treatment remain unchanged. "
+            "This is per-layer communication identity, not constant whole-round communication across added layers.")
+    return assumptions
+
+
+def _lm_method3_communication(shapes):
+    return {"model": "observed_duration_identity_per_target_layer", "remote_ratio": 1.,
+            "extra_ms_per_call": 0., "basis": "explicit_communication_identity_scenario",
+            "scope": "per_target_layer; target layer-count extrapolation is retained",
+            "multipliers": {role: {"dispatch": 1., "combine": 1.} for role in shapes}}
+
+
+def _lm_method3_metadata(method):
+    method["warnings"].append("METHOD3_PER_LAYER_COMMUNICATION_IDENTITY_NOT_CONSTANT_WHOLE_ROUND_COMMUNICATION")
+    method["formula"] = ("R=NHCA*mean(Wmain_HCA+delta)+NCSA*mean(Wmain_CSA+delta)+"
+        "Ndraft*mean(Wdraft_SWA+delta)+source_main_gaps+Nadded_main*mean(reference_main_gaps)+"
+        "source_draft_gaps+U; U=Rsource-source_main_chain-source_draft_chain; "
+        "delta=GMM*(Ktarget/Ksource-1); mD=mC=1; extra_ms_per_call=0; "
+        "Dispatch/Combine identity is per target layer, not whole round")
+    return method
 
 
 
@@ -5036,8 +5069,8 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
     missing_compute = sum(not proof["matched_calls"] for proof in all_evidence)
     if missing_compute:
         warnings.append("ROUTED_GMM_UNMEASURED_UNCHANGED_TOPK: source/target compute metrics remain unknown; zero modeled delta follows from unchanged TopK only")
-    return {"id": method_id, "name": "方法1：按层类型均值＋逻辑通信倍率" if method_id == "method1" else "方法2：按层类型均值＋历史通信倍率",
-            "status": LAYER_MEAN_STATUS, "reasons": [], "assumptions": list(LAYER_MEAN_ASSUMPTIONS), "warnings": warnings,
+    method = {"id": method_id, "name": LAYER_MEAN_METHOD_NAMES[method_id],
+            "status": LAYER_MEAN_STATUS, "reasons": [], "assumptions": _lm_method_assumptions(method_id), "warnings": warnings,
             "cycle_ms": selected["cycle_ms"], "per_device_tokens_s": selected["per_device_tokens_s"],
             "global_tokens_s": selected["global_tokens_s"], "tpot_ms": selected["tpot_ms"],
             "source_cycle_ms": selected["source_cycle_ms"], "selected_rank": selected["rank"],
@@ -5053,6 +5086,7 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
                                  "missing_metric_policy": "None, never zero source cost; zero delta permitted only for unchanged TopK"},
             "reference_policy": {"exclude_main_layers": sorted(excluded), "grouping": "role+attention, hash/normal pooled"},
             "formula": "R=NHCA*mean(Wmain_HCA+delta)+NCSA*mean(Wmain_CSA+delta)+Ndraft*mean(Wdraft_SWA+delta)+source_main_gaps+Nadded_main*mean(reference_main_gaps)+source_draft_gaps+U; U=Rsource-source_main_chain-source_draft_chain; delta=D*(mD-1)+C*(mC-1)+GMM*(Ktarget/Ksource-1)+2*extra_ms_per_call; extra_ms_per_call=" + str(communication.get("extra_ms_per_call", 0.)) + "ms (one fixed addition per Dispatch/Combine target call)"}
+    return _lm_method3_metadata(method) if method_id == "method3" else method
 
 
 
@@ -5131,7 +5165,7 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
                                   for cycle in rounds]
         except (ValueError, KeyError, OSError, TypeError, ArithmeticError) as error:
             source_errors.append(str(error))
-        for method_id in ("method1", "method2"):
+        for method_id in LAYER_MEAN_METHOD_IDS:
             comm = {}
             try:
                 if source_errors:
@@ -5152,7 +5186,7 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
                             "extra_ms_per_call": METHOD1_EXTRA_US / 1000, "basis": "layer_mean_scaling_assumption",
                             "multipliers": {role: {component: ratio * shape["target"]["num_experts_per_tok"] / shape["source"]["num_experts_per_tok"]
                                                    for component in ("dispatch", "combine")} for role, shape in shapes.items()}}
-                else:
+                elif method_id == "method2":
                     declaration = {"communication": {"method2": {"basis": "assumed",
                                    "description": "explicit old layer-mean historical ratio transfer assumption",
                                    "fit": "log2_ols_ep16_extrapolation", "reference_bs": config["bs"]}}}
@@ -5160,6 +5194,8 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
                                                        report.get("communication_reference", {}).get("rows", []))
                     if errors:
                         raise ValueError("; ".join(errors))
+                else:
+                    comm = _lm_method3_communication(shapes)
                 method = _lm_estimate_method(result, prepared, shapes, target_schedule, comm, method_id, excluded,
                                              operator_cache=operator_cache, rank_selection=rank_selection)
                 method["warnings"].extend(coverage_warnings)
@@ -5170,8 +5206,8 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
                 source_summary = _lm_source_summary(prepared) if prepared else []
                 source_reference = next((row for row in source_summary
                                          if row["rank"] == rank_selection["selected_rank"]), None)
-                method = {"id": method_id, "name": "方法1：按层类型均值＋逻辑通信倍率" if method_id == "method1" else "方法2：按层类型均值＋历史通信倍率",
-                          "status": "UNAVAILABLE", "reasons": [str(error)], "assumptions": list(LAYER_MEAN_ASSUMPTIONS),
+                method = {"id": method_id, "name": LAYER_MEAN_METHOD_NAMES[method_id],
+                          "status": "UNAVAILABLE", "reasons": [str(error)], "assumptions": _lm_method_assumptions(method_id),
                           "warnings": coverage_warnings, "coverage": coverage,
                           "cycle_ms": None, "per_device_tokens_s": None, "global_tokens_s": None,
                           "tpot_ms": None, "selected_rank": None, "source_rank": rank_selection["selected_rank"],
@@ -5185,7 +5221,7 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
         result["projection"]["layer_mean_methods"] = methods
         result["projection"]["display_method_set"] = "layer_mean_methods"
         result["projection"]["rank_selection"] = rank_selection
-    report.setdefault("contract", {})["layer_mean"] = "per-rank/per-round attention-kind means; main0 reference excluded by default; original chain boundaries and cross-role/tail residual retained once; both methods share the rank selected by retained source full-cycle mean before extrapolation; explicit uncalibrated estimate"
+    report.setdefault("contract", {})["layer_mean"] = "per-rank/per-round attention-kind means; main0 reference excluded by default; original chain boundaries and cross-role/tail residual retained once; all methods share the rank selected by retained source full-cycle mean before extrapolation; method3 retains per-target-layer communication durations and only the existing routed-GMM TopK delta; explicit uncalibrated estimate"
     return report
 
 
@@ -5193,6 +5229,323 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
 def attach_layer_mean_report(report):
     """Project HC layer means; ownership/calibration declarations are not inputs."""
     return _attach_layer_mean_estimates(report, read_capture, b_schedule, b_shapes, b_comm)
+
+
+def _lm_stored_boundary_means(case, rank, source_schedule, excluded):
+    """Optional independent HC-boundary checks; no native kernels are reread.
+
+    Compact historical reports can omit layer timestamps. Complete source
+    aggregate closure is still required below; present timestamps must agree.
+    """
+    measured, = [row for row in case["measurements"] if row["rank"] == rank]
+    rounds = measured["rounds"]
+    if all("layers" not in cycle for cycle in rounds):
+        return None
+    residual_windows(measured)
+    expected = [(role, number, attention) for role, number, attention, _ in source_schedule]
+    class_walls, roles, excluded_walls = collections.defaultdict(list), collections.defaultdict(list), []
+    for cycle in rounds:
+        layers = sorted(cycle["layers"], key=lambda row: _lm_exact_ns(row["start_ns"]))
+        if [(row.get("role"), row.get("layer"), row.get("attention")) for row in layers] != expected:
+            raise ValueError("stored HC boundaries disagree with the source schedule for " + rank)
+        walls = {}
+        for layer in layers:
+            wall = (_lm_exact_ns(layer["end_ns"]) - _lm_exact_ns(layer["start_ns"])) / 1e6
+            if "wall_ms" in layer and not math.isclose(_lm_number(layer["wall_ms"], "stored HC wall", True),
+                    wall, rel_tol=1e-12, abs_tol=1e-8):
+                raise ValueError("stored HC wall disagrees with its exact boundaries for " + rank)
+            walls[layer["role"], layer["layer"]] = wall
+        for key in {(row["role"], row["attention"]) for row in layers}:
+            retained = [walls[row["role"], row["layer"]] for row in layers
+                if (row["role"], row["attention"]) == key and (row["role"] != "main" or row["layer"] not in excluded)]
+            if retained:
+                class_walls[key].append(statistics.fmean(retained))
+        excluded_walls.append(math.fsum(walls["main", number] for number in excluded))
+        for role in ("main", "draft"):
+            selected = [row for row in layers if row["role"] == role]
+            gaps = [(_lm_exact_ns(right["start_ns"]) - _lm_exact_ns(left["end_ns"])) / 1e6
+                    for left, right in zip(selected, selected[1:])]
+            reference = [gap for gap, left, right in zip(gaps, selected, selected[1:])
+                         if role != "main" or left["layer"] not in excluded and right["layer"] not in excluded]
+            wall = math.fsum(walls[role, row["layer"]] for row in selected)
+            roles[role].append({"source_layer_envelopes_ms": wall, "source_gap_ms": math.fsum(gaps),
+                "source_chain_ms": wall + math.fsum(gaps),
+                "reference_gap_mean_ms": statistics.fmean(reference) if reference else 0.})
+    return {"class_walls": {key: statistics.fmean(values) for key, values in class_walls.items()},
+            "roles": {role: {field: statistics.fmean(row[field] for row in values) for field in values[0]}
+                      for role, values in roles.items()},
+            "excluded_wall_ms": statistics.fmean(excluded_walls)}
+
+
+def _lm_stored_method3_source(case, donor, shapes, source_schedule, excluded, selection):
+    """Recover source aggregates only, never another method's modeled deltas.
+
+    The estimator is affine in the stored source means. One internal aggregate
+    record therefore suffices to evaluate its mean, but is not a recovered HC
+    round. The caller removes this internal record from exported round tables.
+    """
+    ranks = [row["rank"] for row in selection["per_rank"]]
+    stored = donor.get("per_rank") or []
+    if (not isinstance(stored, list) or any(not isinstance(row, dict) for row in stored)
+            or len(stored) != len(ranks) or len({row.get("rank") for row in stored}) != len(stored)
+            or {row.get("rank") for row in stored} != set(ranks)):
+        raise ValueError("stored source class means do not cover each measured rank exactly once")
+    schedule_classes = collections.defaultdict(list)
+    schedule_roles = collections.defaultdict(list)
+    for role, number, attention, _ in source_schedule:
+        schedule_roles[role].append(number)
+        if role != "main" or number not in excluded:
+            schedule_classes[role, attention].append(number)
+    prepared, operator_cache, sample_counts = {}, {}, {}
+    source_fields = ("source_layers", "source_layer_envelopes_ms", "source_gap_ms", "source_gap_count",
+                     "reference_gap_count", "reference_gap_mean_ms", "source_chain_ms")
+    for rank in ranks:
+        record, = [row for row in stored if row["rank"] == rank]
+        measured, = [row for row in selection["per_rank"] if row["rank"] == rank]
+        source_ms = _lm_number(record.get("source_cycle_ms"), "stored source cycle", True)
+        if not math.isclose(source_ms, measured["source_cycle_ms"], rel_tol=1e-12, abs_tol=1e-8):
+            raise ValueError("stored source cycle disagrees with retained source measurements for " + rank)
+        boundaries = _lm_stored_boundary_means(case, rank, source_schedule, excluded)
+        classes = record.get("class_means") or []
+        if not isinstance(classes, list) or any(not isinstance(row, dict) for row in classes):
+            raise ValueError("stored source classes must be a list of objects for " + rank)
+        keyed = {(row.get("role"), row.get("attention")): row for row in classes}
+        if len(keyed) != len(classes) or set(keyed) != set(schedule_classes):
+            raise ValueError("stored source classes do not match the source schedule for " + rank)
+        values = {}
+        for key, row in keyed.items():
+            references = row.get("reference_layers")
+            if references != schedule_classes[key]:
+                raise ValueError("stored reference layers disagree with the excluded source schedule for " + rank)
+            mean = {field: _lm_number(row.get(field), "stored source " + field, field == "wall_ms")
+                    for field in ("wall_ms", "dispatch_ms", "combine_ms")}
+            if min(mean["dispatch_ms"], mean["combine_ms"]) < 0 or mean["dispatch_ms"] + mean["combine_ms"] > mean["wall_ms"] + 1e-8:
+                raise ValueError("stored source communication is outside the layer wall for " + rank)
+            routed = row.get("routed_compute_ms")
+            mean["routed_compute_ms"] = None if routed is None else _lm_number(routed, "stored source routed GMM")
+            # routed_compute_ms is a native GMM interval union, not the sum
+            # of possibly overlapping kernel calls exported in kernel_sum_ms.
+            if routed is not None and (routed < 0 or mean["dispatch_ms"] + mean["combine_ms"] + routed > mean["wall_ms"] + 1e-8):
+                raise ValueError("stored source routed GMM/communication exceed the layer wall for " + rank)
+            if boundaries and not math.isclose(mean["wall_ms"], boundaries["class_walls"][key],
+                    rel_tol=1e-12, abs_tol=1e-8):
+                raise ValueError("stored source class wall disagrees with retained HC boundaries for " + rank)
+            samples = row.get("samples")
+            if samples is not None and (type(samples) is not int or samples != len(references) * measured["rounds"]):
+                raise ValueError("stored source sample count disagrees with retained layers/rounds for " + rank)
+            values[key] = [(number, mean) for number in references]
+            sample_counts[rank, key] = samples
+        roles = {}
+        role_rows = record.get("role_details") or []
+        if (not isinstance(role_rows, list) or any(not isinstance(row, dict) for row in role_rows)
+                or len(role_rows) != 2 or {row.get("role") for row in role_rows} != {"main", "draft"}):
+            raise ValueError("stored source role boundary accounting is missing for " + rank)
+        for row in role_rows:
+            role = row["role"]
+            source = {field: _lm_number(row.get(field), "stored source " + field) for field in source_fields}
+            references = schedule_roles[role]
+            reference_gaps = sum(role != "main" or left not in excluded and right not in excluded
+                                 for left, right in zip(references, references[1:]))
+            if (any(value < 0 for value in source.values()) or source["source_layers"] != len(schedule_roles[role])
+                    or source["source_gap_count"] != len(schedule_roles[role]) - 1
+                    or source["reference_gap_count"] != reference_gaps
+                    or not math.isclose(source["source_layer_envelopes_ms"] + source["source_gap_ms"],
+                                        source["source_chain_ms"], rel_tol=1e-12, abs_tol=1e-8)):
+                raise ValueError("stored source role walls/gaps do not close for " + rank + "/" + role)
+            if boundaries and any(not math.isclose(source[field], expected, rel_tol=1e-12, abs_tol=1e-8)
+                                  for field, expected in boundaries["roles"][role].items()):
+                raise ValueError("stored source role gaps/walls disagree with retained HC boundaries for " + rank)
+            roles[role] = source
+        partition = record.get("source_partition") or {}
+        if not isinstance(partition, dict):
+            raise ValueError("stored source partition must be an object for " + rank)
+        excluded_wall = _lm_number(partition.get("excluded_reference_layer_wall_ms"), "stored excluded source wall")
+        if excluded_wall < 0 or boundaries and not math.isclose(excluded_wall, boundaries["excluded_wall_ms"],
+                rel_tol=1e-12, abs_tol=1e-8):
+            raise ValueError("stored excluded source wall disagrees with retained HC boundaries for " + rank)
+        for role in ("main", "draft"):
+            reference_wall = math.fsum(len(rows) * rows[0][1]["wall_ms"] for (name, _), rows in values.items() if name == role)
+            if not math.isclose(reference_wall + (excluded_wall if role == "main" else 0.),
+                    roles[role]["source_layer_envelopes_ms"], rel_tol=1e-12, abs_tol=1e-8):
+                raise ValueError("stored reference class walls do not close to the source layer envelopes for " + rank)
+        residual = _lm_number(partition.get("residual_ms"), "stored source residual")
+        if residual < 0 or not math.isclose(math.fsum(row["source_chain_ms"] for row in roles.values()) + residual,
+                                           source_ms, rel_tol=1e-12, abs_tol=1e-8):
+            raise ValueError("stored source chains/residual do not close to the retained cycle for " + rank)
+        for field, expected in (("source_cycle_ms", source_ms), ("partition_total_ms", source_ms),
+                                ("source_main_chain_ms", roles["main"]["source_chain_ms"]),
+                                ("source_draft_chain_ms", roles["draft"]["source_chain_ms"])):
+            if not math.isclose(_lm_number(partition.get(field), "stored source " + field), expected,
+                                rel_tol=1e-12, abs_tol=1e-8):
+                raise ValueError("stored source partition disagrees with its boundary accounting for " + rank)
+        stage_groups = _aligned_source_rank_stages(donor, record, rank)
+        source_stages, cache = {}, {}
+        for key, references in schedule_classes.items():
+            matched = [group for group in stage_groups if (group.get("role"), group.get("attention")) == key
+                       and group.get("reference_layers") == references and group.get("rounds") == measured["rounds"]]
+            group = matched[0] if len(matched) == 1 else {}
+            source_stages[key] = [{"layer": number, "status": group.get("status", "UNAVAILABLE"),
+                "reason": group.get("reason") or "stored same-rank source stages are unavailable",
+                "stage_rows": group.get("stage_rows") or []} for number in references]
+            for stage in group.get("stage_rows") or []:
+                breakdown = stage.get("operator_breakdown") or {}
+                if breakdown.get("status") == "MATCHED":
+                    native_rows = [row for row in breakdown.get("rows", []) if row.get("kind") != "model_delta"]
+                    kernels = breakdown.get("kernels") or []
+                    examples = [row.get("example") for row in native_rows + kernels]
+                    same_rank = all(isinstance(example, dict) and example.get("rank") == rank
+                        and all(record.get("rank") == rank for record in example.get("records", []))
+                        for example in examples)
+                    cache[key, stage["stage_key"]] = {"status": "MATCHED" if same_rank else "UNAVAILABLE", "rounds": 1,
+                        "reason": None if same_rank else "stored operator examples do not establish same-rank source provenance",
+                        "reference_layers": references, "layer_round_samples": breakdown.get("layer_round_samples"),
+                        "rows": native_rows, "kernels": kernels}
+        prepared[rank] = [{"round_id": "stored_source_aggregate_not_a_measured_round",
+            "source_cycle_ms": source_ms, "roles": roles, "class_values": values,
+            "source_partition": partition, "compute_evidence": [], "class_stage_values": source_stages}]
+        operator_cache[rank] = cache
+    return prepared, operator_cache, sample_counts
+
+
+def _lm_method3_arithmetic(method):
+    """Evidence-independent signature used only to retain a valid saved M3.
+
+    A fresh report may contain real per-round evidence which an aggregate
+    redraw cannot recover. Keep that evidence when all modeled arithmetic
+    agrees; recompute stale/conflicting estimates instead of accepting an id.
+    """
+    scalar = ("status", "cycle_ms", "per_device_tokens_s", "global_tokens_s", "tpot_ms", "source_cycle_ms",
+              "selected_rank", "source_rank")
+    class_fields = ("role", "attention", "reference_layers", "target_layers", "wall_ms", "dispatch_ms", "combine_ms",
+        "routed_compute_ms", "target_wall_ms", "dispatch_target_ms", "combine_target_ms", "routed_compute_target_ms",
+        "dispatch_delta_ms", "combine_delta_ms", "routed_compute_delta_ms")
+    def fields(row, names):
+        return {field: row.get(field) for field in names}
+    def stages(groups):
+        return [{**fields(group, ("role", "attention", "status", "reference_layers", "target_layers", "rounds",
+                      "source_wall_ms", "target_wall_ms", "target_total_ms")),
+                 "stages": [fields(row, ("stage_key", "stage_order", "source_ms", "delta_ms", "target_ms",
+                                          "target_total_ms", "cycle_share")) for row in group.get("stage_rows", [])]}
+                for group in groups or []]
+    comm = method.get("communication") or method.get("comm_model") or {}
+    return {**fields(method, scalar), "communication": fields(comm, ("model", "remote_ratio", "extra_ms_per_call", "multipliers")),
+        "classes": [fields(row, class_fields) for row in method.get("class_means", [])],
+        "roles": method.get("role_details"), "partition": method.get("source_partition"),
+        "breakdown": method.get("breakdown"), "stages": stages(method.get("target_stage_breakdowns")),
+        "ranks": [{**fields(rank, ("rank", *scalar[1:6])),
+            "classes": [fields(row, class_fields) for row in rank.get("class_means", [])],
+            "roles": rank.get("role_details"), "partition": rank.get("source_partition"), "breakdown": rank.get("breakdown"),
+            "stages": stages(rank.get("target_stage_breakdowns"))}
+            for rank in method.get("per_rank", [])]}
+
+
+def _lm_same_arithmetic(left, right):
+    if type(left) in (int, float) and type(right) in (int, float):
+        return math.isfinite(left) and math.isfinite(right) and math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-8)
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_lm_same_arithmetic(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_lm_same_arithmetic(a, b) for a, b in zip(left, right))
+    return type(left) is type(right) and left == right
+
+
+def add_method3_report(report):
+    """Pure offline method3 from saved source means; no CSV reads or mutation.
+
+    Existing method1/2 objects and values are retained. Incomplete source
+    accounting makes method3 unavailable. No per-round results are invented.
+    """
+    if not isinstance(report, dict) or not isinstance(report.get("cases"), list):
+        raise ValueError("method3 addition requires a report with a cases list")
+    cases = []
+    for case in report["cases"]:
+        projection = case.get("projection") or {}
+        methods = projection.get("layer_mean_methods") or []
+        existing = [method for method in methods if method.get("id") == "method3"]
+        if len(existing) > 1:
+            raise ValueError("duplicate method3 entries in case=" + str(case.get("name")))
+        selection = _lm_source_rank_selection(case)
+        for method in methods:
+            if (method.get("status") == LAYER_MEAN_STATUS and not method.get("reasons")
+                    and method.get("selected_rank") != selection["selected_rank"]):
+                raise ValueError("case=" + str(case.get("name")) + ": stored methods do not use the common source rank; "
+                                 "run --align-source-rank before --add-method3")
+        provenance = {"mode": "offline_from_stored_source_aggregates", "source_csv_read": False,
+            "per_round_results_reconstructed": False, "rank": selection["selected_rank"],
+            "arithmetic": "recompute target classes, original source gaps/residual and throughput; never reuse target deltas"}
+        comm = {}
+        try:
+            config, model = case["config"], case["source_model"]
+            source_schedule, target_schedule, errors = b_schedule(model, config, case.get("target_model"))
+            shapes, shape_errors = b_shapes(model, case.get("target_model"), config)
+            if errors or shape_errors:
+                raise ValueError("; ".join(errors + shape_errors))
+            excluded_list = config.get("exclude_target_layers", [0])
+            if (not isinstance(excluded_list, list) or len(set(excluded_list)) != len(excluded_list)
+                    or any(type(number) is not int or not 0 <= number < model["num_hidden_layers"] for number in excluded_list)):
+                raise ValueError("stored excluded reference layers are not valid source layer numbers")
+            excluded = set(excluded_list)
+            donor = next((method for method in methods if method.get("per_rank")), None)
+            if donor is None:
+                raise ValueError("stored per-rank source class means/boundary accounting are unavailable")
+            prepared, operator_cache, sample_counts = _lm_stored_method3_source(
+                case, donor, shapes, source_schedule, excluded, selection)
+            comm = _lm_method3_communication(shapes)
+            method = _lm_estimate_method(case, prepared, shapes, target_schedule, comm, "method3", excluded,
+                                         operator_cache=operator_cache, rank_selection=selection)
+            round_counts = {row["rank"]: row["rounds"] for row in selection["per_rank"]}
+            for rank in method["per_rank"]:
+                rank.pop("rounds", None)
+                for row in rank["class_means"]:
+                    original_samples = sample_counts[rank["rank"], (row["role"], row["attention"])]
+                    if type(original_samples) is int and original_samples > 0:
+                        row["samples"] = original_samples
+                for detail in rank["detail_rows"]:
+                    detail["rounds_averaged"] = round_counts[rank["rank"]]
+                for group in rank["target_stage_breakdowns"]:
+                    group["rounds"] = round_counts[rank["rank"]]
+            for detail in method["detail_rows"]:
+                detail["rounds_averaged"] = round_counts[detail["rank"]]
+            for group in method["target_stage_breakdowns"]:
+                group["rounds"] = round_counts[selection["selected_rank"]]
+                for stage in group.get("stage_rows", []):
+                    breakdown = stage.get("operator_breakdown") or {}
+                    if breakdown.get("status") == "MATCHED":
+                        breakdown["rounds"] = group["rounds"]
+            method["compute_coverage"] = dict(donor.get("compute_coverage") or {
+                "reference_layer_calls": None, "matched_reference_layers": None,
+                "unmatched_reference_layers": None, "missing_metric_policy": "stored coverage was not exported"},
+                source_scope="stored source evidence; no new per-round kernel observations")
+            method["coverage"] = donor.get("coverage") or {}
+            for warning in donor.get("warnings") or []:
+                if (warning.startswith("PARTIAL_SOURCE_RANK_COVERAGE") or warning.startswith("PACKED_OR_OPAQUE_GMM")
+                        or warning.startswith("ROUTED_GMM_UNMEASURED")) and warning not in method["warnings"]:
+                    method["warnings"].append(warning)
+            method["aggregation"] = "stored_source_means_on_shared_source_cycle_rank"
+            provenance["source_mean_method"] = donor.get("id")
+        except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+            method = {"id": "method3", "name": LAYER_MEAN_METHOD_NAMES["method3"], "status": "UNAVAILABLE",
+                "reasons": ["Cannot derive method3 from saved source evidence: " + str(error)],
+                "assumptions": _lm_method_assumptions("method3"), "warnings": [], "coverage": {},
+                "cycle_ms": None, "per_device_tokens_s": None, "global_tokens_s": None, "tpot_ms": None,
+                "source_cycle_ms": selection["selected_source_cycle_ms"], "selected_rank": None,
+                "source_rank": selection["selected_rank"], "rank_selection": selection, "per_rank": [],
+                "class_means": [], "role_details": [], "source_partition": {}, "breakdown": [],
+                "detail_rows": [], "compute_evidence": [], "target_stage_breakdowns": [],
+                "communication": comm, "comm_model": comm}
+        method["offline_derivation"] = provenance
+        if existing:
+            if (method["status"] == LAYER_MEAN_STATUS
+                    and _lm_same_arithmetic(_lm_method3_arithmetic(existing[0]), _lm_method3_arithmetic(method))):
+                method = existing[0]
+            else:
+                method["warnings"].append("METHOD3_RECOMPUTED_CONFLICTING_OR_UNVERIFIABLE_STORED_RESULT")
+        cases.append(dict(case, projection=dict(projection,
+            layer_mean_methods=[item for item in methods if item.get("id") != "method3"] + [method])))
+    contract = dict(report.get("contract") or {})
+    contract["method3_addition"] = ("offline from retained source aggregates; original methods unchanged; "
+                                    "per-target-layer communication identity; no CSV reread or recovered per-round evidence")
+    return dict(report, cases=cases, contract=contract)
 
 
 
@@ -5392,7 +5745,7 @@ def export_report(report, out, reference_rows, progress=None):
     write('problems.txt', lambda path: atomic_text(path, '\n'.join(f['case'] + ': ' + f['error'] for f in report['failures']) + ('\n' if report['failures'] else '')))
     architecture = ['# HC层均值估算', '',
                     '源8主＋3草稿；主0只排除参考，目标层数按配置。',
-                    '方法一每次Dispatch/Combine加14μs；方法二历史比值不叠加。',
+                    '方法一每次Dispatch/Combine加14μs；方法二历史比值不叠加；方法三按目标单层保留源通信耗时、仅具名专家GMM按TopK变化。',
                     '层间衔接与轮次剩余区间分别计入；单卡吞吐按物理卡数均摊。', '']
     for case in report['cases']:
         architecture += ['## ' + case['name'], '']
@@ -5410,8 +5763,8 @@ def render_html(path, report):
     parts = ['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
              '<title>10T模型推理估算</title><style>body{font:15px system-ui;margin:32px;background:#f4f7fb;color:#182c45}h1{font-size:26px}p{line-height:1.8}table{border-collapse:collapse;width:100%;background:white}td,th{padding:12px;border:1px solid #d7e0eb;text-align:left}th{background:#163551;color:white}</style>',
              '<h1>10T模型推理估算</h1>',
-             '<p>主0只排除参考；HCA/CSA按各rank各轮同类型均值外推，草稿独立。通信及路由GMM只加变化量。方法一每次Dispatch/Combine目标耗时加14μs；方法二不再叠加。</p>',
-             '<p>源层间衔接及轮次剩余区间分别保留一次。先按外推前源完整周期均值选rank，两种方法共用该rank；吞吐按目标物理卡数均摊。</p>',
+             '<p>主0只排除参考；HCA/CSA按各rank各轮同类型均值外推，草稿独立。通信及路由GMM只加变化量。方法一每次Dispatch/Combine目标耗时加14μs；方法二不再叠加；方法三保持目标单层通信耗时不变，仅专家GMM增加TopK对应变化量，目标层数仍按配置外推。</p>',
+             '<p>源层间衔接及轮次剩余区间分别保留一次。先按外推前源完整周期均值选rank，各方法共用该rank；吞吐按目标物理卡数均摊。</p>',
              '<table><thead><tr>' + ''.join('<th>' + esc(key) + '</th>' for key in fields) + '</tr></thead><tbody>']
     parts.extend('<tr>' + ''.join('<td>' + esc(row.get(key)) + '</td>' for key in fields) + '</tr>' for row in rows)
     parts += ['</tbody></table><p>Q_card＝1000×BS×目标DP×Neff/(目标周期ms×目标物理卡数)。</p>',

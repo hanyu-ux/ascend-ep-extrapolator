@@ -61,19 +61,27 @@ class CLIIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(case['source']['aggregate']['per_device_tokens_s'], 166400 / 1.1)
             self.assertFalse(case['source']['aggregate']['rank_coverage_complete'])
             methods = p.displayed_methods(case)
+            self.assertEqual([method['id'] for method in methods], ['method1', 'method2', 'method3'])
             self.assertEqual(methods[0]['status'], 'LAYER_MEAN_ESTIMATE', methods[0]['reasons'])
             self.assertEqual(methods[1]['status'], 'UNAVAILABLE')
+            self.assertEqual(methods[2]['status'], 'LAYER_MEAN_ESTIMATE', methods[2]['reasons'])
+            self.assertEqual(methods[2]['selected_rank'], methods[0]['selected_rank'])
+            for row in methods[2]['class_means']:
+                self.assertEqual(row['dispatch_delta_ms'], 0)
+                self.assertEqual(row['combine_delta_ms'], 0)
             self.assertIsNotNone(report['communication_reference']['error'])
             self.assertFalse(list((base / 'report').glob('*_ownership_template.json')))
             with ZipFile(base / 'report/10T模型推理估算.xlsx') as archive:
                 self.assertIsNone(archive.testzip())
                 root = ET.fromstring(archive.read('xl/workbook.xml'))
-                self.assertEqual(len(root.findall('{*}sheets/{*}sheet')), 9)
+                self.assertEqual(len(root.findall('{*}sheets/{*}sheet')), 10)
             with (base / 'report/最终结果.csv').open(encoding='utf-8-sig', newline='') as stream:
                 rows = list(csv.DictReader(stream))
-            self.assertEqual(len(rows), 2)
+            self.assertEqual(len(rows), 3)
             self.assertGreater(float(rows[0]['单卡吞吐(token/s/卡)']), 0)
             self.assertEqual(rows[1]['周期(ms)'], '')
+            self.assertEqual(rows[2]['方法'], methods[2]['name'])
+            self.assertAlmostEqual(float(rows[2]['周期(ms)']), methods[2]['cycle_ms'])
 
     def test_default_prediction_reuses_the_single_native_csv_read(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -93,7 +101,7 @@ class CLIIntegrationTests(unittest.TestCase):
                 self.assertEqual({str(path.relative_to(base)) for path in base.rglob('*')}, before_files)
                 self.assertEqual({path.name for path in Path.cwd().iterdir()}, before_cwd)
                 # The source was already measured; no further parse is needed
-                # to apply the two estimation methods to those measurements.
+                # to apply all three estimation methods to those measurements.
                 Path(result['captures'][0]['path']).unlink()
                 report = {'cases': [result]}
                 p.attach_layer_mean_report(report)
@@ -114,13 +122,14 @@ class CLIIntegrationTests(unittest.TestCase):
             self.assertTrue(case['source']['aggregate']['rank_coverage_complete'])
             self.assertEqual(case['projection']['display_method_set'], 'layer_mean_methods')
             methods = p.displayed_methods(case)
+            self.assertEqual([method['id'] for method in methods], ['method1', 'method2', 'method3'])
             classes = {(row['role'], row['attention']): row for row in methods[0]['class_means']}
             self.assertEqual(classes['main', 'HCA']['reference_layers'], [1, 3, 5, 7])
             self.assertEqual(classes['main', 'CSA']['reference_layers'], [2, 4, 6])
             self.assertEqual(sum(row['target_layers'] for row in classes.values() if row['role'] == 'main'), 61)
             with (base / 'report/最终结果.csv').open(encoding='utf-8-sig', newline='') as stream:
                 final_rows = list(csv.DictReader(stream))
-            self.assertEqual(len(final_rows), 2)
+            self.assertEqual(len(final_rows), 3)
             for row, method in zip(final_rows, methods):
                 self.assertAlmostEqual(float(row['单卡吞吐(token/s/卡)']), method['per_device_tokens_s'])
                 self.assertAlmostEqual(float(row['周期(ms)']), method['cycle_ms'])
@@ -331,11 +340,17 @@ raise SystemExit(p.main())
                     self.assertEqual(fit['observed_ep32'], expected32)
             with (base / 'out/最终结果.csv').open(encoding='utf-8-sig', newline='') as stream:
                 rows = list(csv.DictReader(stream))
-            self.assertEqual(len(rows), 6)
+            self.assertEqual(len(rows), 9)
             self.assertEqual({row['采样组合'] for row in rows}, set(expected))
+            for item in report['cases']:
+                methods = p.displayed_methods(item)
+                self.assertEqual([method['id'] for method in methods], ['method1', 'method2', 'method3'])
+                own_rows = [row for row in rows if row['采样组合'] == item['name']]
+                self.assertEqual([row['方法'] for row in own_rows], [method['name'] for method in methods])
+                self.assertEqual(methods[2]['status'], 'LAYER_MEAN_ESTIMATE', methods[2]['reasons'])
             with ZipFile(base / 'out/10T模型推理估算.xlsx') as archive:
-                self.assertEqual(len(ET.fromstring(archive.read('xl/workbook.xml')).findall('{*}sheets/{*}sheet')), 9)
-                for index in (1, 2, 3, 4, 5, 6, 8, 9):
+                self.assertEqual(len(ET.fromstring(archive.read('xl/workbook.xml')).findall('{*}sheets/{*}sheet')), 10)
+                for index in (1, 2, 3, 4, 5, 6, 8, 9, 10):
                     xml = archive.read(f'xl/worksheets/sheet{index}.xml').decode()
                     for name in expected:
                         self.assertIn(name, xml)
@@ -412,10 +427,10 @@ raise SystemExit(p.main())
             self.assertNotAlmostEqual(*(method['cycle_ms'] for method in methods.values()))
             with (base / 'out/最终结果.csv').open(encoding='utf-8-sig', newline='') as stream:
                 rows = list(csv.DictReader(stream))
-            self.assertEqual(len(rows), 4)
+            self.assertEqual(len(rows), 6)
             for name, (speculative, effective, _, _) in expected.items():
                 own_rows = [row for row in rows if row['采样组合'] == name]
-                self.assertEqual(len(own_rows), 2)
+                self.assertEqual(len(own_rows), 3)
                 for row in own_rows:
                     self.assertEqual(int(row['草稿token数S']), speculative)
                     self.assertAlmostEqual(float(row['有效输出Neff(含bonus)']), effective)
@@ -527,7 +542,8 @@ raise SystemExit(p.main())
             self.assertEqual(after['failures'], [])
             old_methods = p.displayed_methods(before['cases'][0])
             new_methods = p.displayed_methods(after['cases'][0])
-            self.assertEqual(len(new_methods), 2)
+            self.assertEqual([method['id'] for method in new_methods], ['method1', 'method2', 'method3'])
+            self.assertEqual([method['id'] for method in old_methods], ['method1', 'method2', 'method3'])
             for old, new in zip(old_methods, new_methods):
                 self.assertEqual(new['status'], 'LAYER_MEAN_ESTIMATE', new['reasons'])
                 for field in ('cycle_ms', 'tpot_ms', 'per_device_tokens_s', 'global_tokens_s',
@@ -547,7 +563,7 @@ raise SystemExit(p.main())
             self.assertEqual((baseline_out / '最终结果.csv').read_bytes(),
                              (expanded_out / '最终结果.csv').read_bytes())
             html = (expanded_out / '10T模型推理估算.html').read_text(encoding='utf-8')
-            self.assertEqual(html.count('class="operator-drilldown"'), 6)
+            self.assertEqual(html.count('class="operator-drilldown"'), 9)
             self.assertTrue((expanded_out / '10T模型推理估算.xlsx').is_file())
 
     def test_input_listing_and_inventory_do_not_analyze_cycles_or_scan_trace(self):

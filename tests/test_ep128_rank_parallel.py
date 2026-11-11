@@ -110,7 +110,8 @@ class RankParallelTests(unittest.TestCase):
                 self.assertEqual([capture["rank"] for capture in case["captures"]], ["dp1", "dp0"])
                 self.assertEqual([measured["rank"] for measured in case["measurements"]], ["dp1", "dp0"])
                 self.assertEqual({method["id"]: method["status"] for method in core.displayed_methods(case)},
-                                 {"method1": "LAYER_MEAN_ESTIMATE", "method2": "LAYER_MEAN_ESTIMATE"})
+                                 {"method1": "LAYER_MEAN_ESTIMATE", "method2": "LAYER_MEAN_ESTIMATE",
+                                  "method3": "LAYER_MEAN_ESTIMATE"})
                 self.assertNotIn("_prepared_layer_means", case)
 
     def test_bad_rank_and_duplicate_native_hash_fail_whole_case_in_input_order(self):

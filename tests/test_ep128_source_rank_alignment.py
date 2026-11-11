@@ -32,6 +32,8 @@ def legacy_report():
     attach(single, {"dp0": native["dp0"]})
     attach(report, native)
     case = report["cases"][0]
+    # This fixture represents a saved report from before method3 existed.
+    case["projection"]["layer_mean_methods"] = case["projection"]["layer_mean_methods"][:2]
     original = single["cases"][0]["projection"]["layer_mean_methods"][0]
     full = case["projection"]["layer_mean_methods"][0]
     old_first = dict(original, per_rank=full["per_rank"], detail_rows=full["detail_rows"],

@@ -48,7 +48,7 @@ class BoundExportTests(unittest.TestCase):
                     self.assertEqual(old[key], new[key])
         self.assertFalse(derived["operator_bound_analysis"]["source_csv_read"])
         with ZipFile(out) as archive:
-            self.assertEqual(archive.read("xl/workbook.xml").count(b"<sheet "), 9)
+            self.assertEqual(archive.read("xl/workbook.xml").count(b"<sheet "), 10)
             for index in (5, 6):
                 text = archive.read(f"xl/worksheets/sheet{index}.xml").decode()
                 self.assertIn("MTE1", text)
