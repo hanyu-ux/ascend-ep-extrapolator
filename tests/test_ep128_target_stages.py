@@ -1,9 +1,14 @@
-"""Target ten-stage explanations, using synthetic native anchor timelines."""
+"""Ten-stage layer explanations plus independent whole-layer operator hotspots.
+
+Layer stages remain available; only stage-level operator contribution ledgers
+are removed. Fixtures are synthetic and make no hardware performance claims.
+"""
 import copy
 from pathlib import Path
 import statistics
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import profile_ep128 as core
 from tests.test_ep128_layer_mean import attach, synthetic_report
@@ -29,7 +34,167 @@ def native_stage_report(*args, **kwargs):
     return report, native
 
 
+
 def groups(method):
+    return {(row["role"], row["attention"]): row for row in method["operator_hotspots"]}
+
+
+def assert_no_layer_drilldown(test, value):
+    """Forbid removed operator contribution ledgers, retaining layer/U stages."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            test.assertNotIn(key, ("operator_breakdown",))
+            assert_no_layer_drilldown(test, item)
+    elif isinstance(value, list):
+        for item in value:
+            assert_no_layer_drilldown(test, item)
+
+
+class FullLayerHotspotTests(unittest.TestCase):
+    def test_full_hc_windows_keep_all_three_types_and_parent_estimates(self):
+        report, native = native_stage_report()
+        methods = attach(report, native)
+        first = methods[0]
+        self.assertAlmostEqual(first["cycle_ms"], 1262.592)
+        self.assertAlmostEqual(first["tpot_ms"], 1262.592 / 5.2)
+        self.assertAlmostEqual(first["per_device_tokens_s"], 20800 / 1262.592)
+        self.assertEqual(set(groups(first)), {("main", "CSA"), ("main", "HCA"), ("draft", "SWA")})
+        expected_layers = {("main", "HCA"): [1, 3, 5, 7], ("main", "CSA"): [2, 4, 6],
+                           ("draft", "SWA"): [0, 1, 2]}
+        for key, group in groups(first).items():
+            self.assertEqual(group["status"], "MATCHED", group["reason"])
+            self.assertEqual(group["reference_layers"], expected_layers[key])
+            self.assertEqual(group["rounds"], 1)
+            self.assertEqual(group["layer_round_samples"], len(expected_layers[key]))
+            self.assertTrue(group["kernels"])
+            sums = [row["kernel_sum_ms"] for row in group["kernels"]]
+            self.assertEqual(sums, sorted(sums, reverse=True))
+            self.assertTrue({"HcPre", "HcPost", "SparseAttnSharedkv", "GroupedMatmul", "SwiGlu"}
+                            <= {row["name"] for row in group["kernels"]})
+            for row in group["kernels"]:
+                self.assertIn("pmu", row)
+                self.assertFalse({"source_ms", "target_ms", "delta_ms", "cycle_share"} & row.keys())
+        assert_no_layer_drilldown(self, methods)
+
+    def test_missing_internal_attention_anchor_does_not_disable_full_layer_hotspots(self):
+        report, native = native_stage_report({"dp0": [1., 3.]})
+        baseline = attach(copy.deepcopy(report), copy.deepcopy(native))[0]
+        layer = report["cases"][0]["measurements"][0]["rounds"][1]["layers"][1]
+        native["dp0"]["tasks"] = [task for task in native["dp0"]["tasks"]
+            if not (int(layer["start_ns"]) <= task.start_ns < int(layer["end_ns"])
+                    and task.name == "SparseAttnSharedkv")]
+        method = attach(report, native)[0]
+        for field in ("cycle_ms", "class_means", "role_details", "source_partition", "breakdown"):
+            self.assertEqual(method[field], baseline[field])
+        group = groups(method)["main", "HCA"]
+        self.assertEqual(group["status"], "MATCHED", group["reason"])
+        attention = next(row for row in group["kernels"] if row["name"] == "SparseAttnSharedkv")
+        self.assertEqual(group["layer_round_samples"], 8)
+        self.assertEqual(attention["calls_mean"], 7 / 8)
+
+    def test_old_single_hc_fixture_needs_no_ten_stage_anchors(self):
+        report, native = synthetic_report()
+        method = attach(report, native)[0]
+        self.assertEqual(method["status"], "LAYER_MEAN_ESTIMATE")
+        self.assertAlmostEqual(method["cycle_ms"], 1262.592)
+        self.assertTrue(all(row["status"] == "MATCHED" and row["kernels"]
+                            for row in method["operator_hotspots"]))
+        assert_no_layer_drilldown(self, method)
+
+    def test_main0_is_excluded_from_every_full_layer_hotspot_group(self):
+        report, native = native_stage_report(layer0_wall=10000)
+        layer = report["cases"][0]["measurements"][0]["rounds"][0]["layers"][0]
+        left = int(layer["start_ns"]) + 900_000
+        native["dp0"]["tasks"].append(SimpleNamespace(name="MainZeroExcluded", op_type="Copy",
+            label="MainZeroExcluded Copy", start_ns=left, end_ns=left + 900_000,
+            input_shapes="1", row_index=99999))
+        native["dp0"]["tasks"].sort(key=lambda task: task.start_ns)
+        method = attach(report, native)[0]
+        for group in method["operator_hotspots"]:
+            if group["role"] == "main":
+                self.assertNotIn(0, group["reference_layers"])
+            self.assertFalse(any(row["name"] == "MainZeroExcluded" for row in group["kernels"]))
+
+    def test_all_methods_share_source_selected_rank_hotspots_without_per_round_payloads(self):
+        report, native = native_stage_report({"dp0": [1., 3.], "dp1": [2.2, 2.2]})
+        reference = Path(__file__).resolve().parents[1] / "examples/communication-reference.synthetic.csv"
+        report["communication_reference"] = {"rows": core.read_reference(reference)}
+        methods = attach(report, native)
+        self.assertEqual([row["selected_rank"] for row in methods], ["dp1"] * 3)
+        for method in methods:
+            self.assertEqual(method["operator_hotspots"], methods[0]["operator_hotspots"])
+            for rank in method["per_rank"]:
+                self.assertNotIn("operator_hotspots", rank)
+                self.assertTrue(all("operator_hotspots" not in cycle for cycle in rank["rounds"]))
+        assert_no_layer_drilldown(self, methods)
+
+
+    def test_attention_preparation_is_source_only_common_rank_evidence_for_all_methods(self):
+        report, native = native_stage_report({"dp0": [1., 3.], "dp1": [2.2, 2.2]})
+        reference = Path(__file__).resolve().parents[1] / "examples/communication-reference.synthetic.csv"
+        report["communication_reference"] = {"rows": core.read_reference(reference)}
+        methods = attach(report, native)
+        expected = methods[0]["attention_prepare_breakdowns"]
+        self.assertEqual(len(expected), 3)
+        for method in methods:
+            self.assertEqual(method["attention_prepare_breakdowns"], expected)
+            stages_by_class = target_groups(method)
+            for group in method["attention_prepare_breakdowns"]:
+                self.assertEqual(group["rank"], "dp1")
+                self.assertEqual(group["rounds"], 2)
+                parent = stages_by_class[group["role"], group["attention"]]
+                self.assertEqual(group["reference_layers"], parent["reference_layers"])
+                self.assertAlmostEqual(group["parent_wall_ms"], parent["stage_rows"][0]["source_ms"])
+                self.assertEqual(group["layer_round_samples"], 2 * len(group["reference_layers"]))
+                self.assertNotIn("target_ms", group)
+                self.assertTrue(all("target_ms" not in row for row in group["rows"]))
+        assert_no_layer_drilldown(self, methods)
+
+    def test_layer_stages_and_hotspots_do_not_restore_operator_contribution_sweeps(self):
+        report, native = native_stage_report()
+        with patch.object(core, "_lm_operator_stage", create=True,
+                          side_effect=AssertionError("removed operator contribution sweep")) as sweep, \
+             patch.object(core, "_lm_operator_target_groups", create=True,
+                          side_effect=AssertionError("removed operator model ledger")) as ledger:
+            method = attach(report, native)[0]
+        self.assertTrue(method["operator_hotspots"])
+        self.assertTrue(all(group["status"] == "MATCHED" for group in method["target_stage_breakdowns"]))
+        sweep.assert_not_called()
+        ledger.assert_not_called()
+        assert_no_layer_drilldown(self, method)
+
+    def test_overlapping_gmm_still_uses_union_for_model_increment(self):
+        report, native = native_stage_report()
+        for measured in report["cases"][0]["measurements"]:
+            for cycle in measured["rounds"]:
+                for layer in cycle["layers"]:
+                    named = [task for task in native[measured["rank"]]["tasks"]
+                             if int(layer["start_ns"]) <= task.start_ns < int(layer["end_ns"]) and core._lm_gmm(task)]
+                    named[1].start_ns = named[0].start_ns + 100000
+                    named[1].end_ns = named[0].end_ns
+        native["dp0"]["tasks"].sort(key=lambda task: task.start_ns)
+        method = attach(report, native)[0]
+        for parent in method["class_means"]:
+            self.assertAlmostEqual(parent["routed_compute_ms"], .25)
+            self.assertAlmostEqual(parent["routed_compute_delta_ms"], .125)
+        for group in method["operator_hotspots"]:
+            self.assertAlmostEqual(sum(row["kernel_sum_ms"] for row in group["kernels"]
+                                       if row["name"] == "GroupedMatmul"), .4)
+
+    def test_unknown_gmm_identity_topk_keeps_unknown_parent_without_fake_kernel(self):
+        report, native = native_stage_report(topk=16)
+        native["dp0"]["tasks"] = [task for task in native["dp0"]["tasks"] if not core._lm_gmm(task)]
+        method = attach(report, native)[0]
+        self.assertEqual(method["status"], "LAYER_MEAN_ESTIMATE")
+        self.assertTrue(all(row["routed_compute_ms"] is None and row["routed_compute_delta_ms"] == 0
+                            for row in method["class_means"]))
+        self.assertTrue(all(group["status"] == "MATCHED" for group in method["operator_hotspots"]))
+        self.assertFalse(any(row["name"] == "GroupedMatmul" for group in method["operator_hotspots"]
+                             for row in group["kernels"]))
+        assert_no_layer_drilldown(self, method)
+
+
+def target_groups(method):
     return {(row["role"], row["attention"]): row for row in method["target_stage_breakdowns"]}
 
 
@@ -41,7 +206,7 @@ class TargetStageTests(unittest.TestCase):
     def assert_closes(self, method):
         classes = {(row["role"], row["attention"]): row for row in method["class_means"]}
         weighted = {"main": 0., "draft": 0.}
-        for key, group in groups(method).items():
+        for key, group in target_groups(method).items():
             parent = classes[key]
             self.assertEqual(group["status"], "MATCHED", group["reason"])
             self.assertEqual(group["reference_layers"], parent["reference_layers"])
@@ -69,7 +234,7 @@ class TargetStageTests(unittest.TestCase):
         self.assertAlmostEqual(method["cycle_ms"], 1262.592)
         self.assertAlmostEqual(method["tpot_ms"], 1262.592 / 5.2)
         self.assertAlmostEqual(method["per_device_tokens_s"], 20800 / 1262.592)
-        for group in groups(method).values():
+        for group in target_groups(method).values():
             rows = stages(group)
             self.assertAlmostEqual(rows["dispatch"]["source_ms"], .5)
             self.assertAlmostEqual(rows["dispatch"]["delta_ms"], .5 * (2.8125 - 1) + .014)
@@ -97,7 +262,7 @@ class TargetStageTests(unittest.TestCase):
         self.assert_closes(second)
         self.assertEqual(second["communication"]["multipliers"]["main"]["dispatch"], 6.)
         self.assertEqual(second["communication"]["multipliers"]["main"]["combine"], 3.75)
-        for group in groups(second).values():
+        for group in target_groups(second).values():
             rows = stages(group)
             self.assertAlmostEqual(rows["dispatch"]["target_ms"], .5 * 6.)
             self.assertAlmostEqual(rows["combine"]["target_ms"], .25 * 3.75)
@@ -113,15 +278,15 @@ class TargetStageTests(unittest.TestCase):
                 attention.end_ns = attention.start_ns + round((.02 + .005 * layer["layer"]) * 1e6)
         method = attach(report, native)[0]
         self.assert_closes(method)
-        self.assertAlmostEqual(stages(groups(method)["main", "HCA"])["attention"]["source_ms"], .04)
-        self.assertAlmostEqual(stages(groups(method)["main", "CSA"])["attention"]["source_ms"], .04)
-        self.assertAlmostEqual(stages(groups(method)["draft", "SWA"])["attention"]["source_ms"], .025)
+        self.assertAlmostEqual(stages(target_groups(method)["main", "HCA"])["attention"]["source_ms"], .04)
+        self.assertAlmostEqual(stages(target_groups(method)["main", "CSA"])["attention"]["source_ms"], .04)
+        self.assertAlmostEqual(stages(target_groups(method)["draft", "SWA"])["attention"]["source_ms"], .025)
 
     def test_lower_topk_keeps_signed_deltas_and_positive_target_phases(self):
         report, native = native_stage_report(topk=8)
         method = attach(report, native)[0]
         self.assert_closes(method)
-        for group in groups(method).values():
+        for group in target_groups(method).values():
             rows = stages(group)
             self.assertAlmostEqual(rows["experts"]["delta_ms"], -.2)
             self.assertAlmostEqual(rows["experts"]["target_ms"], 2.3)
@@ -138,7 +303,7 @@ class TargetStageTests(unittest.TestCase):
         method = attach(report, native)[0]
         self.assert_closes(method)
         self.assertEqual(method["cycle_ms"], baseline["cycle_ms"])
-        for (role, _), group in groups(method).items():
+        for (role, _), group in target_groups(method).items():
             if role == "main":
                 self.assertNotIn(0, group["reference_layers"])
                 self.assertLess(group["source_wall_ms"], 1000)
@@ -148,15 +313,11 @@ class TargetStageTests(unittest.TestCase):
         method = attach(report, native)[0]
         ranks = {row["rank"]: row for row in method["per_rank"]}
         self.assertEqual(method["selected_rank"], "dp1")
-        parent_groups = copy.deepcopy(method["target_stage_breakdowns"])
-        for group in parent_groups:
-            for stage in group["stage_rows"]:
-                self.assertIn("operator_breakdown", stage)
-                stage.pop("operator_breakdown")
-        self.assertEqual(parent_groups, ranks["dp1"]["target_stage_breakdowns"])
+        self.assertEqual(method["target_stage_breakdowns"], ranks["dp1"]["target_stage_breakdowns"])
+        assert_no_layer_drilldown(self, method)
         self.assertTrue(all("operator_breakdown" not in stage for rank in ranks.values()
                             for group in rank["target_stage_breakdowns"] for stage in group["stage_rows"]))
-        self.assertEqual(groups(method)["main", "HCA"]["rounds"], 2)
+        self.assertEqual(target_groups(method)["main", "HCA"]["rounds"], 2)
         for rank in ranks.values():
             self.assert_closes(rank)
             for cycle in rank["rounds"]:
@@ -164,14 +325,14 @@ class TargetStageTests(unittest.TestCase):
                 self.assertTrue(all(row["rounds"] == 1 for row in cycle["target_stage_breakdowns"]))
                 self.assertTrue(all("operator_breakdown" not in stage
                     for group in cycle["target_stage_breakdowns"] for stage in group["stage_rows"]))
-        dp0 = stages(groups(ranks["dp0"])["main", "HCA"])
-        dp1 = stages(groups(ranks["dp1"])["main", "HCA"])
+        dp0 = stages(target_groups(ranks["dp0"])["main", "HCA"])
+        dp1 = stages(target_groups(ranks["dp1"])["main", "HCA"])
         self.assertAlmostEqual(dp0["dispatch"]["source_ms"], 1.)
         self.assertAlmostEqual(dp0["dispatch"]["target_ms"], 1. * 2.8125 + .014)
         self.assertAlmostEqual(dp1["dispatch"]["source_ms"], 1.1)
         self.assertAlmostEqual(dp1["dispatch"]["target_ms"], 1.1 * 2.8125 + .014)
-        averaged = stages(groups(ranks["dp0"])["main", "HCA"])["attention"]
-        samples = [stages(groups(cycle)["main", "HCA"])["attention"] for cycle in ranks["dp0"]["rounds"]]
+        averaged = stages(target_groups(ranks["dp0"])["main", "HCA"])["attention"]
+        samples = [stages(target_groups(cycle)["main", "HCA"])["attention"] for cycle in ranks["dp0"]["rounds"]]
         self.assertAlmostEqual(averaged["cycle_share"], statistics.fmean(row["target_total_ms"] for row in samples)
                                / ranks["dp0"]["cycle_ms"])
         self.assertNotAlmostEqual(averaged["cycle_share"], statistics.fmean(row["cycle_share"] for row in samples), places=10)
@@ -187,17 +348,17 @@ class TargetStageTests(unittest.TestCase):
         self.assertEqual(method["status"], "LAYER_MEAN_ESTIMATE")
         for key in ("cycle_ms", "tpot_ms", "per_device_tokens_s", "global_tokens_s", "selected_rank", "class_means", "role_details"):
             self.assertEqual(method[key], baseline[key])
-        for key, group in groups(method).items():
+        for key, group in target_groups(method).items():
             if key == ("main", "HCA"):
                 self.assertEqual(group["status"], "UNAVAILABLE")
                 self.assertEqual(group["stage_rows"], [])
                 self.assertTrue(group["reason"])
-                self.assertEqual(group["target_total_ms"], groups(baseline)[key]["target_total_ms"])
+                self.assertEqual(group["target_total_ms"], target_groups(baseline)[key]["target_total_ms"])
             else:
                 self.assertEqual(group["status"], "MATCHED")
         source_rounds = method["per_rank"][0]["rounds"]
-        self.assertEqual(groups(source_rounds[0])["main", "HCA"]["status"], "MATCHED")
-        self.assertEqual(groups(source_rounds[1])["main", "HCA"]["status"], "UNAVAILABLE")
+        self.assertEqual(target_groups(source_rounds[0])["main", "HCA"]["status"], "MATCHED")
+        self.assertEqual(target_groups(source_rounds[1])["main", "HCA"]["status"], "UNAVAILABLE")
 
     def test_old_single_hc_fixtures_still_estimate_parent_without_fabricating_stages(self):
         report, native = synthetic_report()
@@ -233,7 +394,7 @@ class TargetStageTests(unittest.TestCase):
         self.assert_closes(method)
         self.assertTrue(all(row["routed_compute_ms"] is None and row["routed_compute_delta_ms"] == 0
                             for row in method["class_means"]))
-        for group in groups(method).values():
+        for group in target_groups(method).values():
             row = stages(group)["experts"]
             self.assertEqual(row["delta_ms"], 0)
             self.assertEqual(row["source_ms"], 2.5)
@@ -253,7 +414,7 @@ class TargetStageTests(unittest.TestCase):
         native["dp0"]["tasks"].sort(key=lambda task: task.start_ns)
         method = attach(report, native)[0]
         self.assert_closes(method)
-        for group in groups(method).values():
+        for group in target_groups(method).values():
             self.assertAlmostEqual(stages(group)["experts"]["delta_ms"], .25 * .5)
             self.assertAlmostEqual(stages(group)["experts"]["target_ms"], 2.5 + .125)
 

@@ -589,21 +589,21 @@ raise SystemExit(p.main())
                 for field in ('cycle_ms', 'tpot_ms', 'per_device_tokens_s', 'global_tokens_s',
                               'selected_rank', 'class_means', 'role_details', 'source_partition', 'breakdown'):
                     self.assertEqual(new[field], old[field], (new['id'], field))
+                self.assertEqual(len(new['operator_hotspots']), 3)
                 self.assertEqual(len(new['target_stage_breakdowns']), 3)
                 for group in new['target_stage_breakdowns']:
                     self.assertEqual(group['status'], 'MATCHED', group['reason'])
                     self.assertEqual(len(group['stage_rows']), 10)
-                    for stage in group['stage_rows']:
-                        ledger = stage['operator_breakdown']
-                        self.assertEqual(ledger['status'], 'MATCHED', ledger.get('reason'))
-                        self.assertAlmostEqual(sum(row['source_ms'] for row in ledger['rows']), stage['source_ms'])
-                        self.assertAlmostEqual(sum(row['target_total_ms'] for row in ledger['rows']),
-                                               stage['target_total_ms'])
-                        self.assertTrue(all(kernel['task_type'] == 'AI_CORE' for kernel in ledger['kernels']))
+                    self.assertAlmostEqual(sum(row['target_ms'] for row in group['stage_rows']), group['target_wall_ms'])
+                    self.assertTrue(all('operator_breakdown' not in stage for stage in group['stage_rows']))
+                for group in new['operator_hotspots']:
+                    self.assertEqual(group['status'], 'MATCHED', group['reason'])
+                    self.assertTrue(group['kernels'])
+                    self.assertTrue(all(kernel['task_type'] == 'AI_CORE' for kernel in group['kernels']))
             self.assertEqual((baseline_out / '最终结果.csv').read_bytes(),
                              (expanded_out / '最终结果.csv').read_bytes())
             html = (expanded_out / '10T模型推理估算.html').read_text(encoding='utf-8')
-            self.assertEqual(html.count('class="operator-drilldown"'), 9)
+            self.assertEqual(html.count('class="operator-hotspot-section"'), 9)
             self.assertTrue((expanded_out / '10T模型推理估算.xlsx').is_file())
 
     def test_input_listing_and_inventory_do_not_analyze_cycles_or_scan_trace(self):

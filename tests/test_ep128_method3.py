@@ -58,13 +58,17 @@ class Method3Tests(unittest.TestCase):
                         self.assertEqual(parent[component + "_target_ms"], parent[component + "_ms"])
                     self.assertAlmostEqual(parent["target_wall_ms"] - parent["wall_ms"],
                                            parent["routed_compute_delta_ms"])
+                self.assertNotIn("operator_hotspots", record)
                 for group in record["target_stage_breakdowns"]:
                     self.assertEqual(group["status"], "MATCHED", group["reason"])
-                    self.assertAlmostEqual(sum(row["target_total_ms"] for row in group["stage_rows"]),
+                    self.assertEqual(len(group["stage_rows"]), 10)
+                    self.assertAlmostEqual(math.fsum(row["target_total_ms"] for row in group["stage_rows"]),
                                            group["target_total_ms"])
                     for stage in group["stage_rows"]:
+                        self.assertNotIn("operator_breakdown", stage)
                         if stage["stage_key"] != "experts":
                             self.assertEqual(stage["delta_ms"], 0)
+        self.assertTrue(all(group["status"] == "MATCHED" for group in method["operator_hotspots"]))
         for row in method["detail_rows"]:
             if row["component"] in ("dispatch", "combine"):
                 self.assertEqual(row["multiplier"], 1)
@@ -129,24 +133,55 @@ class Method3Tests(unittest.TestCase):
             self.assertEqual(parent["samples"], matching["samples"])
         for group in method["target_stage_breakdowns"]:
             self.assertEqual(group["rounds"], 2)
+            self.assertEqual(group["status"], "MATCHED", group.get("reason"))
             for stage in group["stage_rows"]:
-                self.assertEqual(stage["operator_breakdown"]["status"], "MATCHED")
-                self.assertEqual(stage["operator_breakdown"]["rounds"], 2)
-                self.assertAlmostEqual(sum(row["target_ms"] for row in stage["operator_breakdown"]["rows"]),
-                                       stage["target_ms"])
+                self.assertNotIn("operator_breakdown", stage)
+            self.assertAlmostEqual(math.fsum(stage["target_ms"] for stage in group["stage_rows"]),
+                                   group["target_wall_ms"])
+        for group in method["operator_hotspots"]:
+            self.assertEqual(group["rounds"], 2)
+            self.assertEqual(group["status"], "MATCHED", group.get("reason"))
+            self.assertTrue(group["kernels"])
 
-    def test_offline_does_not_need_method2_reference_or_target_stage_evidence(self):
+    def test_offline_does_not_need_method2_reference_or_hotspot_evidence(self):
         report, native = source_rank_report(reference=False)
         attach(report, native)
         legacy = legacy_payload(report)
         for method in legacy["cases"][0]["projection"]["layer_mean_methods"]:
-            method.pop("target_stage_breakdowns", None)
-            for rank in method["per_rank"]:
-                rank.pop("target_stage_breakdowns", None)
+            method.pop("operator_hotspots", None)
         changed = core.add_method3_report(legacy)
         method = changed["cases"][0]["projection"]["layer_mean_methods"][-1]
         self.assertEqual(method["status"], core.LAYER_MEAN_STATUS, method["reasons"])
-        self.assertTrue(all(row["status"] == "UNAVAILABLE" for row in method["target_stage_breakdowns"]))
+        self.assertEqual(method["operator_hotspots"], [])
+
+    def test_offline_attention_preparation_reuses_only_matching_source_evidence(self):
+        report, native = source_rank_report()
+        fresh = by_id(attach(report, native))["method3"]
+        legacy = legacy_payload(report)
+        before = copy.deepcopy(legacy)
+        with mock.patch.object(core, "read_capture", side_effect=AssertionError("no source CSV reread")):
+            method = core.add_method3_report(legacy)["cases"][0]["projection"]["layer_mean_methods"][-1]
+        self.assertEqual(method["attention_prepare_breakdowns"], fresh["attention_prepare_breakdowns"])
+        self.assertEqual(legacy, before)
+        self.assertTrue(method["attention_prepare_breakdowns"])
+        for mode in ("missing", "wrong_rank", "wrong_reference_layers", "wrong_rounds"):
+            with self.subTest(mode=mode):
+                corrupted = legacy_payload(report)
+                for donor in corrupted["cases"][0]["projection"]["layer_mean_methods"]:
+                    if mode == "missing":
+                        donor.pop("attention_prepare_breakdowns", None)
+                    else:
+                        for group in donor["attention_prepare_breakdowns"]:
+                            if mode == "wrong_rank":
+                                group["rank"] = "dp1"
+                            elif mode == "wrong_reference_layers":
+                                group["reference_layers"] = [999]
+                            else:
+                                group["rounds"] += 1
+                result = core.add_method3_report(corrupted)["cases"][0]["projection"]["layer_mean_methods"][-1]
+                self.assertEqual(result["status"], core.LAYER_MEAN_STATUS)
+                self.assertEqual(result["cycle_ms"], fresh["cycle_ms"])
+                self.assertEqual(result["attention_prepare_breakdowns"], [])
 
     def test_offline_missing_or_contradictory_source_closure_is_unavailable(self):
         report, native = source_rank_report()
@@ -249,13 +284,12 @@ class Method3Tests(unittest.TestCase):
                          original["cases"][0]["projection"]["layer_mean_methods"])
         third = changed["cases"][0]["projection"]["layer_mean_methods"][-1]
         count = 0
-        for group in third["target_stage_breakdowns"]:
-            for stage in group["stage_rows"]:
-                for kernel in stage["operator_breakdown"]["kernels"]:
-                    self.assertEqual(kernel["example"]["rank"], "dp0")
-                    if "GroupedMatmul" in kernel["name"]:
-                        count += 1
-                        self.assertAlmostEqual(kernel["pmu"]["metrics"]["aic_mac_ratio"]["value"], .96)
+        for group in third["operator_hotspots"]:
+            for kernel in group["kernels"]:
+                self.assertEqual(kernel["example"]["rank"], "dp0")
+                if "GroupedMatmul" in kernel["name"]:
+                    count += 1
+                    self.assertAlmostEqual(kernel["pmu"]["metrics"]["aic_mac_ratio"]["value"], .96)
         self.assertGreater(count, 0)
 
     def test_wrong_rank_operator_evidence_is_unavailable_without_losing_parent(self):
@@ -263,14 +297,11 @@ class Method3Tests(unittest.TestCase):
         attach(report, native)
         legacy = legacy_payload(report)
         donor = legacy["cases"][0]["projection"]["layer_mean_methods"][0]
-        expert = next(row for row in donor["target_stage_breakdowns"][0]["stage_rows"] if row["stage_key"] == "experts")
-        expert["operator_breakdown"]["kernels"][0]["example"]["rank"] = "dp1"
+        donor["operator_hotspots"][0]["kernels"][0]["example"]["rank"] = "dp1"
         original = copy.deepcopy(legacy)
         method = core.add_method3_report(legacy)["cases"][0]["projection"]["layer_mean_methods"][-1]
         self.assertEqual(method["status"], core.LAYER_MEAN_STATUS, method["reasons"])
-        actual = next(row for row in method["target_stage_breakdowns"][0]["stage_rows"] if row["stage_key"] == "experts")
-        self.assertEqual(actual["operator_breakdown"]["status"], "UNAVAILABLE")
-        self.assertIn("same-rank", actual["operator_breakdown"]["reason"])
+        self.assertEqual(method["operator_hotspots"], [])
         self.assertEqual(legacy, original)
 
     def test_conflicting_existing_method3_is_recomputed_not_silently_retained(self):
@@ -377,8 +408,8 @@ class Method3Tests(unittest.TestCase):
         method = core.add_method3_report(legacy)["cases"][0]["projection"]["layer_mean_methods"][-1]
         self.assertEqual(method["status"], core.LAYER_MEAN_STATUS, method["reasons"])
         self.assertAlmostEqual(method["cycle_ms"], fresh["cycle_ms"])
-        expert = next(row for row in method["target_stage_breakdowns"][0]["stage_rows"] if row["stage_key"] == "experts")
-        self.assertAlmostEqual(sum(row["kernel_sum_ms"] for row in expert["operator_breakdown"]["kernels"]
+        hotspot = method["operator_hotspots"][0]
+        self.assertAlmostEqual(sum(row["kernel_sum_ms"] for row in hotspot["kernels"]
                                    if "GroupedMatmul" in row["name"]), .4)
 
 

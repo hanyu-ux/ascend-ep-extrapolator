@@ -237,7 +237,7 @@ class ExcelDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(renderer.RENDERER_VERSION, result.stdout)
 
-    def test_swa_drilldown_preserves_unknown_zero_and_attention_scope(self):
+    def test_source_layer_stages_return_for_all_types_and_keep_unmatched_values_blank(self):
         diagnostic = dict(status='PARTIAL', scope='SYNTHETIC_HC_MARKER_INTERVAL', stages_csv='synthetic-swa.csv',
             layer_summary=[dict(role='main', layer=0, attention='HCA', reference_eligible=False, rounds=3,
                                 wall_ms_mean=1.234, wall_ms_p50=None, no_recorded_ms_mean=0.)],
@@ -250,11 +250,11 @@ class ExcelDiagnosticsTests(unittest.TestCase):
                            dict(role='main', layer=2, attention='CSA', stage_key='attention',
                                 label='SYNTHETIC_CSA_NOT_SWA', rounds=3, matched_windows=3, status='MATCHED',
                                 duration_ms_mean=88888.)])
-        rows = renderer._swa_stage_rows(diagnostic)
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0][4], .4321)
-        self.assertEqual(rows[0][7:9], [renderer.NA, 0.])
-        self.assertEqual(rows[1][4:], [renderer.NA] * 7)
+        rows = renderer._source_layer_rows(diagnostic)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][:6], ['main', 0, 'HCA', False, 3, 1.234])
+        self.assertEqual(rows[0][6], renderer.NA)
+        self.assertEqual(rows[0][9], 0.)
         report = fixture()
         report['cases'][0]['measurements'][0]['swa_diagnostics'] = diagnostic
         out = self.base / 'swa-diagnostic.xlsx'
@@ -262,15 +262,17 @@ class ExcelDiagnosticsTests(unittest.TestCase):
         cells = read_book(out)[0]['层与组件实测'][1]
         self.assertIn('SYNTHETIC_SWA_ATTENTION', cells.values())
         self.assertIn('SYNTHETIC_PARTIAL_SWA', cells.values())
-        self.assertNotIn('SYNTHETIC_CSA_NOT_SWA', cells.values())
+        self.assertIn('SYNTHETIC_CSA_NOT_SWA', cells.values())
         self.assertNotIn(99999., cells.values())
-        self.assertNotIn(88888., cells.values())
+        self.assertIn(88888., cells.values())
         preview = out.with_suffix('.html').read_text()
         self.assertIn('SYNTHETIC_SWA_ATTENTION', preview)
-        self.assertNotIn('SYNTHETIC_CSA_NOT_SWA', preview)
+        self.assertIn('synthetic-swa.csv', preview)
+        self.assertIn('逐层对照', preview)
+        self.assertIn('SYNTHETIC_CSA_NOT_SWA', preview)
         self.assertIn('未知值显示—，不补0', preview)
 
-    def test_swa_details_are_display_only_and_never_change_cycle_or_tpot(self):
+    def test_layer_overview_is_display_only_and_never_changes_cycle_or_tpot(self):
         report = fixture()
         capture = report['cases'][0]['measurements'][0]
         capture['swa_diagnostics'] = dict(status='MATCHED', scope='SYNTHETIC_ONLY', stages_csv='swa.csv',
@@ -290,7 +292,8 @@ class ExcelDiagnosticsTests(unittest.TestCase):
             for field in ('cycle_ms', 'tpot_ms', 'per_device_tokens_s'):
                 self.assertIn(method[field], book[name][1].values())
             self.assertNotIn(1234567., book[name][1].values())
-        self.assertIn('不加到层链、U、完整周期或TPOT', out.with_suffix('.html').read_text())
+        self.assertIn('逐层对照', out.with_suffix('.html').read_text())
+        self.assertIn('SYNTHETIC_LARGE_DETAIL_ALREADY_INCLUDED', out.with_suffix('.html').read_text())
 
     def test_u_children_stay_with_their_parents_without_changing_parent_partition(self):
         from test_ep128_layer_mean_excel import residual_report

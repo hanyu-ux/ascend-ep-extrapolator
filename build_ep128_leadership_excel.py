@@ -23,7 +23,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261111.3.acceptance_output_fraction"
+RENDERER_VERSION = "20261112.2.case_table_labels"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -257,6 +257,11 @@ def _note(sheet, row, text, warning=False, columns=12):
 
 
 def _table(sheet, row, headers, rows, *, record_rows=None, spans=None, blank_columns=()):
+    # Keep the header on the original row: chart formulas refer to these cells.
+    headers = list(headers)
+    case_label = getattr(sheet, "table_case_label", "")
+    if case_label and headers:
+        headers[0] = _text(headers[0]) + "\n" + case_label
     if getattr(sheet, 'navigation_enabled', False):
         sheet.navigation_entries.append(dict(row=row, kind='表', context=sheet.navigation_context,
             case_index=sheet.navigation_case_index,
@@ -269,7 +274,7 @@ def _table(sheet, row, headers, rows, *, record_rows=None, spans=None, blank_col
             sheet.merge(current, first, current, last, value, style)
     for col, label in enumerate(headers, 1):
         put(row, col, label, "header")
-    sheet.row_height(row, 37)
+    sheet.row_height(row, 50 if case_label else 37)
     current, continued = row + 1, False
     for record in rows:
         if record_rows is not None:
@@ -580,6 +585,16 @@ def _case_parameters(case):
     return label if declaration is None else (label + "；声明的" + declaration["label"] + "=" + rate
         + ("（配置输入，尚未产生估算；" if declaration.get("preview_only") else "（配置假设，非实测；")
         + declaration["formula"] + "）")
+
+
+def _case_table_label(case):
+    """Identify declared conditions without inferring BS/S from a case name."""
+    bs, draft = _case_parameter_values(case)[:2]
+    return "BS" + bs + " · S" + draft
+
+
+def _set_table_case(sheet, case):
+    sheet.table_case_label = _case_table_label(case) if case is not None else ""
 
 
 def _case_parameter_rows(report):
@@ -1449,6 +1464,7 @@ def _overview(book, report):
     row = _bs_overview_section(sheet, row, report)
     row = _s_overview_section(sheet, row, report)
     for case_index, case in enumerate(report["cases"]):
+        _set_table_case(sheet, case)
         _navigation_case(sheet, row, case)
         row = _note(sheet, row, case["name"] + " · " + _case_scope(case), columns=12)
         row = _note(sheet, row, _case_parameters(case), columns=12)
@@ -1467,6 +1483,7 @@ def _overview(book, report):
 
 
 def _layer_mean_method_section(sheet, row, case, case_index, identity, method):
+    _set_table_case(sheet, case)
     row = _note(sheet, row, case["name"] + " · " + _layer_mean_name(method) +
                 " / " + _rank_note(method) + " / " + _layer_mean_status(method), columns=12)
     row = _note(sheet, row, _case_parameters(case), columns=12)
@@ -1502,6 +1519,7 @@ def _source_sheet(book, report):
     book.focus_source_tables = {}
     row = _source_sweeps_section(sheet, _navigation_start(sheet, report), report)
     for case in report["cases"]:
+        _set_table_case(sheet, case)
         _navigation_case(sheet, row, case)
         row = _note(sheet, row, case["name"] + " / " + _text(_source(case).get("scope")))
         row = _table(sheet, row, ["rank", "保留轮次", "单卡均摊条件值(token/s/card)", "本DP请求组条件输出率(token/s)",
@@ -1870,20 +1888,16 @@ def _method_expansion_data(case, method):
             _u_expansion_data(residual, "main_metadata", METHOD_STAGE_TITLES[2])]
 
 
-OPERATOR_LEDGER_HEADERS = ["细项 / 父阶段（已含）", "源覆盖×目标层数\n(ms/完整周期)", "模型增减×目标层数\n(ms/完整周期)",
-                           "合计(ms)", "占完整周期", "类型 / 算子与来源"]
-OPERATOR_LEDGER_SPANS = ((1, 4), (5, 6), (7, 8), (9, 9), (10, 10), (11, 12))
-OPERATOR_KERNEL_HEADERS = ["源实测算子 / 父阶段", "相交调用\n/单层均值", "段内累计\n(ms/单层均值)",
-                          "段内单次均值\n(ms)", "段内单次P90\n(ms)", "native / 指纹与来源"]
+OPERATOR_KERNEL_HEADERS = ["源实测算子 / 统计范围", "相交调用\n/单层均值", "层内累计\n(ms/单层均值)",
+                          "相交单次均值\n(ms)", "相交单次P90\n(ms)", "native / 指纹与来源"]
 OPERATOR_KERNEL_SPANS = ((1, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 12))
-OPERATOR_SCOPE = ("关键路径及优化收益尚未验证。目标互斥区间和有符号模型增减仅展开已有父项，不再计入周期；"
-                  "具名并行组合不分摊给成员，无记录区间不等于CPU瓶颈。源kernel累计可重叠，不能当目标关键耗时或优化收益；"
-                  "调用按段内相交记录统计，跨阶段不可机械累加调用数。完整指纹、成员及样例见核心JSON。")
-OPERATOR_KINDS = {"operator": "单算子覆盖", "parallel": "具名并行组合", "gap": "无设备记录区间", "model_delta": "模型增减（非原生执行）"}
+OPERATOR_SCOPE = ("按所选源rank、同类参考层统计Top8原生算子，保持源实测。"
+                  "kernel累计可因多流重叠大于层跨度，不代表目标关键路径或优化收益。"
+                  "相交调用按层边界裁剪，完整指纹、原始行与轮次示例见核心JSON。")
 PMU_SCOPE = ("以下顺序与上方源实测Top8一一对应；PMU按原生整次调用Duration加权，保持源实测，不乘目标层数或外推倍率。"
              "各流水可以同时工作，活动比不可相加为100%，也不是MFU或理论峰值利用率。"
              "bound为流水活动证据支持的方向判断，不直接证明HBM带宽跑满、关键路径或优化收益。"
-             "若调用跨父阶段，PMU仍属于整次调用；同一调用在不同阶段引用不能相加。")
+             "若调用跨统计窗口，PMU仍属于整次调用；同一调用在不同窗口引用不能相加。")
 PMU_METRICS = (("aic_mac_ratio", "AIC MAC\n矩阵计算"),
                ("aic_mte1_ratio", "AIC MTE1\n片内供数"),
                ("aic_mte2_ratio", "AIC MTE2\nGM读入"), ("aic_fixpipe_ratio", "AIC Fixpipe\n结果搬运"),
@@ -1915,7 +1929,7 @@ def _pmu_metric_text(item):
 
 def _pmu_label(kernel, number):
     # Keep names complete without repeating a long shape in every PMU column.
-    return "K" + str(number) + " · " + _text(kernel.get("op_type") or kernel.get("name")) + "\n父阶段：" + _text(kernel.get("stage_label")) + "\nstream=" + _text(kernel.get("stream_id"))
+    return "K" + str(number) + " · " + _text(kernel.get("op_type") or kernel.get("name")) + "\n统计范围：" + _text(kernel.get("stage_label") or "完整层区间") + "\nstream=" + _text(kernel.get("stream_id"))
 
 
 def _operator_pmu_data(kernels):
@@ -2042,175 +2056,95 @@ def _operator_fingerprint_text(item):
         + ("\n" + _operator_example_text(item.get("example")) if "example" in item else ""))
 
 
-def _operator_label(item, number):
-    if item.get("remainder"):
-        return item["label"]
-    parts = ["#" + str(number) + " " + _text(item.get("stage_label"))]
-    kind = item["kind"]
-    if kind in ("operator", "parallel"):
-        for index, member in enumerate(item["members"], 1):
-            parts.append(("∥ 成员" + str(index) + "：" if kind == "parallel" else "")
-                         + _text(member.get("op_type") or member.get("name") or "未导出名称"))
-            parts.append("输入shape=" + _text(member.get("input_shapes") or "未记录"))
-            parts.append("stream=" + _text(member.get("stream_id"))
-                         + ("；并发实例=" + str(member.get("instances", 1)) if member.get("instances", 1) > 1 else ""))
+def _method_operator_data(method, role, attention, kernel_limit=8):
+    """Read source hotspots only; legacy JSON may supply already collected kernels."""
+    result = dict(attention=attention, title=attention + "源实测Top8算子统计", available=False,
+                  kernel_rows=[], kernel_items=[], note="")
+    selected = method.get("selected_rank")
+    classes = [item for item in method.get("class_means") or []
+               if item.get("role") == role and item.get("attention") == attention]
+    if selected is None or len(classes) != 1:
+        result["note"] = "缺少所选rank或唯一同类参考层；Top算子统计未绘图。"
+        return result
+    reference = classes[0].get("reference_layers")
+    direct = method.get("operator_hotspots")
+    legacy = direct is None
+    groups = method.get("target_stage_breakdowns") if legacy else direct
+    groups = [item for item in groups or [] if isinstance(item, dict)
+              and item.get("role") == role and item.get("attention") == attention]
+    if len(groups) != 1:
+        result["note"] = "缺少唯一Top算子证据；请用新版核心重算；未知值不补0。"
+        return result
+    group = groups[0]
+    rounds, kernels, problems = group.get("rounds"), [], []
+    if legacy:
+        for stage in group.get("stage_rows") or []:
+            breakdown = stage.get("operator_breakdown") or {}
+            if breakdown.get("kernels"):
+                if ("status" in breakdown and breakdown["status"] != "MATCHED") or breakdown.get("reason"):
+                    problems.append("旧JSON热点来源状态不可用")
+                if (("reference_layers" in breakdown
+                     and (breakdown["reference_layers"] != group.get("reference_layers")
+                          or breakdown["reference_layers"] != reference))
+                        or "rounds" in breakdown and breakdown["rounds"] != rounds):
+                    problems.append("旧JSON热点来源参考层或保留轮次与父项不一致")
+            kernels.extend({**item, "stage_label": stage.get("label") or stage.get("stage_key"),
+                            "stage_order": stage.get("stage_order", 0)}
+                           for item in breakdown.get("kernels") or [] if isinstance(item, dict))
     else:
-        parts.append(item["label"].removeprefix("模型增减：").removeprefix("模型增减:") if kind == "model_delta" else item["label"])
-    return "\n".join(line for part in parts for line in _operator_svg_label_lines(part, width=72))
-
-
-def _operator_preview(records, limit):
-    ordered = sorted(records, key=lambda item: (-abs(item["target_total_ms"]), item["stage_order"], item["key"]))
-    retained, rest = ordered[:limit], ordered[limit:]
-    for kind, label in (("operator", "单算子覆盖"), ("parallel", "具名并行组合"), ("gap", "无设备记录区间"),
-                        ("model_positive", "正模型增量"), ("model_negative", "负模型修正")):
-        subset = [item for item in rest if (item["kind"] == kind or item["kind"] == "model_delta"
-                  and (kind == "model_positive" and item["target_total_ms"] >= 0
-                       or kind == "model_negative" and item["target_total_ms"] < 0))]
-        if not subset:
-            continue
-        def sample_span(item):
-            sample = item.get("example") or {}
-            if _number(sample.get("duration_ns")):
-                return sample["duration_ns"]
-            start, end = sample.get("start_ns"), sample.get("end_ns")
-            try:
-                return int(end) - int(start)
-            except (ValueError, TypeError):
-                return -1
-        representative = max(subset, key=sample_span)
-        retained.append(dict(key="remainder_" + kind, kind="model_delta" if kind.startswith("model_") else kind,
-            label="其余" + str(len(subset)) + "项" + label + "合计（非单一热点）", remainder=True,
-            members=[], example=representative.get("example"), stage_label="多个父阶段", stage_order=99,
-            details="\n\n".join(_operator_label(item, index) for index, item in enumerate(subset[:3], 1)),
-            **{field: math.fsum(item[field] for item in subset)
-               for field in ("source_ms", "delta_ms", "target_ms", "target_total_ms", "cycle_share")}))
-    return retained
-
-
-def _method_operator_data(method, role, attention, limit=12, kernel_limit=8):
-    """Only display a complete core operator contract with the same parent means."""
-    result = dict(attention=attention, title=attention + "算子下钻 · 目标贡献", available=False,
-                  target_rows=[], kernel_rows=[], target_items=[], kernel_items=[], note="")
-    parent = _target_layer_expansion_data(method, role, attention, attention + "层内阶段展开")
-    if parent["series"] is None:
-        result["note"] = "目标父阶段不可发布，算子下钻未绘图。" + parent["note"]
-        return result
-    group = next(item for item in method["target_stage_breakdowns"] if item.get("role") == role and item.get("attention") == attention)
-    count, cycle, selected = group["target_layers"], method["cycle_ms"], method["selected_rank"]
-    result["scope"] = ("rank=" + _text(selected) + "；参考层=" + _text(group["reference_layers"])
-        + "；保留轮次=" + str(group["rounds"]) + "；目标同类全部层=" + str(count)
-        + "；完整周期=" + _text(cycle) + " ms。"
-        + ("主0是否作参考以层号清单为准；目标全层数不再扣除参考排除层。" if role == "main" else "草稿完整同类层数由核心提供。"))
+        kernels = group.get("kernels")
     close = lambda a, b: _number(a) and _number(b) and math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-8)
-    all_rows, all_kernels, notes = [], [], []
-
-    def evidence(example, needs_row=False):
-        if (not isinstance(example, dict) or example.get("rank") != selected
-                or example.get("layer") not in group["reference_layers"] or example.get("round_id") is None):
-            return False
-        if needs_row:
-            rows = example.get("row_indices")
-            return (type(example.get("row_index")) is int and example["row_index"] >= 0
-                    or isinstance(rows, list) and bool(rows) and all(type(row) is int and row >= 0 for row in rows))
-        return True
-
-    try:
-        for stage in sorted(group["stage_rows"], key=lambda item: item["stage_order"]):
-            prefix = "父阶段" + str(stage["stage_order"]) + "（" + _text(stage.get("label", stage["stage_key"])) + "）"
-            breakdown = stage.get("operator_breakdown")
-            if not isinstance(breakdown, dict):
-                raise ValueError(prefix + "缺少operator_breakdown；请用新版核心重算")
-            if breakdown.get("status") != "MATCHED" or breakdown.get("reason"):
-                raise ValueError(prefix + "算子证据不可用：" + _text(breakdown.get("reason") or breakdown.get("status")))
-            if breakdown.get("reference_layers") != group["reference_layers"] or breakdown.get("rounds") != group["rounds"]:
-                raise ValueError(prefix + "算子参考层或保留轮次与父项不一致")
-            rows, kernels = breakdown.get("rows"), breakdown.get("kernels")
-            if (not isinstance(rows, list) or not isinstance(kernels, list)
-                    or any(not isinstance(item, dict) for item in rows + kernels)):
-                raise ValueError(prefix + "算子明细/热点列表缺失")
-            for records, label in ((rows, "互斥项"), (kernels, "kernel指纹")):
-                keys = [item.get("key") for item in records]
-                if any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys):
-                    raise ValueError(prefix + label + "标识重复/无效")
-            fingerprints = {item["key"]: item for item in kernels}
-            for kernel in kernels:
-                if (not isinstance(kernel.get("name"), str)
-                        or not all(field in kernel for field in ("op_type", "input_shapes", "output_shapes", "input_dtypes",
-                                                                 "output_dtypes", "stream_id", "task_type"))
-                        or not all(_number(kernel.get(field)) and kernel[field] >= 0 for field in
-                                   ("calls_mean", "kernel_sum_ms", "duration_mean_ms", "duration_p90_ms"))
-                        or kernel["calls_mean"] <= 0 or not evidence(kernel.get("example"), True)
-                        or not close(kernel["kernel_sum_ms"], kernel["calls_mean"] * kernel["duration_mean_ms"])):
-                    raise ValueError(prefix + "kernel热点数值、完整指纹或原行/轮/层证据无效")
-                all_kernels.append({**kernel, "stage_label": stage.get("label") or stage["stage_key"], "stage_order": stage["stage_order"]})
-            for item in rows:
-                kind, members = item.get("kind"), item.get("members")
-                if (kind not in OPERATOR_KINDS or not isinstance(item.get("label"), str) or not item["label"].strip()
-                        or not isinstance(members, list) or not all(_number(item.get(field)) for field in
-                            ("source_ms", "delta_ms", "target_ms", "target_total_ms", "cycle_share"))
-                        or item["source_ms"] < 0 or not close(item["target_ms"], item["source_ms"] + item["delta_ms"])
-                        or not close(item["target_total_ms"], item["target_ms"] * count)
-                        or not close(item["cycle_share"], item["target_total_ms"] / cycle)):
-                    raise ValueError(prefix + "互斥项字段/目标值/占比无效")
-                if kind == "model_delta":
-                    if members or not close(item["source_ms"], 0):
-                        raise ValueError(prefix + "模型修正混入了原生执行覆盖")
-                else:
-                    if not close(item["delta_ms"], 0) or item["target_total_ms"] < 0 or not evidence(item.get("example"), kind != "gap"):
-                        raise ValueError(prefix + "原生覆盖缺定位或混入模型修正")
-                    if kind == "gap":
-                        if members or not all(key in item["example"] for key in ("before", "after")):
-                            raise ValueError(prefix + "无记录区间缺少前后任务定位")
-                    else:
-                        if not members or any(not isinstance(member, dict) for member in members):
-                            raise ValueError(prefix + "缺少具名算子成员")
-                        active = 0
-                        member_keys = []
-                        for member in members:
-                            fingerprint = fingerprints.get(member.get("key"))
-                            if (fingerprint is None or any(member.get(field) != fingerprint.get(field) for field in
-                                ("name", "op_type", "input_shapes", "output_shapes", "input_dtypes", "output_dtypes", "stream_id", "task_type"))
-                                    or type(member.get("instances")) is not int or member["instances"] <= 0):
-                                raise ValueError(prefix + "成员指纹/并发数量与kernel热点不一致")
-                            member_keys.append(member["key"])
-                            active += member["instances"]
-                        if len(set(member_keys)) != len(member_keys) or (kind == "operator" and active != 1) or (kind == "parallel" and active < 2):
-                            raise ValueError(prefix + "单算子/并行组合成员数量不一致")
-                all_rows.append({**item, "stage_label": stage.get("label") or stage["stage_key"], "stage_order": stage["stage_order"]})
-            if not all(close(math.fsum(item[field] for item in rows), stage[field])
-                       for field in ("source_ms", "delta_ms", "target_ms", "target_total_ms", "cycle_share")):
-                raise ValueError(prefix + "算子子项未与父阶段闭合")
-            if breakdown.get("note"):
-                notes.append(_text(breakdown["note"]))
-        if not close(math.fsum(item["target_total_ms"] for item in all_rows), group["target_total_ms"]):
-            raise ValueError("算子子项未与目标同类全部层闭合")
-    except (ValueError, KeyError, TypeError, ArithmeticError) as error:
-        result["note"] = "算子下钻未绘图：" + str(error) + "。原十阶段表图与父类结果仍保留；未知子项不补0。"
+    if group.get("status") != "MATCHED" or group.get("reason"):
+        problems.append("核心热点状态=" + _text(group.get("status")) + "；" + _text(group.get("reason")))
+    if (not isinstance(reference, list) or not reference or group.get("reference_layers") != reference
+            or type(rounds) is not int or rounds <= 0):
+        problems.append("参考层或保留轮次与所选rank不一致")
+    if not isinstance(kernels, list) or not kernels:
+        problems.append("原生算子热点未采集")
+        kernels = []
+    keys = []
+    for item in kernels:
+        if not isinstance(item, dict):
+            problems.append("算子指纹无效")
+            continue
+        key = (item.get("stage_order", 0), item.get("key")) if legacy else item.get("key")
+        keys.append(key)
+        example = item.get("example")
+        if not isinstance(example, dict):
+            example = {}
+        rows = example.get("row_indices")
+        row_evidence = (type(example.get("row_index")) is int and example["row_index"] >= 0
+                        or isinstance(rows, list) and bool(rows) and all(type(row) is int and row >= 0 for row in rows))
+        if (not isinstance(item.get("key"), str) or not item["key"] or not isinstance(item.get("name"), str)
+                or not all(field in item for field in ("op_type", "input_shapes", "output_shapes", "input_dtypes",
+                                                       "output_dtypes", "stream_id", "task_type"))
+                or not all(_number(item.get(field)) and item[field] >= 0 for field in
+                           ("calls_mean", "kernel_sum_ms", "duration_mean_ms", "duration_p90_ms"))
+                or item.get("calls_mean", 0) <= 0
+                or not close(item.get("kernel_sum_ms"), item.get("calls_mean", 0) * item.get("duration_mean_ms", 0))
+                or example.get("rank") != selected or example.get("layer") not in (reference or [])
+                or example.get("round_id") is None or not row_evidence):
+            problems.append("算子热点数值、指纹或原行/轮/层证据无效")
+    if any(not isinstance(key[-1] if legacy else key, str) for key in keys):
+        problems.append("算子指纹标识无效")
+    elif len(set(keys)) != len(keys):
+        problems.append("算子指纹重复")
+    if problems:
+        result["note"] = "Top算子统计未绘图：" + "；".join(dict.fromkeys(problems)) + "。"
         return result
-    preview = _operator_preview(all_rows, limit)
-    target_rows = []
-    for number, item in enumerate(preview, 1):
-        correction = item["kind"] == "model_delta"
-        detail = OPERATOR_KINDS[item["kind"]] + "\n指纹#" + item["key"] + "\n" + _operator_example_text(item.get("example"))
-        if item.get("details"):
-            detail += "\n前三项预览：\n" + item["details"]
-        elif item["members"]:
-            detail += "\n\n" + "\n\n".join("成员" + str(index) + "\n" + _operator_fingerprint_text(member)
-                                                for index, member in enumerate(item["members"], 1))
-        target_rows.append([_operator_label(item, number), 0. if correction else item["target_total_ms"],
-                            item["target_total_ms"] if correction else 0., item["target_total_ms"], item["cycle_share"], detail])
-    kernels = sorted(all_kernels, key=lambda item: (-item["kernel_sum_ms"], item["stage_order"], item["key"]))[:kernel_limit]
-    kernel_rows = [[_operator_label(dict(item, kind="operator", members=[dict(item, instances=1)]), "K" + str(number)),
-        item["calls_mean"], item["kernel_sum_ms"], item["duration_mean_ms"],
-        item["duration_p90_ms"], _operator_fingerprint_text(item)] for number, item in enumerate(kernels, 1)]
-    total_row = ["合计（闭合目标父类）", math.fsum(row[1] for row in target_rows), math.fsum(row[2] for row in target_rows),
-                 group["target_total_ms"], math.fsum(item["cycle_share"] for item in all_rows), "完整明细已核对全部10个父阶段；模型增减不代表优化收益"]
-    result.update(available=True, target_rows=target_rows, kernel_rows=kernel_rows, target_items=preview, kernel_items=kernels,
-                  total_row=total_row, basis_notes=list(dict.fromkeys(notes)),
-                  note="目标Top" + str(limit) + "及分类剩余合计：预览" + str(len(preview))
-                  + "行 / 完整" + str(len(all_rows)) + "项，合计闭合父类。gap独立列示，定位取最大间隙示例。源热点Top"
-                  + str(kernel_limit) + " / 完整" + str(len(all_kernels)) + "个阶段内指纹；单次均值/P90取实测段内裁剪调用，不含未出现调用。")
+    kernels = sorted(kernels, key=lambda item: (-item["kernel_sum_ms"], item.get("stage_order", 0), item["key"]))[:kernel_limit]
+    rows = []
+    for number, item in enumerate(kernels, 1):
+        scope = item.get("stage_label") or attention + "完整层区间"
+        label = "K" + str(number) + " · " + _text(item.get("op_type") or item.get("name")) + "\n统计范围：" + scope
+        label += "\n输入shape=" + _text(item.get("input_shapes")) + "\nstream=" + _text(item.get("stream_id"))
+        label = "\n".join(line for part in label.splitlines() for line in _operator_svg_label_lines(part, width=72))
+        rows.append([label, item["calls_mean"], item["kernel_sum_ms"], item["duration_mean_ms"],
+                     item["duration_p90_ms"], _operator_fingerprint_text(item)])
+    result.update(available=True, kernel_rows=rows, kernel_items=kernels,
+        scope="rank=" + _text(selected) + "；参考层=" + _text(reference) + "；保留轮次=" + str(rounds) + "。",
+        note=("旧JSON复用已保存的阶段内热点，按原统计范围展示；未重算或重建层内阶段。" if legacy else
+              "按完整参考层区间统计与排序，Top" + str(kernel_limit) + "保持源实测，不乘目标层数或外推倍率。"))
     return result
 
 
@@ -2282,16 +2216,10 @@ def _method_operator_section(sheet, row, method, role, attention):
     if not data["available"]:
         return row
     row = _note(sheet, row, OPERATOR_SCOPE + "来源JSON=" + str(sheet.report_origin))
-    row, header, written = _operator_table(sheet, row, OPERATOR_LEDGER_HEADERS,
-        [*data["target_rows"], data["total_row"]], OPERATOR_LEDGER_SPANS, True)
-    row = _operator_bar(sheet, row, attention + "算子互斥覆盖与模型增减 · " + _layer_mean_name(method),
-        OPERATOR_LEDGER_HEADERS, data["target_rows"], OPERATOR_LEDGER_SPANS, header, written[:-1], (1, 2),
-        "ms/目标同类全部层；含有符号模型修正，非优化收益")
-    row = _note(sheet, row, attention + "源实测算子热点；相交调用/单层均值，段内单次均值/P90；不加到互斥账本")
     row, header, written = _operator_table(sheet, row, OPERATOR_KERNEL_HEADERS, data["kernel_rows"], OPERATOR_KERNEL_SPANS)
     row = _operator_bar(sheet, row, attention + "源实测算子热点 · " + _layer_mean_name(method),
         OPERATOR_KERNEL_HEADERS, data["kernel_rows"], OPERATOR_KERNEL_SPANS, header, written, (2,),
-        "源段内kernel累计(ms/参考单层均值)；可重叠，不是目标贡献")
+        "源kernel累计(ms/参考单层均值)；可重叠，不是目标贡献")
     return _operator_pmu_section(sheet, row, attention, data["kernel_items"], method)
 
 
@@ -2326,16 +2254,114 @@ def _write_method_expansion(sheet, row, group, method):
     return row + height + 2
 
 
+ATTENTION_PREPARE_HEADERS = ["Attention准备业务分组（已含）", "任务调用\n/单层均值", "kernel累计\n(ms/单层)",
+                             "活动区间并集\n(ms/单层)", "首末跨度\n(ms/单层)", "证据 / 函数入口"]
+ATTENTION_PREPARE_SPANS = ((1, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 12))
+ATTENTION_PREPARE_SCOPE = ("源实测Attention准备细分，不乘目标层数或外推倍率；各业务分支可并行，"
+                            "不同分组的kernel累计、活动区间并集和首末跨度不能相加为父跨度。"
+                            "函数入口仅作静态对照，不是Host函数实测时间；未知留空，不适用不补零。"
+                            "仅部分样本可确认时保留证据计数；不强行归属同名MatMul，不拆分融合kernel内部时间。")
+
+
+def _attention_prepare_expansion_data(method, role, attention):
+    result = dict(title=attention + " Attention准备细分（源实测）", rows=[], available=False,
+                  note="未采集Attention准备业务细分；请用新版核心重新分析已有采样，旧JSON不猜拆大项。")
+    groups = [item for item in method.get("attention_prepare_breakdowns") or []
+              if isinstance(item, dict) and item.get("role") == role and item.get("attention") == attention]
+    if len(groups) != 1:
+        return result
+    group, issues = groups[0], []
+    classes = [item for item in method.get("class_means") or []
+               if item.get("role") == role and item.get("attention") == attention]
+    if (method.get("selected_rank") is None or group.get("rank") != method.get("selected_rank")
+            or len(classes) != 1 or group.get("reference_layers") != classes[0].get("reference_layers")):
+        issues.append("来源rank或参考层与本方法不一致")
+    rounds, samples = group.get("rounds"), group.get("layer_round_samples")
+    references = group.get("reference_layers")
+    if (type(rounds) is not int or rounds <= 0 or not isinstance(references, list) or not references
+            or any(type(layer) is not int or layer < 0 for layer in references)
+            or len(set(references)) != len(references) or type(samples) is not int
+            or samples != len(references) * rounds):
+        issues.append("参考层、轮次或样本数无效")
+    parent_fields = ("parent_wall_ms", "recorded_busy_ms", "uncovered_ms")
+    if (not all(_number(group.get(key)) and group[key] >= 0 for key in parent_fields)
+            or not math.isclose(group.get("parent_wall_ms", -1),
+                                sum(group.get(key, 0) or 0 for key in ("recorded_busy_ms", "uncovered_ms")),
+                                rel_tol=1e-9, abs_tol=1e-8)):
+        issues.append("父跨度与设备记录覆盖/未覆盖不闭合")
+    parents = [entry for entry in method.get("target_stage_breakdowns") or []
+               if isinstance(entry, dict) and entry.get("role") == role and entry.get("attention") == attention
+               and entry.get("status") == "MATCHED"]
+    if len(parents) == 1:
+        stages = [entry for entry in parents[0].get("stage_rows") or [] if entry.get("stage_key") == "attention_prepare"]
+        if (len(stages) != 1 or not _number(stages[0].get("source_ms"))
+                or not _number(group.get("parent_wall_ms"))
+                or not math.isclose(stages[0]["source_ms"], group["parent_wall_ms"], rel_tol=1e-9, abs_tol=1e-8)):
+            issues.append("细分父跨度与10阶段的源Attention准备不一致")
+    items = group.get("rows")
+    keys = [item.get("key") for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    if not keys or any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys):
+        issues.append("业务分组标识缺失或重复")
+    if group.get("status") not in ("MATCHED", "PARTIAL"):
+        issues.append("核心细分状态=" + _text(group.get("status")))
+    for item in items or []:
+        if not isinstance(item, dict):
+            issues.append("业务分组记录无效")
+            continue
+        status, known, total = item.get("status"), item.get("known_samples"), item.get("total_samples")
+        fields = ("kernel_count_mean", "kernel_sum_ms", "busy_union_ms", "span_ms")
+        measured = status in ("MATCHED", "PARTIAL")
+        if (status not in ("MATCHED", "PARTIAL", "UNKNOWN", "NOT_APPLICABLE")
+                or type(known) is not int or type(total) is not int or total != samples
+                or known < 0 or known > total or measured and known <= 0
+                or status == "MATCHED" and known != total
+                or measured and not all(_number(item.get(key)) and item[key] >= 0 for key in fields)
+                or not measured and any(item.get(key) is not None for key in fields)):
+            issues.append("业务分组证据或数值无效：" + _text(item.get("key")))
+        entries = item.get("function_entries") or []
+        detail = _text(status) + " · " + _text(known) + "/" + _text(total) + "样本"
+        if item.get("reason"):
+            detail += "；" + _text(item["reason"])
+        detail += "\n函数入口（静态）：" + ("\n".join(_text(entry) for entry in entries) if entries else "未确认")
+        result["rows"].append([item.get("label") or item.get("key"),
+                               *[item[key] if measured and _number(item.get(key)) else NA for key in fields], detail])
+    result["note"] = ("rank=" + _text(group.get("rank")) + "；参考层=" + _text(references) + "；保留轮次=" + _text(rounds)
+        + "；父准备跨度=" + _text(group.get("parent_wall_ms")) + " ms/单层；设备记录覆盖="
+        + _text(group.get("recorded_busy_ms")) + " ms；未覆盖=" + _text(group.get("uncovered_ms")) + " ms。"
+        + "核心状态=" + _text(group.get("status")) + "；" + _text(group.get("reason") or "")
+        + ("；" + _text(group["note"]) if group.get("note") else ""))
+    if issues:
+        result["note"] += "未绘图：" + "；".join(dict.fromkeys(issues)) + "。"
+        # Invalid core records remain described without publishing suspect values.
+        result["rows"] = [[record[0], NA, NA, NA, NA, record[-1]] for record in result["rows"]]
+    else:
+        result["available"] = True
+    return result
+
+
+def _attention_prepare_section(sheet, row, method, role, attention):
+    data = _attention_prepare_expansion_data(method, role, attention)
+    row = _note(sheet, row, data["title"] + " · " + _rank_note(method))
+    row = _note(sheet, row, ATTENTION_PREPARE_SCOPE + data["note"], warning=not data["available"])
+    if not data["rows"]:
+        return row
+    row, header, written = _operator_table(sheet, row, ATTENTION_PREPARE_HEADERS, data["rows"], ATTENTION_PREPARE_SPANS)
+    indices = [index for index, record in enumerate(data["rows"]) if data["available"] and _number(record[3])]
+    if not indices:
+        return row
+    records = [data["rows"][index] for index in indices]
+    positions = [written[index] for index in indices] if written else []
+    return _operator_bar(sheet, row, data["title"] + " · " + _layer_mean_name(method), ATTENTION_PREPARE_HEADERS,
+        records, ATTENTION_PREPARE_SPANS, header, positions, (3,), "源业务分组活动区间并集(ms/单层)；分支可重叠，不可相加")
+
+
 def _method_stage_expansions(sheet, row, case, method):
-    index_row, positions = row, []
-    row = _note(sheet, row, "CSA/HCA/SWA算子下钻位置：正在列示")
     for group in _method_expansion_data(case, method):
         row = _write_method_expansion(sheet, row, group, method)
         if group.get("operator_group"):
-            role, attention = group["operator_group"]
-            positions.append(attention + "：第" + str(row) + "行")
-            row = _method_operator_section(sheet, row, method, role, attention)
-    sheet.write(index_row, 1, "CSA/HCA/SWA算子下钻位置：" + "；".join(positions), "note")
+            row = _attention_prepare_section(sheet, row, method, *group["operator_group"])
+    for role, attention in (("main", "CSA"), ("main", "HCA"), ("draft", "SWA")):
+        row = _method_operator_section(sheet, row, method, role, attention)
     return row
 
 
@@ -2687,17 +2713,16 @@ def _residual_stage_tables(sheet, row, diagnostic):
     return row
 
 
-SWA_LAYER_HEADERS = ["主/草稿", "层号", "attention", "参考可用", "轮次", "层跨度均值(ms)",
+SOURCE_LAYER_HEADERS = ["主/草稿", "层号", "attention", "参考可用", "轮次", "层跨度均值(ms)",
                      "层p50(ms)", "层p90(ms)", "设备任务并集(ms)", "无设备记录(ms)",
                      "kernel累加(ms)", "duration+wait累加(ms)"]
-SWA_STAGE_HEADERS = ["草稿层号", "阶段标识", "SWA内部阶段（已含）", "匹配轮次 / 状态",
-                     "跨度均值(ms)", "p50(ms)", "p90(ms)", "设备任务并集(ms)",
-                     "无设备记录(ms)", "kernel累加(ms)", "duration+wait累加(ms)"]
-SWA_DIAGNOSTIC_SCOPE = ("同rank、同保留HC周期的逐层对照；层跨度为首HCPre开始→末HCPost结束。"
-                        "主0保留展示，是否纳入参考由核心给定；SWA内部阶段只展示draft/SWA。"
-                        "所有细分已含在原层跨度中，不加到层链、U、完整周期或TPOT。"
+SOURCE_LAYER_SCOPE = ("同rank、同保留HC周期的逐层对照；层跨度为首HCPre开始→末HCPost结束。"
+                        "主0保留展示，是否纳入参考由核心给定。"
                         "kernel累加可因多流重叠大于跨度；duration+wait为诊断累加，不能当互斥占用或额外时延。"
                         "无设备记录只表示CSV任务未覆盖；未知值显示—，不补0。")
+SOURCE_STAGE_HEADERS = ["主/草稿", "层号 / 类型", "阶段标识", "层内阶段（已含）", "匹配轮次 / 状态",
+                        "跨度均值(ms)", "p50(ms)", "p90(ms)", "设备任务并集(ms)", "无设备记录(ms)",
+                        "kernel累加(ms)", "duration+wait累加(ms)"]
 
 
 def _diagnostic_value(item, field):
@@ -2705,7 +2730,7 @@ def _diagnostic_value(item, field):
     return value if _number(value) else NA
 
 
-def _swa_layer_rows(diagnostic):
+def _source_layer_rows(diagnostic):
     fields = ("wall_ms_mean", "wall_ms_p50", "wall_ms_p90", "recorded_busy_ms_mean",
               "no_recorded_ms_mean", "kernel_sum_ms_mean", "total_cost_ms_mean")
     return [[item.get("role"), item.get("layer"), item.get("attention"),
@@ -2714,32 +2739,33 @@ def _swa_layer_rows(diagnostic):
             for item in diagnostic.get("layer_summary") or []]
 
 
-def _swa_stage_rows(diagnostic):
+def _source_stage_rows(diagnostic):
+    """Show source semantic stages, without reconstructing operator ledgers."""
     fields = ("duration_ms_mean", "duration_ms_p50", "duration_ms_p90", "recorded_busy_ms_mean",
               "no_recorded_ms_mean", "kernel_sum_ms_mean", "total_cost_ms_mean")
     rows = []
     for item in diagnostic.get("stage_summary") or []:
-        if item.get("role") != "draft" or item.get("attention") != "SWA":
+        if (item.get("role"), item.get("attention")) not in (("main", "CSA"), ("main", "HCA"), ("draft", "SWA")):
             continue
-        complete = (item.get("status") == "MATCHED" and _number(item.get("rounds"))
-                    and item["rounds"] > 0 and item.get("matched_windows") == item["rounds"])
-        source = item if complete else {}
-        rows.append([item.get("layer"), item.get("stage_key"), item.get("label", item.get("stage_key")),
-                     str(item.get("matched_windows", NA)) + "/" + str(item.get("rounds", NA)) +
-                     " · " + str(item.get("status", "UNRESOLVED")),
+        source = item if _matched_stage(item, item.get("rounds")) else {}
+        rows.append([item.get("role"), _text(item.get("layer")) + " / " + _text(item.get("attention")),
+                     item.get("stage_key"), item.get("label", item.get("stage_key")), _stage_match_text(item),
                      *[_diagnostic_value(source, field) for field in fields]])
     return rows
 
 
-def _swa_tables(sheet, row, diagnostic, rank):
-    row = _note(sheet, row, "源rank=" + _text(rank) + " · 逐层对照与SWA内部细分；状态=" +
-                _text(diagnostic.get("status")))
-    row = _note(sheet, row, SWA_DIAGNOSTIC_SCOPE + "核心scope=" + _text(diagnostic.get("scope")))
+def _source_layer_tables(sheet, row, diagnostic, rank):
+    row = _note(sheet, row, "源rank=" + _text(rank) + " · 逐层对照；状态=" + _text(diagnostic.get("status")))
+    row = _note(sheet, row, SOURCE_LAYER_SCOPE + "核心scope=" + _text(diagnostic.get("scope")))
     if diagnostic.get("reason"):
-        row = _note(sheet, row, "SWA诊断未完成原因：" + _text(diagnostic["reason"]), warning=True)
-    row = _table(sheet, row, SWA_LAYER_HEADERS, _swa_layer_rows(diagnostic))
-    row = _table(sheet, row, SWA_STAGE_HEADERS, _swa_stage_rows(diagnostic))
-    return _note(sheet, row, "逐轮SWA阶段锚点和形状证据：" + _text(diagnostic.get("stages_csv")))
+        row = _note(sheet, row, "层区间诊断未完成原因：" + _text(diagnostic["reason"]), warning=True)
+    row = _table(sheet, row, SOURCE_LAYER_HEADERS, _source_layer_rows(diagnostic))
+    stages = _source_stage_rows(diagnostic)
+    if stages:
+        row = _note(sheet, row, "源CSA/HCA/SWA层内阶段展开；细分已含在层跨度中，不额外计入完整周期。")
+        row = _table(sheet, row, SOURCE_STAGE_HEADERS, stages)
+        row = _note(sheet, row, "逐轮层内阶段锚点和形状证据：" + _text(diagnostic.get("stages_csv")))
+    return row
 
 
 def _ledger_sheet(book, report):
@@ -2749,6 +2775,7 @@ def _ledger_sheet(book, report):
     fields = ("source_cycle_ms", "source_main_chain_ms", "source_draft_chain_ms",
               "cross_role_tail_residual_ms", "partition_total_ms", "closed", "scope")
     for case in report["cases"]:
+        _set_table_case(sheet, case)
         row = _note(sheet, row, case["name"] + "；" + LAYER_RESIDUAL_NOTE)
         for identity in METHOD_IDS:
             method = _method(case, identity)
@@ -2813,6 +2840,7 @@ def _layers_sheet(book, report):
     sheet = _sheet(book, SHEETS[2], "层与组件 · 排除主0的分类参考均值", "按attention分类；所有数值来自本方法逐rank参考均值，不使用旧Hash分组或构造完整Router时长。")
     row = 5
     for case in report["cases"]:
+        _set_table_case(sheet, case)
         row = _note(sheet, row, case["name"] + "：参考层号和样本数由核心给定；主/草稿独立统计。", columns=12)
         for identity in METHOD_IDS:
             method = _method(case, identity)
@@ -2823,9 +2851,9 @@ def _layers_sheet(book, report):
             row = _table(sheet, row, ["采样组合", "方法", "rank", "主/草稿", "attention", "参考层号（主0排除）",
                          "参考样本数", "源单层(ms)", "源Dispatch(ms)", "源Combine(ms)", "源路由GMM(ms)", "核心选中rank"], rows)
         for capture in case.get("measurements") or []:
-            diagnostic = capture.get("swa_diagnostics")
+            diagnostic = capture.get("layer_diagnostics", capture.get("swa_diagnostics"))
             if isinstance(diagnostic, dict):
-                row = _swa_tables(sheet, row, diagnostic, capture.get("rank"))
+                row = _source_layer_tables(sheet, row, diagnostic, capture.get("rank"))
     return sheet
 
 
@@ -2837,6 +2865,7 @@ def _formula_sheet(book, report):
         ["接受率与有效输出", CASE_PARAMETERS_SCOPE],
         ["层间衔接区间", LAYER_GAP_NOTE], ["轮次剩余区间", LAYER_RESIDUAL_NOTE]])
     for case in report["cases"]:
+        _set_table_case(sheet, case)
         row = _note(sheet, row, case["name"] + " · " + _case_scope(case), columns=12)
         config = case.get("config") or {}
         row = _table(sheet, row, ["配置", "核心原值"], [[key, config.get(key)] for key in (
@@ -2873,6 +2902,7 @@ def _review_sheet(book, report, origin):
     row = _table(sheet, 5, ["来源", "原值"], [["核心JSON", str(origin)], ["renderer_version", RENDERER_VERSION],
                     ["profile_version", report.get("profile_version")], ["generated_at", report.get("generated_at")]])
     for case in report["cases"]:
+        _set_table_case(sheet, case)
         row = _note(sheet, row, case["name"], columns=12)
         for identity in METHOD_IDS:
             method = _method(case, identity)
@@ -2882,6 +2912,7 @@ def _review_sheet(book, report, origin):
                          [[field, value] for field in ("reasons", "warnings") for value in method.get(field) or []])
         row = _table(sheet, row, ["采样rank", "CSV来源", "SHA256"],
                      [[item.get("rank"), item.get("path"), item.get("sha256")] for item in case.get("captures") or []])
+    _set_table_case(sheet, None)
     if report.get("failures"):
         _records(sheet, row, report["failures"])
     return sheet
@@ -2891,6 +2922,11 @@ def _html_table(headers, rows):
     esc = lambda value: html.escape(_text(value), quote=True)
     return '<table><thead><tr>' + ''.join('<th>' + esc(value) + '</th>' for value in headers) + '</tr></thead><tbody>' + ''.join(
         '<tr>' + ''.join('<td>' + esc(value) + '</td>' for value in row) + '</tr>' for row in rows) + '</tbody></table>'
+
+
+def _html_case_tables(fragment, case):
+    caption = '<caption class="case-table-caption">' + html.escape(_case_table_label(case), quote=True) + '</caption>'
+    return fragment.replace('<table>', '<table>' + caption)
 
 
 def _method_residual_html(case, method):
@@ -2927,8 +2963,8 @@ def _focus_source_html(report):
                 + esc(case["name"] + ' · rank=' + _text(data["rank"])) + '</h3><p>'
                 + esc('引用：' + '、'.join(entry["methods"])) + '</p><p>' + esc(data["note"]) + '</p>')
             if data["available"]:
-                parts.append(_html_table(FOCUS_STEP_HEADERS,
-                    [['' if value is None else value for value in row] for row in data["step_rows"]]))
+                parts.append(_html_case_tables(_html_table(FOCUS_STEP_HEADERS,
+                    [['' if value is None else value for value in row] for row in data["step_rows"]]), case))
             parts.append('</section>')
     return ''.join(parts) + '</section>'
 
@@ -3040,23 +3076,16 @@ def _operator_svg(title, labels, series, axis):
 def _method_operator_html(method, role, attention):
     esc = lambda value: html.escape(_text(value), quote=True)
     data = _method_operator_data(method, role, attention)
-    parts = ['<section class="operator-drilldown"><h4>' + esc(data["title"]) + '</h4><p>'
+    parts = ['<section class="operator-hotspot-section"><h4>' + esc(data["title"]) + '</h4><p>'
              + esc(data.get("scope", "") + data["note"]) + '</p>']
     if not data["available"]:
         return ''.join(parts) + '</section>'
     parts.append('<p>' + esc(OPERATOR_SCOPE) + '</p>')
-    displayed = [[format(value, '.3%') if index == 4 and _number(value) else value
-                  for index, value in enumerate(row)] for row in [*data["target_rows"], data["total_row"]]]
-    parts.append('<div class="operator-ledger">' + _html_table(OPERATOR_LEDGER_HEADERS, displayed) + '</div>')
-    parts.append(_operator_svg(attention + '算子互斥覆盖与模型增减', [row[0] for row in data["target_rows"]],
-        [(OPERATOR_LEDGER_HEADERS[column], [row[column] for row in data["target_rows"]], color)
-         for column, color in ((1, "168B8D"), (2, "D4793A"))], '目标同类全部层，ms；模型修正不是已验证收益'))
-    parts.append('<h5>' + esc(attention + '源实测算子热点；段内相交调用/单层均值，单次均值/P90') + '</h5>')
     parts.append('<div class="operator-hotspots">' + _html_table(OPERATOR_KERNEL_HEADERS, data["kernel_rows"]) + '</div>')
     if data["kernel_rows"]:
         parts.append(_operator_svg(attention + '源实测算子热点', [row[0] for row in data["kernel_rows"]],
             [(OPERATOR_KERNEL_HEADERS[2], [row[2] for row in data["kernel_rows"]], "168B8D")],
-            '源段内kernel累计，可重叠；不是目标贡献或critical time'))
+            '源kernel累计，可重叠；不是目标贡献或critical time'))
     pmu_rows, pmu_details = _operator_pmu_data(data["kernel_items"])
     parts.append('<h5>' + esc(attention + '源实测Top8 · 流水活动与bound诊断') + '</h5><p>' + esc(PMU_SCOPE) + '</p>')
     if not any((kernel.get("pmu") or {}).get("metrics") for kernel in data["kernel_items"]):
@@ -3071,9 +3100,24 @@ def _method_operator_html(method, role, attention):
     parts.append('<details><summary>定量模型、峰值比例、缺失证据与限制</summary>'
                  + _html_table(PMU_DETAIL_HEADERS, model_details) + '</details>')
     parts.append('<details><summary>本页源热点的完整指纹与原行/轮/层示例（全部明细见核心JSON）</summary><pre>'
-        + esc(json.dumps({"core_basis_notes": data.get("basis_notes"), "target_preview": data["target_items"], "kernel_hotspots": data["kernel_items"]},
+        + esc(json.dumps({"kernel_hotspots": data["kernel_items"]},
                          ensure_ascii=False, indent=2)) + '</pre></details></section>')
     return ''.join(parts)
+
+
+def _attention_prepare_html(method, role, attention):
+    data = _attention_prepare_expansion_data(method, role, attention)
+    esc = lambda value: html.escape(_text(value), quote=True)
+    parts = ['<section class="attention-prepare-expansion"><h4>' + esc(data["title"]) + '</h4><p>'
+             + esc(ATTENTION_PREPARE_SCOPE + data["note"]) + '</p>']
+    if data["rows"]:
+        parts.append(_html_table(ATTENTION_PREPARE_HEADERS, data["rows"]))
+    records = [record for record in data["rows"] if data["available"] and _number(record[3])]
+    if records:
+        parts.append(_operator_svg(data["title"], [record[0] for record in records],
+            [(ATTENTION_PREPARE_HEADERS[3], [record[3] for record in records], "168B8D")],
+            "源业务分组活动区间并集(ms/单层)；分支可重叠，不可相加"))
+    return ''.join(parts) + '</section>'
 
 
 def _method_stage_expansions_html(case, method):
@@ -3099,7 +3143,9 @@ def _method_stage_expansions_html(case, method):
             parts.append('</div>')
         parts.append('</section>')
         if group.get("operator_group"):
-            parts.append(_method_operator_html(method, *group["operator_group"]))
+            parts.append(_attention_prepare_html(method, *group["operator_group"]))
+    parts.extend(_method_operator_html(method, role, attention)
+                 for role, attention in (("main", "CSA"), ("main", "HCA"), ("draft", "SWA")))
     return ''.join(parts)
 
 
@@ -3147,15 +3193,17 @@ def _residual_html(diagnostic, rank):
     return ''.join(parts)
 
 
-def _swa_html(diagnostic, rank):
+def _source_layer_html(diagnostic, rank):
     esc = lambda value: html.escape(_text(value), quote=True)
-    return ('<section><h3>逐层对照与SWA内部细分 · rank=' + esc(rank) + '</h3><p>状态：' +
+    stages = _source_stage_rows(diagnostic)
+    return ('<section><h3>逐层对照 · rank=' + esc(rank) + '</h3><p>状态：' +
             esc(diagnostic.get("status")) + '；scope=' + esc(diagnostic.get("scope")) + '</p><p>' +
-            esc(SWA_DIAGNOSTIC_SCOPE) + '</p>' +
-            ('<p>SWA诊断未完成原因：' + esc(diagnostic["reason"]) + '</p>' if diagnostic.get("reason") else '') +
-            _html_table(SWA_LAYER_HEADERS, _swa_layer_rows(diagnostic)) +
-            _html_table(SWA_STAGE_HEADERS, _swa_stage_rows(diagnostic)) +
-            '<p>逐轮SWA阶段锚点和形状证据：<code>' + esc(diagnostic.get("stages_csv")) + '</code></p></section>')
+            esc(SOURCE_LAYER_SCOPE) + '</p>' +
+            ('<p>层区间诊断未完成原因：' + esc(diagnostic["reason"]) + '</p>' if diagnostic.get("reason") else '') +
+            _html_table(SOURCE_LAYER_HEADERS, _source_layer_rows(diagnostic)) +
+            ('<h4>源CSA/HCA/SWA层内阶段展开</h4><p>细分已含在层跨度中，不额外计入完整周期。</p>' +
+             _html_table(SOURCE_STAGE_HEADERS, stages) + '<p>逐轮层内阶段锚点和形状证据：<code>' +
+             esc(diagnostic.get("stages_csv")) + '</code></p>' if stages else '') + '</section>')
 
 
 def _bs_svg(title, categories, series, unit, *, x_axis_title="BS（每DP请求数）", category_name="BS",
@@ -3344,7 +3392,7 @@ class _HTMLNavigationParser(HTMLParser):
         self.line_offsets = [0]
         self.line_offsets.extend(match.end() for match in re.finditer('\n', document))
         self.context, self.subcontext = '总览与采样配置', ''
-        self.title_depth, self.header_depth = 0, 0
+        self.title_depth, self.header_depth, self.caption_depth = 0, 0, 0
         self.tag_depths, self.existing_ids = collections.Counter(), set()
 
     def handle_starttag(self, tag, attrs):
@@ -3367,12 +3415,14 @@ class _HTMLNavigationParser(HTMLParser):
             self.title_depth += 1
         if tag == 'th':
             self.header_depth += 1
+        if tag == 'caption':
+            self.caption_depth += 1
 
     def handle_data(self, data):
         for block in self.active:
             if block['tag'] in ('h2', 'h3', 'h4', 'h5') or block['tag'] == 'svg' and self.title_depth and not block.get('title_complete'):
                 block['parts'].append(data)
-            elif block['tag'] == 'table' and self.header_depth and len(block['parts']) < 3:
+            elif block['tag'] == 'table' and (self.header_depth or self.caption_depth) and len(block['parts']) < 3:
                 block['parts'].append(data)
 
     def handle_endtag(self, tag):
@@ -3383,6 +3433,8 @@ class _HTMLNavigationParser(HTMLParser):
             self.title_depth = max(0, self.title_depth - 1)
         if tag == 'th':
             self.header_depth = max(0, self.header_depth - 1)
+        if tag == 'caption':
+            self.caption_depth = max(0, self.caption_depth - 1)
         for index in range(len(self.active) - 1, -1, -1):
             if self.active[index]['tag'] != tag or self.active[index]['depth'] != self.tag_depths[tag]:
                 continue
@@ -3514,8 +3566,9 @@ def _html_preview(report, out, progress=None):
              '<h1>10T模型推理估算</h1><p>' + esc(LAYER_MEAN_SCOPE) + '</p>',
              '<p><a href="' + esc(Path(out).name) + '">打开Excel（10个工作表）</a>；来源：' + esc(report.get('source_kind')) + '</p>']
     parts.append('<style>.bs-table{overflow-x:auto}.bs-table table{min-width:1200px}.bs-table th,.bs-table td{white-space:pre-line}.bs-trend{margin:28px 0;max-width:1120px}.bs-trend svg{display:block;width:100%;font:14px system-ui}.bs-trend figcaption{font-weight:600}</style>')
-    parts.append('<style>.operator-chart svg{width:100%;font:12px system-ui;display:block;margin:24px 0}.operator-drilldown table{table-layout:fixed;font-size:13px}.operator-drilldown th:first-child{width:34%}.operator-drilldown th:last-child{width:29%}.operator-drilldown td{overflow-wrap:anywhere;white-space:pre-line}.operator-drilldown pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>')
+    parts.append('<style>.operator-chart svg{width:100%;font:12px system-ui;display:block;margin:24px 0}.operator-hotspot-section table{table-layout:fixed;font-size:13px}.operator-hotspot-section th:first-child{width:34%}.operator-hotspot-section th:last-child{width:29%}.operator-hotspot-section td{overflow-wrap:anywhere;white-space:pre-line}.operator-hotspot-section pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>')
     parts.append('<style>.u-focus table{table-layout:fixed;font-size:13px}.u-focus td,.u-focus th{white-space:pre-line;overflow-wrap:anywhere}.u-focus th:first-child{width:25%}.u-focus th:last-child{width:25%}.pmu-metrics{overflow-x:auto}.pmu-metrics table{min-width:1500px}.pmu-metrics th:first-child{width:20%}.pmu-metrics th:last-child{width:14%}details>summary{cursor:pointer;font-weight:600;padding:12px;background:#edf2f7}</style>')
+    parts.append('<style>.case-table-caption{caption-side:top;text-align:left;background:#173451;color:white;font-weight:700;line-height:24px;padding:8px 10px;position:sticky;top:0;z-index:3}.case-table-caption+thead th{position:sticky;top:40px;z-index:2}@media print{.case-table-caption,.case-table-caption+thead th{position:static}}</style>')
     parameter_headers, parameter_rows, _ = _case_parameter_table(report)
     parts.append('<section class="case-parameters"><h2>' + esc(CASE_PARAMETERS_TITLE) + '</h2><p>'
                  + esc(CASE_PARAMETERS_SCOPE) + '</p>'
@@ -3527,6 +3580,7 @@ def _html_preview(report, out, progress=None):
     case_counts = collections.Counter(case['name'] for case in report['cases'])
     for case_index, case in enumerate(report["cases"]):
         mark("生成case " + str(case_index + 1) + "/" + str(len(report['cases'])) + "：" + case['name'])
+        case_start = len(parts)
         focus_case_index = case_index if case_counts[case['name']] > 1 else None
         heading = case['name'] + (' · 组合序号' + str(case_index + 1) if focus_case_index is not None else '')
         parts.append('<h2>' + esc(heading) + '</h2><p>' + esc(_case_scope(case)) + '</p>')
@@ -3548,12 +3602,14 @@ def _html_preview(report, out, progress=None):
             parts.append(_method_stage_expansions_html(case, method))
             parts.append('<p><code>' + esc(method.get("formula")) + '</code></p><p>' + esc(_explanation(method)) + '</p></section>')
         for capture in case.get("measurements") or []:
-            swa = capture.get("swa_diagnostics")
+            swa = capture.get("layer_diagnostics", capture.get("swa_diagnostics"))
             if isinstance(swa, dict):
-                parts.append(_swa_html(swa, capture.get("rank")))
+                parts.append(_source_layer_html(swa, capture.get("rank")))
             diagnostic = capture.get("step_residuals") or {}
             if diagnostic:
                 parts.append(_residual_html(diagnostic, capture.get("rank")))
+        # Process each case once; never repeatedly copy the complete HTML report.
+        parts[case_start:] = [_html_case_tables(''.join(parts[case_start:]), case)]
     parts.append('</html>')
     path = Path(out).with_suffix('.html')
     document = ''.join(parts)

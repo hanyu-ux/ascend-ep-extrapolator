@@ -21,9 +21,8 @@ def fixture():
               "task_type": "AI_CORE", "input_shapes": "57344,7168;14,224,512,16,32",
               "pmu": pmu, "duration_mean_ms": .001, "kernel_sum_ms": .002}
     methods = [{"id": name, "selected_rank": "dp1", "cycle_ms": 123., "tpot_ms": 24.6,
-                "per_device_tokens_s": 42., "target_stage_breakdowns": [{"attention": attention,
-                 "stage_rows": [{"operator_breakdown": {"kernels": [copy.deepcopy(kernel)],
-                                                           "rows": [{"source_ms": 1.5}]}}]}]}
+                "per_device_tokens_s": 42., "operator_hotspots": [{"attention": attention,
+                 "kernels": [copy.deepcopy(kernel)]}]}
                for name, attention in (("method1", "CSA"), ("method2", "HCA"))]
     return {"cases": [{"name": "case-a", "projection": {"layer_mean_methods": methods}}]}
 
@@ -39,7 +38,7 @@ def explicit_profile():
 
 
 def refreshed_kernel(report):
-    return report["cases"][0]["projection"]["layer_mean_methods"][0]["target_stage_breakdowns"][0]["stage_rows"][0]["operator_breakdown"]["kernels"][0]
+    return report["cases"][0]["projection"]["layer_mean_methods"][0]["operator_hotspots"][0]["kernels"][0]
 
 
 class RooflineTests(unittest.TestCase):
@@ -51,6 +50,23 @@ class RooflineTests(unittest.TestCase):
         self.assertFalse(pmu["bound"]["bound_verified"])
         self.assertFalse(pmu["roofline"]["bound_verified"])
         self.assertTrue(any("有效" in item for item in pmu["roofline"]["missing"]))
+
+    def test_saved_legacy_stage_kernels_can_refresh_bounds_without_rebuilding_stages(self):
+        report = fixture()
+        for method in report['cases'][0]['projection']['layer_mean_methods']:
+            group = method.pop('operator_hotspots')[0]
+            method['target_stage_breakdowns'] = [dict(attention=group['attention'], stage_rows=[
+                dict(stage_key='legacy_phase', target_ms=12345., operator_breakdown=dict(
+                    kernels=group['kernels'], rows=[dict(source_ms=1.5)]))])]
+        before = copy.deepcopy(report)
+        changed = core.refresh_report_operator_bounds(report, explicit_profile())
+        self.assertEqual(report, before)
+        original_stage = report['cases'][0]['projection']['layer_mean_methods'][0]['target_stage_breakdowns'][0]['stage_rows'][0]
+        actual_stage = changed['cases'][0]['projection']['layer_mean_methods'][0]['target_stage_breakdowns'][0]['stage_rows'][0]
+        self.assertEqual(actual_stage['target_ms'], original_stage['target_ms'])
+        self.assertEqual(actual_stage['operator_breakdown']['rows'], original_stage['operator_breakdown']['rows'])
+        self.assertEqual(actual_stage['operator_breakdown']['kernels'][0]['pmu']['roofline']['status'], 'modeled')
+        self.assertNotIn('operator_hotspots', changed['cases'][0]['projection']['layer_mean_methods'][0])
 
     def test_quantitative_units_use_unique_whole_calls_not_clipped_hotspot_mean(self):
         report = core.refresh_report_operator_bounds(fixture(), explicit_profile())

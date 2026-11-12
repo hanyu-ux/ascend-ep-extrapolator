@@ -204,6 +204,18 @@ class LayerMeanIntegrationTests(unittest.TestCase):
         self.assertEqual(method["comm_model"]["extra_ms_per_call"], .014)
         self.assertAlmostEqual(method["cycle_ms"], expected_round(2.25, depth=12), places=8)
         self.assertTrue((out / "10T模型推理估算.xlsx").is_file())
+        # Layer-stage expansion is retained; only per-stage operator ledgers are removed.
+        self.assertTrue((out / "layer_stage_summary.csv").is_file())
+        self.assertTrue(any(path.name.endswith("-layer-stages.csv") for path in out.rglob("*.csv")))
+        from tests.test_ep128_target_stages import assert_no_layer_drilldown
+        assert_no_layer_drilldown(self, case["projection"]["layer_mean_methods"])
+        self.assertTrue(method["operator_hotspots"])
+        self.assertEqual(len(method["target_stage_breakdowns"]), 3)
+        for measured in case["measurements"]:
+            whole_layer = measured.get("layer_diagnostics") or {}
+            self.assertTrue(whole_layer.get("layer_summary"))
+            self.assertTrue(whole_layer.get("stage_summary"))
+            self.assertTrue(Path(whole_layer["stages_csv"]).is_file())
         with ZipFile(out / "10T模型推理估算.xlsx") as archive:
             self.assertIsNone(archive.testzip())
             for filename in archive.namelist():
@@ -430,24 +442,23 @@ class AllLayerDrilldownTests(unittest.TestCase):
             self.assertEqual(len(legacy['layer_summary']), 11)
 
 
-class OperatorDrilldownIntegrationTests(unittest.TestCase):
-    """Hand-accounted synthetic overlaps; never hardware performance evidence."""
+class OperatorHotspotIntegrationTests(unittest.TestCase):
+    """Native full-layer overlaps and PMU; never hardware performance evidence."""
 
     @staticmethod
     def native_report(round_factors=None, *, topk=24):
-        from test_ep128_target_stages import native_stage_report
+        from tests.test_ep128_target_stages import native_stage_report
         return native_stage_report(round_factors or {'dp0': [1., 1.]}, topk=topk)
 
     @staticmethod
     def attach(report, native):
-        from test_ep128_layer_mean import attach
+        from tests.test_ep128_layer_mean import attach
         return attach(report, native)
 
     @staticmethod
-    def stages(method, attention='HCA', role='main'):
-        group = next(row for row in method['target_stage_breakdowns']
-                     if (row['role'], row['attention']) == (role, attention))
-        return group, {row['stage_key']: row for row in group['stage_rows']}
+    def group(method, attention='HCA', role='main'):
+        return next(row for row in method['operator_hotspots']
+                    if (row['role'], row['attention']) == (role, attention))
 
     @staticmethod
     def add_payloads(report, native):
@@ -472,37 +483,20 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
                     if layer['layer'] == 0:
                         add('MainZeroExcluded', 1.6, .2, 29, '16,512')
                         continue
-                    # Experts span [1.5, 4] ms. Two .1ms overlaps must not
-                    # become .2ms extra wall time; adjacent phases clip again.
+                    # Overlapping calls remain independent native calls.
+                    # The whole HC layer clips only its own endpoints.
                     add('PayloadCopy', 1.4, .4, 21, '16,512')
                     add('PayloadCopy', 1.7, .4, 22, '32,512')
                     add('TailCopy', 3.9, .3, 23, '16,512')
-                    # A task that starts before the layer must still appear
-                    # in its first phase, clipped to [0, .01] ms.
+                    # A call beginning before the layer is retained, clipped
+                    # to the [.0, .01]ms overlap with this HC layer.
                     add('CarryIn', -.05, .06, 24, '16,512')
                     if round_index == 0 and layer['layer'] == 1:
                         add('RareOnly', 3.4, .2, 25, '16,512')
             tasks.sort(key=lambda task: task.start_ns)
 
-    def assert_operator_closure(self, method):
-        for group in method['target_stage_breakdowns']:
-            self.assertEqual(group['status'], 'MATCHED', group['reason'])
-            for stage in group['stage_rows']:
-                ledger = stage['operator_breakdown']
-                self.assertEqual(ledger['status'], 'MATCHED', ledger.get('reason'))
-                for field in ('source_ms', 'delta_ms', 'target_ms', 'target_total_ms', 'cycle_share'):
-                    self.assertAlmostEqual(sum(row[field] for row in ledger['rows']), stage[field],
-                                           msg=(group['attention'], stage['stage_key'], field))
-                for row in ledger['rows']:
-                    self.assertAlmostEqual(row['target_ms'], row['source_ms'] + row['delta_ms'])
-                    self.assertAlmostEqual(row['target_total_ms'], row['target_ms'] * group['target_layers'])
-                    self.assertAlmostEqual(row['cycle_share'], row['target_total_ms'] / method['cycle_ms'])
-                    if row['kind'] != 'model_delta':
-                        self.assertGreaterEqual(row['source_ms'], 0)
-                        self.assertEqual(row['delta_ms'], 0)
-                self.assertFalse(any(kernel['name'] == 'MainZeroExcluded' for kernel in ledger['kernels']))
-
-    def test_operator_clipping_parallel_shapes_and_absent_samples_preserve_parent_estimates(self):
+    def test_whole_layer_clipping_parallel_shapes_and_absent_samples_preserve_estimates(self):
+        from tests.test_ep128_target_stages import assert_no_layer_drilldown
         report, native = self.native_report()
         baseline = self.attach(copy.deepcopy(report), copy.deepcopy(native))[0]
         self.add_payloads(report, native)
@@ -511,61 +505,56 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
                       'class_means', 'role_details', 'source_partition', 'breakdown', 'per_rank'):
             self.assertEqual(method[field], baseline[field], field)
         self.assertAlmostEqual(method['cycle_ms'], 1262.592)
-        self.assert_operator_closure(method)
-        group, stages = self.stages(method)
+        group = self.group(method)
+        self.assertEqual(group['status'], 'MATCHED', group['reason'])
         self.assertEqual(group['reference_layers'], [1, 3, 5, 7])
-        self.assertEqual(group['target_layers'], 31)
         self.assertEqual(group['rounds'], 2)
-        ledger = stages['experts']['operator_breakdown']
-        # Independent partition arithmetic for the eight equally weighted
-        # layer/round windows: gap 1-.2/8, exclusive busy 1.3+.2/8,
-        # parallel .1+.1. The named-kernel sum 1.7+.2/8 is NOT wall.
-        by_kind = {kind: sum(row['source_ms'] for row in ledger['rows'] if row['kind'] == kind)
-                   for kind in ('gap', 'operator', 'parallel', 'model_delta')}
-        self.assertAlmostEqual(by_kind['gap'], .975)
-        self.assertAlmostEqual(by_kind['operator'], 1.325)
-        self.assertAlmostEqual(by_kind['parallel'], .2)
-        self.assertEqual(by_kind['model_delta'], 0)
-        self.assertAlmostEqual(sum(row['kernel_sum_ms'] for row in ledger['kernels']), 1.725)
-        copies = {row['input_shapes']: row for row in ledger['kernels'] if row['name'] == 'PayloadCopy'}
+        self.assertEqual(group['layer_round_samples'], 8)
+        kernels = group['kernels']
+        copies = {row['input_shapes']: row for row in kernels if row['name'] == 'PayloadCopy'}
         self.assertEqual(set(copies), {'16,512', '32,512'})
-        for shape, clipped in (('16,512', .3), ('32,512', .4)):
+        # Both original .4ms calls overlap the layer in full, regardless of
+        # former dispatch/expert substage boundaries or parallel execution.
+        for shape in ('16,512', '32,512'):
             self.assertEqual(copies[shape]['calls_mean'], 1)
-            self.assertAlmostEqual(copies[shape]['kernel_sum_ms'], clipped)
-            self.assertAlmostEqual(copies[shape]['duration_mean_ms'], clipped)
-            self.assertAlmostEqual(copies[shape]['duration_p90_ms'], clipped)
-        rare = next(row for row in ledger['kernels'] if row['name'] == 'RareOnly')
+            self.assertAlmostEqual(copies[shape]['kernel_sum_ms'], .4)
+            self.assertAlmostEqual(copies[shape]['duration_mean_ms'], .4)
+            self.assertAlmostEqual(copies[shape]['duration_p90_ms'], .4)
+        rare = next(row for row in kernels if row['name'] == 'RareOnly')
         self.assertAlmostEqual(rare['calls_mean'], 1 / 8)
         self.assertAlmostEqual(rare['kernel_sum_ms'], .2 / 8)
         self.assertAlmostEqual(rare['duration_mean_ms'], .2)
         self.assertAlmostEqual(rare['duration_p90_ms'], .2)
-        for stage_key, name, clipped in (('attention_prepare', 'CarryIn', .01),
-                ('dispatch', 'PayloadCopy', .1), ('combine', 'TailCopy', .2)):
-            kernel = next(row for row in stages[stage_key]['operator_breakdown']['kernels']
-                          if row['name'] == name and row['input_shapes'] == '16,512')
+        for name, clipped in (('CarryIn', .01), ('TailCopy', .3)):
+            kernel = next(row for row in kernels if row['name'] == name)
             self.assertAlmostEqual(kernel['kernel_sum_ms'], clipped)
             self.assertEqual(kernel['calls_mean'], 1)
-        delta = [row for row in ledger['rows'] if row['kind'] == 'model_delta']
-        self.assertEqual(len(delta), 1)
-        self.assertAlmostEqual(delta[0]['delta_ms'], .2)
-        self.assertAlmostEqual(delta[0]['target_total_ms'], 31 * .2)
+        self.assertFalse(any(row['name'] == 'MainZeroExcluded' for row in kernels))
+        self.assertFalse(any('delta_ms' in row for row in kernels))
+        assert_no_layer_drilldown(self, method)
 
-    def test_negative_increment_is_separate_from_observed_nonnegative_operator_coverage(self):
-        report, native = self.native_report(topk=8)
+    def test_whole_call_pmu_is_retained_when_hc_window_clips_call_duration(self):
+        report, native = self.native_report()
         self.add_payloads(report, native)
-        method = self.attach(report, native)[0]
-        self.assert_operator_closure(method)
-        _, stages = self.stages(method)
-        stage = stages['experts']
-        delta = next(row for row in stage['operator_breakdown']['rows'] if row['kind'] == 'model_delta')
-        self.assertAlmostEqual(stage['source_ms'], 2.5)
-        self.assertAlmostEqual(stage['target_ms'], 2.3)
-        self.assertEqual(delta['source_ms'], 0)
-        self.assertAlmostEqual(delta['delta_ms'], -.2)
-        self.assertAlmostEqual(delta['target_total_ms'], -31 * .2)
-        self.assertLess(delta['cycle_share'], 0)
+        for task in native['dp0']['tasks']:
+            task.pmu = {'metrics': {'aiv_vec_ratio': .8, 'aiv_mte2_ratio': .3,
+                                    'aiv_mte3_ratio': .1, 'aiv_scalar_ratio': .05},
+                        'invalid_fields': [], 'core_type': 'AI_VECTOR_CORE'}
+        group = self.group(self.attach(report, native)[0])
+        carry = next(row for row in group['kernels'] if row['name'] == 'CarryIn')
+        self.assertAlmostEqual(carry['kernel_sum_ms'], .01)
+        pmu = carry['pmu']
+        self.assertEqual(pmu['aggregation'], 'native_whole_call_duration_weighted')
+        self.assertEqual(pmu['coverage']['total_calls'], 8)
+        self.assertEqual(pmu['coverage']['known_calls'], 8)
+        self.assertEqual(pmu['coverage']['clipped_calls'], 8)
+        self.assertAlmostEqual(pmu['coverage']['total_duration_ms'], .06 * 8)
+        self.assertAlmostEqual(pmu['coverage']['duration_coverage'], 1)
+        self.assertAlmostEqual(pmu['metrics']['aiv_vec_ratio']['value'], .8)
+        self.assertIn('bound', pmu)
+        self.assertIn('confidence', pmu['bound'])
 
-    def test_methods_use_operator_evidence_from_the_common_source_selected_rank(self):
+    def test_methods_use_common_source_rank_for_hotspots_even_if_target_maximum_differs(self):
         report, native = self.native_report({'dp0': [1., 1.], 'dp1': [1.01, 1.01]})
         self.add_payloads(report, native)
         for measured in report['cases'][0]['measurements']:
@@ -580,25 +569,21 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
                     d, c = (.8, .2) if measured['rank'] == 'dp0' else (.3, .7)
                     dispatch.end_ns = dispatch.start_ns + round(d * factor * 1e6)
                     combine.end_ns = combine.start_ns + round(c * factor * 1e6)
-        reference = HERE / 'examples/communication-reference.synthetic.csv'
-        report['communication_reference'] = {'rows': core.read_reference(reference)}
+        report['communication_reference'] = {'rows': core.read_reference(
+            HERE / 'examples/communication-reference.synthetic.csv')}
         methods = self.attach(report, native)
-        self.assertEqual([row['selected_rank'] for row in methods], ['dp1', 'dp1', 'dp1'])
-        # Method2's target-model maximum is dp0, but the source full-round
-        # mean selects dp1 before either extrapolation is evaluated.
+        self.assertEqual([row['selected_rank'] for row in methods], ['dp1'] * 3)
         target_ranks = {row['rank']: row for row in methods[1]['per_rank']}
         self.assertGreater(target_ranks['dp0']['cycle_ms'], target_ranks['dp1']['cycle_ms'])
         for method in methods:
-            self.assert_operator_closure(method)
-            _, stages = self.stages(method)
-            kernel = next(row for row in stages['attention_prepare']['operator_breakdown']['kernels']
-                          if row['name'] == 'CarryIn')
+            self.assertEqual(method['operator_hotspots'], methods[0]['operator_hotspots'])
+            kernel = next(row for row in self.group(method)['kernels'] if row['name'] == 'CarryIn')
             self.assertAlmostEqual(kernel['kernel_sum_ms'], .0101)
             self.assertEqual(kernel['example']['rank'], method['selected_rank'])
 
-    def test_workbook_and_html_keep_ten_stages_and_fifteen_u_stages_beside_operator_charts(self):
+    def test_workbook_and_html_keep_top_pmu_u_fifteen_and_layer_stages_without_operator_ledgers(self):
         import posixpath
-        from test_ep128_v2_excel import renderer
+        from tests.test_ep128_v2_excel import renderer
 
         report, native = self.native_report(topk=8)
         self.add_payloads(report, native)
@@ -606,14 +591,12 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
             HERE / 'examples/communication-reference.synthetic.csv')}
         methods = self.attach(report, native)
         case = report['cases'][0]
-        # Supply a clearly synthetic, complete 8+7 U display fixture. Its two
-        # window totals come from the native chain's actual 7ms/11ms gaps;
-        # this tests preservation of the old chart, not U-anchor recognition.
+        # Synthetic complete 8+7 U fixture. The two parent windows are the
+        # native chain's actual 7ms/11ms gaps; no U recognition is inferred.
         for measured in case['measurements']:
             summaries, parents = [], []
             count = len(measured['rounds'])
-            windows = (('main_to_draft', 8), ('draft_to_nextmain', 7))
-            for window, stages_count in windows:
+            for window, stages_count in (('main_to_draft', 8), ('draft_to_nextmain', 7)):
                 values = [((int(cycle['layers'][8]['start_ns']) - int(cycle['layers'][7]['end_ns']))
                            if window == 'main_to_draft' else
                            (int(cycle['end_ns']) - int(cycle['layers'][-1]['end_ns']))) / 1e6
@@ -649,8 +632,6 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
             with ZipFile(out) as archive:
                 self.assertIsNone(archive.testzip())
                 for index, method in zip((5, 6, 10), methods):
-                    # Follow the worksheet -> drawing -> chart relationships,
-                    # so an unattached chart part cannot satisfy this test.
                     rels = ET.fromstring(archive.read(f'xl/worksheets/_rels/sheet{index}.xml.rels'))
                     drawing_target = next(row.get('Target') for row in rels if row.get('Type').endswith('/drawing'))
                     drawing = posixpath.normpath(posixpath.join('xl/worksheets', drawing_target))
@@ -661,42 +642,36 @@ class OperatorDrilldownIntegrationTests(unittest.TestCase):
                               for row in ET.fromstring(archive.read(drawing_rels))
                               if row.get('Type').endswith('/chart')]
                     titles = {chart_title(chart): chart for chart in charts}
+                    self.assertFalse(any('互斥覆盖与模型增减' in title for title in titles))
+                    for attention in ('CSA', 'HCA', 'SWA'):
+                        stage_chart = next(chart for title, chart in titles.items()
+                                           if title.startswith(attention + '层内阶段展开'))
+                        self.assertEqual([len(values) for values in numeric_series(stage_chart)], [10])
                     u_chart = next(chart for title, chart in titles.items()
                                    if title.startswith('轮次剩余区间耗时构成'))
                     self.assertEqual([len(values) for values in numeric_series(u_chart)], [15])
                     self.assertAlmostEqual(sum(numeric_series(u_chart)[0]), 18)
                     for attention, role in (('CSA', 'main'), ('HCA', 'main'), ('SWA', 'draft')):
-                        group, stages = self.stages(method, attention, role)
-                        parent = next(chart for title, chart in titles.items()
-                                      if title.startswith(attention + '层内阶段展开'))
-                        values = numeric_series(parent)
-                        self.assertEqual([len(series) for series in values], [10])
-                        for value, stage in zip(values[0], stages.values()):
-                            self.assertAlmostEqual(value, stage['target_total_ms'])
-                        operator = next(chart for title, chart in titles.items()
-                            if title.startswith(attention + '算子互斥覆盖与模型增减'))
-                        coverage, increments = numeric_series(operator)
-                        self.assertTrue(coverage)
-                        self.assertEqual(len(coverage), len(increments))
-                        self.assertTrue(all(value >= 0 for value in coverage))
-                        self.assertTrue(any(value < 0 for value in increments))
-                        self.assertAlmostEqual(sum(coverage), group['source_wall_ms'] * group['target_layers'])
-                        self.assertAlmostEqual(sum(coverage) + sum(increments), group['target_total_ms'])
                         hotspots = next(chart for title, chart in titles.items()
                             if title.startswith(attention + '源实测算子热点'))
-                        self.assertTrue(numeric_series(hotspots)[0])
+                        series, = numeric_series(hotspots)
+                        expected = [row['kernel_sum_ms'] for row in self.group(method, attention, role)['kernels'][:8]]
+                        self.assertEqual(len(series), len(expected))
+                        for actual, value in zip(series, expected):
+                            self.assertAlmostEqual(actual, value)
                     xml = archive.read(f'xl/worksheets/sheet{index}.xml').decode()
                     self.assertIn('PayloadCopy', xml)
+                    self.assertIn('bound', xml)
                     self.assertIn('SYNTHETIC_U_main_to_draft_1', xml)
                     self.assertIn('SYNTHETIC_U_draft_to_nextmain_7', xml)
             html = out.with_suffix('.html').read_text(encoding='utf-8')
-            self.assertEqual(html.count('class="operator-drilldown"'), 9)
-            self.assertIn('operator-ledger', html)
+            self.assertEqual(html.count('class="operator-hotspot-section"'), 9)
+            self.assertNotIn('class="operator-ledger"', html)
             self.assertIn('operator-hotspots', html)
             self.assertIn('PayloadCopy', html)
             for attention in ('CSA', 'HCA', 'SWA'):
                 self.assertIn(attention + '层内阶段展开', html)
-                self.assertIn(attention + '算子互斥覆盖与模型增减', html)
+                self.assertNotIn(attention + '算子互斥覆盖与模型增减', html)
             self.assertIn('SYNTHETIC_U_main_to_draft_1', html)
             self.assertIn('SYNTHETIC_U_draft_to_nextmain_7', html)
 

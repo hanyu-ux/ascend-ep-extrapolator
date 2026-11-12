@@ -88,7 +88,7 @@ class SourceRankAlignmentTests(unittest.TestCase):
             self.assertEqual(method["source_rank"], "dp1")
             self.assertNotIn("focus_selected_rank", method)
             for field in ("cycle_ms", "per_device_tokens_s", "global_tokens_s", "tpot_ms",
-                          "class_means", "role_details", "source_partition", "breakdown"):
+                          "class_means", "role_details", "source_partition", "breakdown", "target_stage_breakdowns"):
                 self.assertEqual(method[field], expected[field])
             self.assertEqual(method["per_rank"], original["per_rank"])
         self.assertNotEqual(case["projection"]["layer_mean_methods"][0]["cycle_ms"],
@@ -100,13 +100,11 @@ class SourceRankAlignmentTests(unittest.TestCase):
         original = report["cases"][0]["projection"]["layer_mean_methods"]
         self.assertEqual([method["selected_rank"] for method in original], ["dp0", "dp1"])
         aligned = core.align_report_source_rank(report)["cases"][0]["projection"]["layer_mean_methods"]
-        for group in aligned[0]["target_stage_breakdowns"]:
-            self.assertTrue(all("operator_breakdown" not in stage for stage in group["stage_rows"]))
-        # Method 2 had rich same-rank data. Keep its PMU/operators; their model
-        # deltas must never leak into method 1's source-rank row.
-        self.assertEqual(aligned[1]["target_stage_breakdowns"], original[1]["target_stage_breakdowns"])
-        self.assertTrue(any("operator_breakdown" in stage for group in aligned[1]["target_stage_breakdowns"]
-                            for stage in group["stage_rows"]))
+        self.assertEqual(aligned[0]["operator_hotspots"], [])
+        # Same-method, same-rank source PMU survives without borrowing the
+        # other method's evidence for a newly selected rank.
+        self.assertEqual(aligned[1]["operator_hotspots"], original[1]["operator_hotspots"])
+        self.assertTrue(any(group["kernels"] for group in aligned[1]["operator_hotspots"]))
 
     def test_unavailable_method_stays_unavailable_and_drops_old_selected_diagnostics(self):
         report = legacy_report()
@@ -118,6 +116,7 @@ class SourceRankAlignmentTests(unittest.TestCase):
         self.assertIsNone(aligned["selected_rank"])
         self.assertEqual(aligned["source_rank"], "dp1")
         self.assertEqual(aligned["source_cycle_ms"], aligned["rank_selection"]["selected_source_cycle_ms"])
+        self.assertEqual(aligned["operator_hotspots"], [])
         self.assertEqual(aligned["target_stage_breakdowns"], [])
         self.assertIsNone(aligned["cycle_ms"])
         self.assertNotIn("focus_selected_rank", aligned)
@@ -149,13 +148,73 @@ class SourceRankAlignmentTests(unittest.TestCase):
                 core.align_report_source_rank(report)
             self.assertEqual(report, before)
 
-    def test_mismatched_parent_stages_do_not_reuse_old_operator_breakdowns(self):
+    def test_mismatched_reference_layers_do_not_reuse_stored_hotspots(self):
+        report = legacy_report()
+        method = report["cases"][0]["projection"]["layer_mean_methods"][1]
+        method["operator_hotspots"][0]["reference_layers"] = [999]
+        aligned = core.align_report_source_rank(report)["cases"][0]["projection"]["layer_mean_methods"][1]
+        self.assertEqual(aligned["operator_hotspots"], [])
+
+    def test_same_rank_legacy_kernels_keep_original_scope_after_alignment(self):
+        report = legacy_report()
+        for method in report["cases"][0]["projection"]["layer_mean_methods"]:
+            hotspots = {(group["role"], group["attention"]): group
+                        for group in method.pop("operator_hotspots")}
+            for group in method["target_stage_breakdowns"]:
+                saved = hotspots[group["role"], group["attention"]]
+                group["stage_rows"][0]["operator_breakdown"] = dict(
+                    status="MATCHED", reason=None, reference_layers=group["reference_layers"],
+                    rounds=group["rounds"], kernels=saved["kernels"])
+        before = copy.deepcopy(report)
+        methods = core.align_report_source_rank(report)["cases"][0]["projection"]["layer_mean_methods"]
+        self.assertEqual(report, before)
+        self.assertEqual(methods[0]["operator_hotspots"], [])
+        self.assertEqual(methods[0]["target_stage_breakdowns"],
+                         next(record for record in methods[0]["per_rank"] if record["rank"] == "dp1")
+                         ["target_stage_breakdowns"])
+        self.assertNotIn("operator_hotspots", methods[1])
+        self.assertTrue(list(core._bound_method_kernels(methods[1])))
+        view = renderer._method_operator_data(methods[1], "main", "HCA")
+        self.assertTrue(view["available"], view["note"])
+        self.assertIn("旧JSON", view["note"])
+        self.assertIn(methods[1]["target_stage_breakdowns"][0]["stage_rows"][0]["label"],
+                      view["kernel_rows"][0][0])
+
+    def test_target_delta_changes_keep_same_rank_source_hotspots_independent(self):
         report = legacy_report()
         method = report["cases"][0]["projection"]["layer_mean_methods"][1]
         selected = next(item for item in method["per_rank"] if item["rank"] == "dp1")
-        selected["target_stage_breakdowns"][0]["stage_rows"][0]["delta_ms"] += .01
+        selected["class_means"][0]["dispatch_delta_ms"] += .01
+        before = copy.deepcopy(method["operator_hotspots"])
         aligned = core.align_report_source_rank(report)["cases"][0]["projection"]["layer_mean_methods"][1]
-        self.assertNotIn("operator_breakdown", aligned["target_stage_breakdowns"][0]["stage_rows"][0])
+        self.assertEqual(aligned["operator_hotspots"], before)
+
+    def test_attention_preparation_alignment_never_borrows_other_rank_or_method(self):
+        report = legacy_report()
+        before = copy.deepcopy(report)
+        original = report["cases"][0]["projection"]["layer_mean_methods"]
+        methods = core.align_report_source_rank(report)["cases"][0]["projection"]["layer_mean_methods"]
+        self.assertEqual(methods[0]["attention_prepare_breakdowns"], [])
+        self.assertEqual(methods[1]["attention_prepare_breakdowns"], original[1]["attention_prepare_breakdowns"])
+        self.assertTrue(methods[1]["attention_prepare_breakdowns"])
+        self.assertEqual(report, before)
+        for mode in ("missing", "wrong_rank", "wrong_reference_layers", "wrong_rounds"):
+            with self.subTest(mode=mode):
+                corrupted = legacy_report()
+                donor = corrupted["cases"][0]["projection"]["layer_mean_methods"][1]
+                if mode == "missing":
+                    donor.pop("attention_prepare_breakdowns", None)
+                else:
+                    for group in donor["attention_prepare_breakdowns"]:
+                        if mode == "wrong_rank":
+                            group["rank"] = "dp0"
+                        elif mode == "wrong_reference_layers":
+                            group["reference_layers"] = [999]
+                        else:
+                            group["rounds"] += 1
+                aligned = core.align_report_source_rank(corrupted)["cases"][0]["projection"]["layer_mean_methods"][1]
+                self.assertEqual(aligned["attention_prepare_breakdowns"], [])
+                self.assertEqual(aligned["cycle_ms"], original[1]["cycle_ms"])
 
     def test_renderer_flag_writes_new_sidecar_uses_common_u_and_preserves_legacy_default(self):
         report = legacy_report()
@@ -177,6 +236,7 @@ class SourceRankAlignmentTests(unittest.TestCase):
             derived = json.loads(aligned_out.with_suffix(".source_rank.json").read_text())
             methods = derived["cases"][0]["projection"]["layer_mean_methods"]
             self.assertEqual([method["selected_rank"] for method in methods], ["dp1", "dp1"])
+            self.assertEqual(methods[0]["operator_hotspots"], [])
             self.assertEqual(methods[0]["target_stage_breakdowns"],
                              next(item for item in before["cases"][0]["projection"]["layer_mean_methods"][0]["per_rank"]
                                   if item["rank"] == "dp1")["target_stage_breakdowns"])
@@ -184,7 +244,7 @@ class SourceRankAlignmentTests(unittest.TestCase):
             text = " ".join(map(str, book["方法1估算"][1].values()))
             self.assertIn("SOURCE_dp1_U_", text)
             self.assertNotIn("SOURCE_dp0_U_", text)
-            self.assertIn("缺少operator_breakdown", text)
+            self.assertIn("缺少唯一Top算子证据", text)
             preview = aligned_out.with_suffix(".html").read_text()
             self.assertIn("共同", preview)
             legacy, _ = excel_tests.read_book(stored_out)

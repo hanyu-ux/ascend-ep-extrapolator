@@ -307,51 +307,42 @@ class LayerMeanTests(unittest.TestCase):
 
 class OperatorMeanTests(unittest.TestCase):
     def report(self, *args, **kwargs):
-        # Reuse the public synthetic timeline's complete native HC anchors.
         from tests.test_ep128_target_stages import native_stage_report
         return native_stage_report(*args, **kwargs)
 
-    def operators(self, method, role="main", attention="HCA", stage="experts"):
-        group = next(row for row in method["target_stage_breakdowns"]
+    def operators(self, method, role="main", attention="HCA"):
+        group = next(row for row in method["operator_hotspots"]
                      if (row["role"], row["attention"]) == (role, attention))
-        parent = next(row for row in group["stage_rows"] if row["stage_key"] == stage)
-        result = parent["operator_breakdown"]
-        self.assertEqual(result["status"], "MATCHED", result["reason"])
-        for field in ("source_ms", "delta_ms", "target_ms", "target_total_ms"):
-            self.assertAlmostEqual(sum(row[field] for row in result["rows"]), parent[field])
-        for row in result["rows"]:
-            self.assertAlmostEqual(row["cycle_share"], row["target_total_ms"] / method["cycle_ms"])
-        return result
+        self.assertEqual(group["status"], "MATCHED", group["reason"])
+        return group
 
-    def test_operator_view_keeps_signed_parent_deltas_separate_from_native_kernel_costs(self):
+    def test_kernel_costs_remain_native_when_model_increment_changes_sign(self):
+        actual = []
         for topk, expected_delta in ((24, .2), (8, -.2)):
-            with self.subTest(topk=topk):
-                report, native = self.report(topk=topk)
-                method = attach(report, native)[0]
-                result = self.operators(method)
-                model = [row for row in result["rows"] if row["kind"] == "model_delta"]
-                self.assertEqual(len(model), 1)
-                self.assertAlmostEqual(model[0]["delta_ms"], expected_delta)
-                self.assertEqual(model[0]["source_ms"], 0)
-                self.assertEqual(model[0]["members"], [])
-                self.assertTrue(all(row["delta_ms"] == 0 and row["target_ms"] == row["source_ms"]
-                                    for row in result["rows"] if row["kind"] != "model_delta"))
-                self.assertAlmostEqual(sum(row["kernel_sum_ms"] for row in result["kernels"]
-                    if "GroupedMatmul" in row["name"]), .4)
-                self.assertNotIn("operator_breakdown", method["per_rank"][0]["target_stage_breakdowns"][0]["stage_rows"][0])
-                self.assertNotIn("operator_breakdown", method["per_rank"][0]["rounds"][0]["target_stage_breakdowns"][0]["stage_rows"][0])
+            report, native = self.report(topk=topk)
+            method = attach(report, native)[0]
+            parent = next(row for row in method["class_means"]
+                          if row["role"] == "main" and row["attention"] == "HCA")
+            self.assertAlmostEqual(parent["routed_compute_delta_ms"], expected_delta)
+            result = self.operators(method)
+            self.assertAlmostEqual(sum(row["kernel_sum_ms"] for row in result["kernels"]
+                if "GroupedMatmul" in row["name"]), .4)
+            self.assertTrue(all(row["kernel_sum_ms"] >= 0 for row in result["kernels"]))
+            self.assertNotIn("rows", result)
+            self.assertTrue(all("delta_ms" not in row for row in result["kernels"]))
+            actual.append(result)
+        self.assertEqual(actual[0], actual[1])
 
-    def test_rare_operator_uses_all_reference_layers_and_rounds_as_its_denominator(self):
+    def test_rare_operator_uses_all_reference_layers_and_rounds_as_denominator(self):
         report, native = self.report({"dp0": [1., 3.]})
         layer = report["cases"][0]["measurements"][0]["rounds"][0]["layers"][1]
         start = int(layer["start_ns"]) + 3_400_000
         native["dp0"]["tasks"].append(SimpleNamespace(name="RareOnly", op_type="Copy", label="Copy RareOnly",
             start_ns=start, end_ns=start + 200_000, input_shapes="4,16", row_index=99999))
         native["dp0"]["tasks"].sort(key=lambda task: task.start_ns)
-        method = attach(report, native)[0]
-        result = self.operators(method)
+        result = self.operators(attach(report, native)[0])
         rare = next(row for row in result["kernels"] if row["name"] == "RareOnly")
-        self.assertEqual(result["layer_round_samples"], 8)  # Four HCA references, two retained rounds.
+        self.assertEqual(result["layer_round_samples"], 8)
         self.assertEqual(rare["calls_mean"], 1 / 8)
         self.assertAlmostEqual(rare["kernel_sum_ms"], .2 / 8)
         self.assertAlmostEqual(rare["duration_mean_ms"], .2)
@@ -359,11 +350,6 @@ class OperatorMeanTests(unittest.TestCase):
         self.assertEqual(rare["example"]["layer"], 1)
         self.assertEqual(rare["example"]["round_id"], "hc-0")
         self.assertTrue(all(row["example"]["layer"] != 0 for row in result["kernels"]))
-        # The aggregate gap example comes from the larger second-round gap,
-        # while the displayed source value still averages all eight samples.
-        gap = next(row for row in result["rows"] if row["kind"] == "gap")
-        self.assertEqual(gap["example"]["round_id"], "hc-1")
-        self.assertEqual(gap["example"]["duration_ns"], 2_550_000)
 
     def test_unidentified_gmm_remains_unknown_without_fabricated_zero_kernel_rows(self):
         report, native = self.report(topk=16)
@@ -373,9 +359,7 @@ class OperatorMeanTests(unittest.TestCase):
         parent = next(row for row in method["class_means"] if row["role"] == "main" and row["attention"] == "HCA")
         self.assertIsNone(parent["routed_compute_ms"])
         self.assertEqual(parent["routed_compute_delta_ms"], 0)
-        self.assertTrue(any("未识别" in group["note"] for group in method["target_stage_breakdowns"]))
         self.assertTrue(all("GroupedMatmul" not in row["name"] for row in result["kernels"]))
-        self.assertFalse(any(row["kind"] == "model_delta" for row in result["rows"]))
 
     def test_operator_evidence_failure_does_not_change_any_parent_number(self):
         report, native = self.report()
@@ -384,25 +368,32 @@ class OperatorMeanTests(unittest.TestCase):
             method = attach(report, native)[0]
         for field in ("cycle_ms", "tpot_ms", "per_device_tokens_s", "selected_rank", "class_means", "breakdown"):
             self.assertEqual(method[field], baseline[field])
-        for group in method["target_stage_breakdowns"]:
-            self.assertEqual(group["status"], "MATCHED")
-            for stage in group["stage_rows"]:
-                self.assertEqual(stage["operator_breakdown"]["status"], "UNAVAILABLE")
-                self.assertEqual(stage["operator_breakdown"]["rows"], [])
-                self.assertEqual(stage["operator_breakdown"]["kernels"], [])
+        self.assertTrue(method["operator_hotspots"])
+        for group in method["operator_hotspots"]:
+            self.assertEqual(group["status"], "UNAVAILABLE")
+            self.assertEqual(group["kernels"], [])
+            self.assertTrue(group["reason"])
 
-    def test_one_time_index_per_capture_and_source_operator_means_shared_by_both_methods(self):
+    def test_one_time_index_and_source_hotspot_means_shared_by_all_methods(self):
         report, native = self.report({"dp0": [1., 2.], "dp1": [1.5, 2.5]})
         reference = Path(__file__).resolve().parents[1] / "examples/communication-reference.synthetic.csv"
         report["communication_reference"] = {"rows": core.read_reference(reference)}
         with patch.object(core, "ATimeIndex", wraps=core.ATimeIndex) as indices, \
-             patch.object(core, "_lm_operator_source_means", wraps=core._lm_operator_source_means) as means:
-            first, second = attach(report, native)[:2]
-        self.assertEqual(first["selected_rank"], "dp1")
-        self.assertEqual(second["selected_rank"], "dp1")
-        self.assertEqual(indices.call_count, 2)
+             patch.object(core, "_lm_operator_source_means", wraps=core._lm_operator_source_means) as means, \
+             patch.object(core, "_lm_operator_layer", wraps=core._lm_operator_layer) as layers:
+            methods = attach(report, native)
+        self.assertEqual([row["selected_rank"] for row in methods], ["dp1"] * 3)
+        self.assertGreaterEqual(indices.call_count, 1)
+        self.assertLessEqual(indices.call_count, 2)  # At most one index per capture.
         self.assertEqual(means.call_count, 1)
-        self.assertEqual(self.operators(first)["kernels"], self.operators(second)["kernels"])
+        # Each rank worker scans its ten eligible layers once per round before
+        # releasing native tasks; this avoids retaining/pickling whole traces
+        # or rereading CSV after global rank selection. Only selected-rank PMU
+        # and quantiles are aggregated, once, for all three target methods.
+        self.assertEqual(layers.call_count, 40)
+        self.assertEqual({call.args[2]["rank"] for call in layers.call_args_list}, {"dp0", "dp1"})
+        self.assertTrue(all(self.operators(method)["kernels"] == self.operators(methods[0])["kernels"]
+                            for method in methods))
 
 
 if __name__ == "__main__":

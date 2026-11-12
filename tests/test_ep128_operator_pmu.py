@@ -113,15 +113,14 @@ class OperatorPmuTests(unittest.TestCase):
         self.assertIn("整次调用", result["scope_note"])
         self.assertTrue(any("局部测量" in message for message in result["bound"]["evidence"]))
 
-    def test_stage_hotspot_keeps_clipped_time_but_pmu_weights_whole_calls(self):
+    def test_layer_hotspot_keeps_clipped_time_but_pmu_weights_whole_calls(self):
         tasks = [task(1, 100, {"aic_mac_ratio": .2}),
                  task(2, 300, {"aic_mac_ratio": .8}, start_ns=200000)]
-        stage = core._lm_operator_stage({"start_ns": "20000", "end_ns": "450000"}, core.ATimeIndex(tasks),
+        layer = core._lm_operator_layer({"layer": 2, "start_ns": "20000", "end_ns": "450000"}, core.ATimeIndex(tasks),
                                        {"rank": "dp1", "round_id": "hc-1", "layer": 2})
-        self.assertEqual(stage["status"], "MATCHED")
-        means = core._lm_operator_source_means([{"class_stage_values": {("main", "CSA"): [
-            {"layer": 2, "_operator_stages": {"experts": stage}}]}}])
-        hotspot = means[("main", "CSA"), "experts"]["kernels"][0]
+        self.assertEqual(layer["status"], "MATCHED")
+        means = core._lm_operator_source_means([{"class_operator_values": {("main", "CSA"): [layer]}}])
+        hotspot = means[("main", "CSA")]["kernels"][0]
         self.assertAlmostEqual(hotspot["kernel_sum_ms"], .330)
         self.assertAlmostEqual(hotspot["duration_mean_ms"], .165)
         self.assertAlmostEqual(hotspot["pmu"]["metrics"]["aic_mac_ratio"]["value"], .65)
@@ -224,11 +223,10 @@ class OperatorPmuTests(unittest.TestCase):
                 return [strip_pmu(item) for item in value]
             return value
         self.assertEqual(strip_pmu(actual), strip_pmu(expected))
-        for group in actual[0]["target_stage_breakdowns"]:
-            for stage in group["stage_rows"]:
-                for kernel in stage["operator_breakdown"]["kernels"]:
-                    self.assertAlmostEqual(kernel["pmu"]["metrics"]["aic_mac_ratio"]["value"], .96)
-                    self.assertEqual(kernel["pmu"]["aggregation"], "native_whole_call_duration_weighted")
+        for group in actual[0]["operator_hotspots"]:
+            for kernel in group["kernels"]:
+                self.assertAlmostEqual(kernel["pmu"]["metrics"]["aic_mac_ratio"]["value"], .96)
+                self.assertEqual(kernel["pmu"]["aggregation"], "native_whole_call_duration_weighted")
 
 
 if __name__ == "__main__":

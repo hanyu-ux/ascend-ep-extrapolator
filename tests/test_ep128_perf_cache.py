@@ -38,15 +38,25 @@ class PerformanceCacheTests(unittest.TestCase):
         return {"Name": "GroupedMatmul", "Type": "GroupedMatmul", "Start Time(us)": "1",
                 "Duration(us)": "100", "Task ID": "7", "Stream ID": "2", **pmu}
 
-    def test_same_task_fingerprint_is_reused_for_clips_and_gap_neighbors(self):
+    def test_same_task_fingerprint_is_reused_across_complete_hc_window_scans(self):
         item = task()
         index = core.ATimeIndex([item])
         expected = core._lm_operator_member(item, index)
         self.assertIs(core._lm_operator_member(item, index), expected)
-        before = core._lm_operator_neighbor(index, item.end_ns, before=True)
-        after = core._lm_operator_neighbor(index, item.start_ns, before=False)
-        self.assertEqual(before["key"], expected["key"])
-        self.assertEqual(after["key"], expected["key"])
+        scope = {"rank": "dp0", "round_id": "r1", "layer": 1}
+        first = core._lm_operator_layer({"layer": 1, "start_ns": "1000", "end_ns": "11000"}, index, scope)
+        second = core._lm_operator_layer({"layer": 2, "start_ns": "11000", "end_ns": "101000"},
+                                         index, {**scope, "layer": 2})
+        for result, duration in ((first, 10000), (second, 90000)):
+            self.assertEqual(result["status"], "MATCHED", result["reason"])
+            kernel, = result["kernels"].values()
+            self.assertIs(kernel["member"], expected)
+            self.assertEqual(kernel["member"]["key"], expected["key"])
+            self.assertEqual(kernel["durations_ns"], [duration])
+            self.assertEqual(kernel["example"]["task_start_ns"], str(item.start_ns))
+            self.assertEqual(kernel["example"]["task_end_ns"], str(item.end_ns))
+            self.assertNotIn("rows", result)
+        self.assertEqual(len(index._operator_members), 1)
         self.assertEqual(expected["input_shapes"], item.input_shapes)
 
     def test_fingerprint_cache_is_index_scoped_and_preserves_full_identity(self):
