@@ -32,16 +32,6 @@ def add_synthetic_third(report):
                      tpot_ms=third["tpot_ms"] + .375,
                      formula="SYNTHETIC_CORE_METHOD3_FORMULA; mD=mC=1; extra_ms_per_call=0")
         third["breakdown"][-1]["value_ms"] += 3.125
-        def update_explicit_fixture_shares(value):
-            if isinstance(value, dict):
-                if "cycle_share" in value and "target_total_ms" in value:
-                    value["cycle_share"] = value["target_total_ms"] / third["cycle_ms"]
-                for child in value.values():
-                    update_explicit_fixture_shares(child)
-            elif isinstance(value, list):
-                for child in value:
-                    update_explicit_fixture_shares(child)
-        update_explicit_fixture_shares(third.get("target_stage_breakdowns") or [])
         third["communication"] = dict(extra_ms_per_call=0., remote_ratio=1.,
             multipliers={"main": {"dispatch": 1., "combine": 1.}, "draft": {"dispatch": 1., "combine": 1.}})
         case["projection"]["layer_mean_methods"].append(third)
@@ -107,7 +97,7 @@ class MethodThreeRendererTests(unittest.TestCase):
         self.assertFalse(charts, "absent method3 must not copy another method's charts/results")
         self.assertIn("核心报告未输出方法三", page)
         self.assertEqual(len(renderer._focus_source_entries(report["cases"][0])), 2)
-        self.assertEqual(list(book["源采样基线"][1].values()).count("保留序号"), 2)
+        self.assertEqual([str(value).split("\n", 1)[0] for value in book["源采样基线"][1].values()].count("保留序号"), 2)
 
     def test_configuration_preview_includes_third_method_without_performance_values(self):
         config = self.root / "synthetic-config.json"
@@ -228,7 +218,7 @@ class MethodThreeRendererTests(unittest.TestCase):
         self.assertIn("97.5%", values)
         self.assertIn("SYNTHETIC_AIC_EVIDENCE", values)
         self.assertNotIn("保留序号", book["方法3估算"][1].values())
-        self.assertEqual(list(book["源采样基线"][1].values()).count("保留序号"), 2)
+        self.assertEqual([str(value).split("\n", 1)[0] for value in book["源采样基线"][1].values()].count("保留序号"), 2)
         charts = self.tools.chart_parts_by_sheet(out, book)
         refs = []
         for name in ("方法1估算", "方法3估算"):

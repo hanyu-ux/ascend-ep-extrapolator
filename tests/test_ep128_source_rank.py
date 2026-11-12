@@ -115,7 +115,7 @@ class CommonSourceRankTests(unittest.TestCase):
         self.assertEqual(second["class_means"], source["class_means"])
         self.assertEqual(second["role_details"], source["role_details"])
 
-    def test_stage_parts_operator_examples_and_pmu_all_follow_common_source_rank(self):
+    def test_whole_layer_hotspots_operator_examples_and_pmu_follow_common_source_rank(self):
         report, native = source_rank_report()
         for rank, capture in native.items():
             for task in capture["tasks"]:
@@ -129,28 +129,21 @@ class CommonSourceRankTests(unittest.TestCase):
         for method in methods:
             selected = next(row for row in method["per_rank"] if row["rank"] == "dp0")
             found_gmms = 0
-            for actual, expected in zip(method["target_stage_breakdowns"], selected["target_stage_breakdowns"]):
-                without_operators = copy.deepcopy(actual)
-                for stage in without_operators["stage_rows"]:
-                    stage.pop("operator_breakdown")
-                self.assertEqual(without_operators, expected)
+            self.assertNotIn("operator_hotspots", selected)
+            self.assertEqual(method["target_stage_breakdowns"], selected["target_stage_breakdowns"])
+            for group in method["target_stage_breakdowns"]:
+                self.assertEqual(group["status"], "MATCHED", group.get("reason"))
+                self.assertAlmostEqual(math.fsum(stage["target_total_ms"] for stage in group["stage_rows"]),
+                                       group["target_total_ms"])
+                self.assertTrue(all("operator_breakdown" not in stage for stage in group["stage_rows"]))
+            for actual in method["operator_hotspots"]:
                 self.assertEqual(actual["status"], "MATCHED", actual.get("reason"))
-                self.assertAlmostEqual(math.fsum(stage["target_total_ms"] for stage in actual["stage_rows"]),
-                                       actual["target_total_ms"])
-                for stage in actual["stage_rows"]:
-                    ledger = stage["operator_breakdown"]
-                    self.assertEqual(ledger["status"], "MATCHED", ledger.get("reason"))
-                    for field in ("source_ms", "delta_ms", "target_ms", "target_total_ms", "cycle_share"):
-                        self.assertAlmostEqual(math.fsum(row[field] for row in ledger["rows"]), stage[field])
-                    for row in ledger["rows"]:
-                        if row.get("example"):
-                            self.assertEqual(row["example"]["rank"], "dp0")
-                    for kernel in ledger["kernels"]:
-                        self.assertEqual(kernel["example"]["rank"], "dp0")
-                        if "GroupedMatmul" in kernel["name"]:
-                            found_gmms += 1
-                            self.assertAlmostEqual(kernel["pmu"]["metrics"]["aic_mac_ratio"]["value"], .96)
-                            self.assertEqual(kernel["pmu"]["coverage"]["duration_coverage"], 1.)
+                for kernel in actual["kernels"]:
+                    self.assertEqual(kernel["example"]["rank"], "dp0")
+                    if "GroupedMatmul" in kernel["name"]:
+                        found_gmms += 1
+                        self.assertAlmostEqual(kernel["pmu"]["metrics"]["aic_mac_ratio"]["value"], .96)
+                        self.assertEqual(kernel["pmu"]["coverage"]["duration_coverage"], 1.)
             self.assertGreater(found_gmms, 0)
 
     def test_common_source_selection_is_case_local(self):

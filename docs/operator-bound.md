@@ -1,12 +1,12 @@
 # 源算子 bound 的证据口径
 
-版本：`20261110.1.evidence_roofline`。运行时仍只有三个标准库 Python 脚本，不安装外部 Skill，不调用设备，也不改变层时间、外推公式、Top8 排名或共同源 rank。
+bound判据版本：`20261110.1.evidence_roofline`；热点统计接口：核心／生成器 `20261112.1.layer_stages_restored`。运行时保持Python标准库依赖；Attention准备识别单列为同目录模块，不安装外部 Skill，不调用设备，保留整层时间、外推公式和共同源rank；新热点按完整层区间统计，旧JSON保留所存阶段内热点口径。
 
 公开检索、实际代码审查与不采用的规则见 [Skill 调研](operator-bound-skill-survey.md)。这里把统计事实、候选判断和定量模型分开，不把某个百分比的最大值当作已定位根因。
 
 ## 报告如何读
 
-方法1、方法2的 CSA、HCA、SWA 各自源实测 Top8 后依次展示：流水表、完整高级指标与候选依据、Roofline 定量表、模型依据与缺失项。包含这些 Top8 中的 Attention/MoE；不是声称每个算子均有硬件证据。源 PMU 不乘目标层数和外推倍率。
+方法1、方法2和方法3的CSA、HCA、SWA各自源实测Top8后依次展示：流水表、完整高级指标与候选依据、Roofline 定量表、模型依据与缺失项。包含这些Top8中的Attention/MoE；不是声称每个算子均有硬件证据。新报告从 `projection.layer_mean_methods[].operator_hotspots[].kernels` 读取热点，层内十阶段独立保留，不计算逐算子互斥覆盖或目标算子贡献。源PMU不乘目标层数和外推倍率。
 
 | 层级 | 说明 | 能得出的结论 |
 | --- | --- | --- |
@@ -35,7 +35,7 @@
 
 新解析器识别有明确单位和文档依据的流量、通路带宽、cache、指令工作量字段，并附 `field_info` 来源/范围/estimate 标签。只有实际列存在才显示；msOpProf 每核导出和 msprof 任务级导出不可仅凭同名拼接。各通路的使用范围见 [Ascend C 数据通路](https://asc.gitcode.com/api/SIMD-API/c_api/data_move_guide/overview/data_path.html) 和 [msOpProf 性能字段](https://github.com/Ascend/msopprof/blob/master/docs/en/user_guide/msopprof_performance_data.md)。
 
-比例按唯一原生整次调用的 Duration 加权，保留 min/max、逐指标样本数、时长覆盖。新的流量/工作量还额外保留 `sample_sum` 和 `sample_mean`；这些只属于字段已知的导出行，不能把加权 bytes 均值除以调用均时求实际带宽。阶段裁剪只计账，不能裁出局部 PMU。同一调用跨段被引用时不重复计为独立采集。
+比例按唯一原生整次调用的 Duration 加权，保留 min/max、逐指标样本数、时长覆盖。新的流量/工作量还额外保留 `sample_sum` 和 `sample_mean`；这些只属于字段已知的导出行，不能把加权 bytes 均值除以调用均时求实际带宽。层边界裁剪只用于热点耗时，不能裁出局部PMU。同一调用跨层边界或旧阶段被引用时，不重复计为独立采集。
 
 ## 候选判据
 
@@ -53,7 +53,7 @@ AIC 的基础竞争项为 MAC、Scalar、MTE1、MTE2、Fixpipe；AIV 为 VEC、S
 python -u build_ep128_leadership_excel.py --report ep128_report_7/model_architecture_report.json --refresh-bound --out "ep128_report_7/专业bound.xlsx"
 ```
 
-生成 Excel、同名 HTML、`专业bound.bound.json`，原 JSON 不变；不读 CSV/trace，不改任何时间和 rank。旧 JSON 未存 `sample_diagnostics` 时，联合覆盖、短调用和逐调用时差无法从均值恢复，对应检查未知、置信度降低。原本未采集的 MTE1 或访存量不会凭空补出。
+生成Excel、同名HTML、`专业bound.bound.json`，原JSON不变；不读CSV／trace，不改已有周期、热点耗时和rank。旧JSON已有的阶段内热点按兼容口径展示，保留其层内十阶段展开，不再绘制逐算子目标贡献。重新处理原CSV才能得到新的完整层Top8；PMU刷新不会重排或重建采样热点。旧 JSON 未存 `sample_diagnostics` 时，联合覆盖、短调用和逐调用时差无法从均值恢复，对应检查未知、置信度降低。原本未采集的 MTE1 或访存量不会凭空补出。
 
 可同时加 `--align-source-rank`，先按已存逐 rank 估算对齐，再更新证据。缺少新 rank 的算子证据仍未知。直接重绘不加刷新参数会保留原 JSON 所存判据；主表的新 MTE1/Fixpipe 列仍可显示已有值。
 

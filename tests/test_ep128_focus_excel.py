@@ -46,18 +46,17 @@ def focus_fixture():
             scope="SYNTHETIC_SAME_RANK_ONLY", stages=stages, operators={"op1": operator},
             segments_csv="SYNTHETIC-focus-segments.csv", steps_csv="SYNTHETIC-focus-steps.csv")
     for method in report["cases"][0]["projection"]["layer_mean_methods"]:
-        for group in method["target_stage_breakdowns"]:
-            for stage in group["stage_rows"]:
-                for kernel in stage["operator_breakdown"]["kernels"]:
-                    metrics = {key:dict(value=value, unit="ratio", known_calls=2, total_calls=2,
-                        known_duration_ms=2., total_duration_ms=2., duration_coverage=1.)
-                        for key, value in (("aic_mac_ratio", .975), ("aic_mte2_ratio", .771), ("aic_mte3_ratio", 0.),
-                                           ("aiv_vec_ratio", .0), ("aiv_mte2_ratio", .2), ("aiv_mte3_ratio", .3),
-                                           ("aic_scalar_ratio", .1), ("aiv_scalar_ratio", .4), ("aic_icache_miss_rate", .002))}
-                    kernel["pmu"] = dict(metrics=metrics, coverage=dict(known_calls=2, total_calls=2,
-                        known_duration_ms=2., total_duration_ms=2., duration_coverage=1., clipped_calls=1),
-                        bound=dict(code="MATRIX_ACTIVITY", label="偏矩阵计算限制", confidence="中", evidence=["SYNTHETIC_AIC_EVIDENCE"]),
-                        scope_note="SYNTHETIC_NATIVE_WHOLE_CALL_ONLY")
+        for group in method["operator_hotspots"]:
+            for kernel in group["kernels"]:
+                metrics = {key:dict(value=value, unit="ratio", known_calls=2, total_calls=2,
+                    known_duration_ms=2., total_duration_ms=2., duration_coverage=1.)
+                    for key, value in (("aic_mac_ratio", .975), ("aic_mte2_ratio", .771), ("aic_mte3_ratio", 0.),
+                                       ("aiv_vec_ratio", .0), ("aiv_mte2_ratio", .2), ("aiv_mte3_ratio", .3),
+                                       ("aic_scalar_ratio", .1), ("aiv_scalar_ratio", .4), ("aic_icache_miss_rate", .002))}
+                kernel["pmu"] = dict(metrics=metrics, coverage=dict(known_calls=2, total_calls=2,
+                    known_duration_ms=2., total_duration_ms=2., duration_coverage=1., clipped_calls=1),
+                    bound=dict(code="MATRIX_ACTIVITY", label="偏矩阵计算限制", confidence="中", evidence=["SYNTHETIC_AIC_EVIDENCE"]),
+                    scope_note="SYNTHETIC_NATIVE_WHOLE_CALL_ONLY")
     return report
 
 

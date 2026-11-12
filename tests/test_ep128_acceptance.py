@@ -142,7 +142,7 @@ class AcceptanceOutputFractionTests(unittest.TestCase):
             with self.subTest(method=low["id"]):
                 self.assertEqual(low["status"], core.LAYER_MEAN_STATUS)
                 for key in ("cycle_ms", "source_cycle_ms", "selected_rank", "class_means",
-                            "role_details", "source_partition", "breakdown", "target_stage_breakdowns"):
+                            "role_details", "source_partition", "breakdown", "operator_hotspots"):
                     self.assertEqual(low[key], high[key], key)
                 self.assertAlmostEqual(low["tpot_ms"], low["cycle_ms"] / 4.8)
                 self.assertAlmostEqual(high["tpot_ms"], high["cycle_ms"] / 5.2)

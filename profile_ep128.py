@@ -29,8 +29,10 @@ import sys
 import tempfile
 import time
 
+from ep128_attention_prepare import analyze_attention_prepare
+
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261111.2.acceptance_output_fraction"
+PROFILE_VERSION = "20261112.1.layer_stages_restored"
 ACCEPTANCE_SEMANTICS = "mean_output_fraction_including_bonus"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
@@ -41,7 +43,6 @@ A_DISPATCH = re.compile(r"MoeDistributeDispatch", re.I)
 A_NATIVE_DISPATCH = re.compile(r"(?:aclnn)?MoeDistributeDispatch(?:V([123]))?", re.I)
 A_COMBINE = re.compile(r"MoeDistributeCombine", re.I)
 A_INDEXER = re.compile(r"LightningIndexer|IndexerTopK|SparseIndexer", re.I)
-
 
 
 @dataclass(slots=True)
@@ -74,7 +75,6 @@ class ATask:
         return self.op_type + " " + self.name
 
 
-
 def a_sha(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as source:
@@ -83,13 +83,11 @@ def a_sha(path):
     return digest.hexdigest()
 
 
-
 def a_id(value):
     if value is None or str(value).strip() in ("", "N/A", "None", "null"):
         return None
     value = str(value).strip()
     return str(int(value)) if re.fullmatch(r"[+-]?\d+", value) else value
-
 
 
 def a_alias(row, names, label, normalize=None):
@@ -102,7 +100,6 @@ def a_alias(row, names, label, normalize=None):
     if entries and any(value != entries[0][1] for _, value in entries):
         raise ValueError("conflicting CSV aliases for " + label + ": " + str(entries))
     return entries[0][1] if entries else None
-
 
 
 def a_ns(value, label="timestamp", missing=False):
@@ -121,7 +118,6 @@ def a_ns(value, label="timestamp", missing=False):
         return int((number * 1000).to_integral_value())
     except (ArithmeticError, ValueError) as error:
         raise ValueError(label + " must be finite microseconds: " + str(value)) from error
-
 
 
 def a_exact_ns(value, label):
@@ -343,7 +339,6 @@ def _a_merge_pmu(left, right):
                        core_type=left.get("core_type") or right.get("core_type") or "")
 
 
-
 def read_capture(path, rank):
     """Keep original row references and metadata; deduplicate identical events."""
     path = Path(path).resolve()
@@ -428,7 +423,6 @@ def read_capture(path, rank):
             "parse_warnings": warnings}
 
 
-
 def a_union(intervals):
     output = []
     for left, right in sorted(intervals):
@@ -441,7 +435,6 @@ def a_union(intervals):
     return output
 
 
-
 def a_stats(tasks, start, end):
     clipped = [(max(start, task.start_ns), min(end, task.end_ns))
                for task in tasks if task.start_ns < end and task.end_ns > start]
@@ -450,7 +443,6 @@ def a_stats(tasks, start, end):
             "busy_union_ms": sum(b - a for a, b in a_union(clipped)) / 1e6,
             "kernel_sum_ms": sum(b - a for a, b in clipped) / 1e6,
             "calls": len(clipped)}
-
 
 
 def a_schedule(model, case):
@@ -470,7 +462,6 @@ def a_schedule(model, case):
     return [("main" if i < main else "draft", i if i < main else i - main,
              {0: "SWA", 4: "CSA", 128: "HCA"}[value], "hash" if i < count else "normal")
             for i, value in enumerate(ratios)]
-
 
 
 def a_hc_cycles(tasks, model, case):
@@ -539,10 +530,8 @@ def a_hc_cycles(tasks, model, case):
     return result
 
 
-
 def a_dims(value):
     return [[int(number) for number in re.findall(r"-?\d+", part)] for part in value.split(";")]
-
 
 
 def a_dispatch_inputs(task):
@@ -594,7 +583,6 @@ def a_dispatch_inputs(task):
     return {**unknown, 'reason': 'unsupported Dispatch activation/route-ID input layout'}
 
 
-
 class ATimeIndex:
     """All-stream clipped queries including tasks already active at the boundary."""
     def __init__(self, tasks):
@@ -612,7 +600,6 @@ class ATimeIndex:
         return [task for task in self.tasks[left:right] if task.end_ns > start]
 
 
-
 def a_source_shape_error(task, model, reason, capture=None):
     """Preserve the evidence behind a shape rejection; never infer a new K."""
     location = ''
@@ -625,7 +612,6 @@ def a_source_shape_error(task, model, reason, capture=None):
         + '; Input Shapes=' + repr(task.input_shapes)
         + '; Input Data Types=' + repr(task.input_dtypes)
         + '; Output Shapes=' + repr(task.output_shapes))
-
 
 
 def a_validate_source_shapes(tasks, model, capture=None):
@@ -660,7 +646,6 @@ def a_validate_source_shapes(tasks, model, capture=None):
                 'Dispatch activation/routing row counts contradict each other'
                 + f' (x_rows={x_shape[0]}, expert_ids_rows={ids_shape[0]})', capture)
     return warnings
-
 
 
 def measure_capture(capture, model, case, base=None):
@@ -720,7 +705,6 @@ def measure_capture(capture, model, case, base=None):
             'capture_reasons': ['HC_CYCLE_ONLY: device marker timing, configured BS and Neff']}
 
 
-
 def b_number(value):
     if isinstance(value, bool):
         return None
@@ -731,10 +715,8 @@ def b_number(value):
     return value if math.isfinite(value) else None
 
 
-
 def b_positive_int(value):
     return type(value) is int and value > 0
-
 
 
 def b_topology(case):
@@ -766,10 +748,8 @@ def b_topology(case):
     return topology, errors
 
 
-
 def b_unique(values):
     return list(dict.fromkeys(str(value) for value in values if value))
-
 
 
 def b_schedule(model, case, target_model):
@@ -824,7 +804,6 @@ def b_schedule(model, case, target_model):
     return source, target, b_unique(errors)
 
 
-
 def b_shapes(model, target_model, case):
     errors, shapes = [], {}
     ep0, ep1 = case.get('base_ep'), case.get('target_ep')
@@ -855,7 +834,6 @@ def b_shapes(model, target_model, case):
                     errors.append(f'目标{role}改变{k}，完整层source形状不能直接沿用')
         shapes[role] = {'source': src.copy(), 'target': dst, 'local0': local0, 'local1': local1}
     return shapes, b_unique(errors)
-
 
 
 def b_comm(method_id, model, shapes, case, projection, reference_rows):
@@ -930,14 +908,12 @@ def b_comm(method_id, model, shapes, case, projection, reference_rows):
     return info, info['reasons'], assumptions
 
 
-
 def positive_int(value, name, *, optional=False, zero=False):
     if value is None and optional:
         return None
     if type(value) is not int or value < (0 if zero else 1):
         raise ValueError(f'{name} must be an integer >= {0 if zero else 1}')
     return value
-
 
 
 def finite_number(value, name, *, minimum=None, maximum=None):
@@ -948,7 +924,6 @@ def finite_number(value, name, *, minimum=None, maximum=None):
     return value
 
 
-
 def referenced_object(value, base, name):
     if isinstance(value, str):
         path = Path(value).expanduser()
@@ -956,7 +931,6 @@ def referenced_object(value, base, name):
     if not isinstance(value, dict):
         raise ValueError(f'{name} must be an object or a JSON file path')
     return value
-
 
 
 def normalize_case(defaults, item, base):
@@ -1100,7 +1074,6 @@ def normalize_case(defaults, item, base):
     return case
 
 
-
 def validate_models(model, target):
     main = positive_int(model.get('num_hidden_layers'), 'sample_model.num_hidden_layers')
     if main != 8:
@@ -1132,14 +1105,12 @@ def validate_models(model, target):
                 raise ValueError('Invalid destination TopK/hash depth')
 
 
-
 def rank_name(path, index):
     for part in reversed(str(path).replace('\\', '/').split('/')[:-1]):
         match = re.search(r'(?:^|[_-])(?:dp|rank)[_-]?(\d+)(?=$|[_-])', part, re.I)
         if match:
             return 'dp' + str(int(match[1]))
     return 'trace' + str(index)
-
 
 
 def find_files(source, base, progress=None):
@@ -1156,7 +1127,6 @@ def find_files(source, base, progress=None):
     if not files:
         raise ValueError('No parsed kernel_details.csv in ' + str(path))
     return files
-
 
 
 def case_inputs(case, base, progress=None):
@@ -1184,7 +1154,6 @@ def case_inputs(case, base, progress=None):
     if duplicates or len(set(paths)) != len(paths):
         raise ValueError('Duplicate global rank/capture. Select one capture per global rank: ' + ', '.join(duplicates))
     return paths, names
-
 
 
 def list_inputs(config, base):
@@ -1220,7 +1189,6 @@ def list_inputs(config, base):
     return int(failed > 0)
 
 
-
 def rank_coverage_details(names, case):
     count = positive_int(case.get('expected_ranks'), 'expected_ranks')
     expected = case.get('expected_rank_names', ['dp' + str(i) for i in range(count)])
@@ -1234,10 +1202,8 @@ def rank_coverage_details(names, case):
             'unexpected': unexpected, 'complete': not missing and not unexpected and len(names) == len(expected)}
 
 
-
 def rank_coverage(names, case):
     return rank_coverage_details(names, case)['complete']
-
 
 
 def quantile(values, q):
@@ -1249,11 +1215,9 @@ def quantile(values, q):
     return values[i] + (values[j] - values[i]) * (p - i)
 
 
-
 def _ledger_value(ledger, key):
     value = ledger.get(key) if isinstance(ledger, dict) else None
     return value if type(value) in (int, float) and math.isfinite(value) else None
-
 
 
 def summarize_source(measurements, case):
@@ -1321,7 +1285,6 @@ def summarize_source(measurements, case):
                           'rank_coverage_complete': complete,
                           'declared_rank_names_complete': case['_rank_coverage_complete'],
                           'formula': 'Q_device=(1000*sum(output_tokens)/sum(cycle_ms))*source_dp/source_devices; selected rank=max(mean cycle)'}}
-
 
 
 def source_sweep_summary(case):
@@ -1440,6 +1403,23 @@ def source_sweep_summary(case):
     return result
 
 
+def _aligned_source_rank_hotspots(method, selected, rank):
+    """Reuse only saved whole-layer hotspots from this method and source rank."""
+    groups = (method if method.get("selected_rank") == rank else selected).get("operator_hotspots") or []
+    classes = {(row.get("role"), row.get("attention")): row for row in selected.get("class_means") or []}
+    for group in groups:
+        parent = classes.get((group.get("role"), group.get("attention"))) or {}
+        references = parent.get("reference_layers")
+        if not references or group.get("reference_layers") != references:
+            return []
+        for kernel in group.get("kernels") or []:
+            example = kernel.get("example") or {}
+            if (example.get("rank") != rank or example.get("layer") not in references
+                    or any(record.get("rank") != rank for record in example.get("records") or [])):
+                return []
+    return groups
+
+
 def _aligned_source_rank_stages(method, selected, rank):
     """Keep method-specific parents; reuse only this method's same-rank evidence."""
     groups = selected.get("target_stage_breakdowns") or []
@@ -1468,6 +1448,25 @@ def _aligned_source_rank_stages(method, selected, rank):
             stages.append(stage)
         output.append(dict(group, stage_rows=stages))
     return output
+
+
+def _lm_stored_prepare_groups(method, selected, rank):
+    """Reuse source preparation observations only with the same rank/references."""
+    groups = (method if method.get("selected_rank") == rank else selected).get("attention_prepare_breakdowns") or []
+    parents = {(row.get("role"), row.get("attention")): row for row in selected.get("class_means") or []}
+    stage_parents = {(row.get("role"), row.get("attention")): row
+                     for row in selected.get("target_stage_breakdowns") or []}
+    for group in groups:
+        key = group.get("role"), group.get("attention")
+        references = (parents.get(key) or {}).get("reference_layers")
+        rounds = group.get("rounds")
+        stage = stage_parents.get(key) or {}
+        if (group.get("rank") != rank or not references or group.get("reference_layers") != references
+                or type(rounds) is not int or rounds <= 0
+                or group.get("layer_round_samples") != rounds * len(references)
+                or stage.get("rounds", rounds) != rounds):
+            return []
+    return groups
 
 
 def align_report_source_rank(report):
@@ -1508,7 +1507,9 @@ def align_report_source_rank(report):
                         aggregation="per_round_layer_type_means_on_shared_source_cycle_rank",
                         class_means=selected.get("class_means") or [], role_details=selected.get("role_details") or [],
                         source_partition=selected.get("source_partition") or {}, breakdown=selected.get("breakdown") or [],
-                        target_stage_breakdowns=_aligned_source_rank_stages(method, selected, rank))
+                        operator_hotspots=_aligned_source_rank_hotspots(method, selected, rank),
+                        target_stage_breakdowns=_aligned_source_rank_stages(method, selected, rank),
+                        attention_prepare_breakdowns=_lm_stored_prepare_groups(method, selected, rank))
                 else:
                     # An unavailable estimate must not expose an old selected
                     # rank or stale target diagnostics after the policy changes.
@@ -1518,7 +1519,16 @@ def align_report_source_rank(report):
                         cycle_ms=None, per_device_tokens_s=None,
                         global_tokens_s=None, tpot_ms=None, class_means=selected.get("class_means") or [],
                         role_details=selected.get("role_details") or [], source_partition=selected.get("source_partition") or {},
-                        breakdown=[], target_stage_breakdowns=[])
+                        breakdown=[], operator_hotspots=[], target_stage_breakdowns=[], attention_prepare_breakdowns=[])
+                if "target_stage_breakdowns" in method:
+                    # Preserve the original scope of same-rank legacy kernels.
+                    # An empty new field would hide the renderer's legacy path.
+                    legacy = [dict(group, kernels=[kernel for stage in group.get("stage_rows") or []
+                        for kernel in (stage.get("operator_breakdown") or {}).get("kernels") or []])
+                        for group in method.get("target_stage_breakdowns") or []]
+                    if ("operator_hotspots" not in method and aligned.get("selected_rank") == method.get("selected_rank")
+                            and _aligned_source_rank_hotspots(dict(method, operator_hotspots=legacy), selected, rank)):
+                        aligned.pop("operator_hotspots", None)
                 previous = method.get("source_rank_alignment")
                 previous = previous if isinstance(previous, dict) else {}
                 aligned["source_rank_alignment"] = {
@@ -1605,10 +1615,14 @@ def validate_bound_profile(profile):
 
 
 def _bound_method_kernels(method):
+    if "operator_hotspots" in method:
+        for group in method.get("operator_hotspots") or []:
+            yield from group.get("kernels") or []
+        return
+    # Read-only compatibility for saved reports; no stage analysis is rerun.
     for group in method.get("target_stage_breakdowns") or []:
         for stage in group.get("stage_rows") or []:
-            for kernel in (stage.get("operator_breakdown") or {}).get("kernels") or []:
-                yield kernel
+            yield from (stage.get("operator_breakdown") or {}).get("kernels") or []
 
 
 def operator_bound_profile_template(report):
@@ -1742,39 +1756,47 @@ def refresh_report_operator_bounds(report, profile=None):
                      if method.get("selected_rank") is not None}
             if ranks != {case_profile["source_rank"]}:
                 raise ValueError("bound profile source_rank differs from method selected rank: " + str(case.get("name")))
+        def refresh_kernel(kernel, method):
+            nonlocal updated
+            key, pmu = kernel.get("key"), dict(kernel.get("pmu") or {})
+            seen.add(key)
+            op = operators.get(key)
+            if op is not None and method.get("selected_rank") != case_profile.get("source_rank"):
+                raise ValueError("bound profile source_rank differs from method selected rank: " + str(case.get("name")))
+            metrics = {field: (dict(item, field_info=dict(_A_PMU_FIELD_INFO[field]))
+                if isinstance(item, dict) and field in _A_PMU_FIELD_INFO and not item.get("field_info") else item)
+                for field, item in (pmu.get("metrics") or {}).items()}
+            pmu["metrics"] = metrics
+            coverage = pmu.get("coverage") or {}
+            samples = [{"core_type": core, "metrics": {field: item["value"] for field, item in metrics.items()
+                if isinstance(item, dict) and type(item.get("value")) in (float, int)}}
+                for core in pmu.get("core_types") or []]
+            pmu["bound"] = _lm_operator_pmu_bound(kernel, metrics, coverage, samples,
+                sample_diagnostics=pmu.get("sample_diagnostics"))
+            pmu["roofline"] = _lm_operator_roofline(kernel, pmu, op, case_profile.get("hardware"))
+            pmu["scope_note"] = _LM_PMU_NOTE
+            pmu["bound_engine_version"] = BOUND_ENGINE_VERSION
+            updated += 1
+            return dict(kernel, pmu=pmu)
+
         for method in projection.get("layer_mean_methods") or []:
-            groups = []
-            for group in method.get("target_stage_breakdowns") or []:
-                stages = []
-                for stage in group.get("stage_rows") or []:
-                    breakdown, kernels = stage.get("operator_breakdown"), []
-                    if not isinstance(breakdown, dict):
-                        stages.append(stage)
-                        continue
-                    for kernel in breakdown.get("kernels") or []:
-                        key, pmu = kernel.get("key"), dict(kernel.get("pmu") or {})
-                        seen.add(key)
-                        op = operators.get(key)
-                        if op is not None and method.get("selected_rank") != case_profile.get("source_rank"):
-                            raise ValueError("bound profile source_rank differs from method selected rank: " + str(case.get("name")))
-                        metrics = {field: (dict(item, field_info=dict(_A_PMU_FIELD_INFO[field]))
-                            if isinstance(item, dict) and field in _A_PMU_FIELD_INFO and not item.get("field_info") else item)
-                            for field, item in (pmu.get("metrics") or {}).items()}
-                        pmu["metrics"] = metrics
-                        coverage = pmu.get("coverage") or {}
-                        samples = [{"core_type": core, "metrics": {field: item["value"] for field, item in metrics.items()
-                            if isinstance(item, dict) and type(item.get("value")) in (float, int)}}
-                            for core in pmu.get("core_types") or []]
-                        pmu["bound"] = _lm_operator_pmu_bound(kernel, metrics, coverage, samples,
-                            sample_diagnostics=pmu.get("sample_diagnostics"))
-                        pmu["roofline"] = _lm_operator_roofline(kernel, pmu, op, case_profile.get("hardware"))
-                        pmu["scope_note"] = _LM_PMU_NOTE
-                        pmu["bound_engine_version"] = BOUND_ENGINE_VERSION
-                        kernels.append(dict(kernel, pmu=pmu))
-                        updated += 1
-                    stages.append(dict(stage, operator_breakdown=dict(breakdown, kernels=kernels)))
-                groups.append(dict(group, stage_rows=stages))
-            methods.append(dict(method, target_stage_breakdowns=groups))
+            if "operator_hotspots" in method:
+                groups = [dict(group, kernels=[refresh_kernel(kernel, method)
+                    for kernel in group.get("kernels") or []]) for group in method.get("operator_hotspots") or []]
+                methods.append(dict(method, operator_hotspots=groups))
+            else:
+                # Old JSON keeps saved evidence only. This path performs no
+                # stage boundaries, operator coverage sweeps or target deltas.
+                groups = []
+                for group in method.get("target_stage_breakdowns") or []:
+                    stages = []
+                    for stage in group.get("stage_rows") or []:
+                        breakdown = stage.get("operator_breakdown")
+                        stages.append(dict(stage, operator_breakdown=dict(breakdown,
+                            kernels=[refresh_kernel(kernel, method) for kernel in breakdown.get("kernels") or []]))
+                            if isinstance(breakdown, dict) else stage)
+                    groups.append(dict(group, stage_rows=stages))
+                methods.append(dict(method, target_stage_breakdowns=groups))
         if set(operators) - seen:
             raise ValueError("bound profile operator fingerprint not present: " + str(case.get("name")))
         cases.append(dict(case, projection=dict(projection, layer_mean_methods=methods)))
@@ -1793,7 +1815,6 @@ def read_reference(path):
         if 'bs' not in reader.fieldnames:
             raise ValueError('Communication reference needs bs column')
         return list(reader)
-
 
 
 def _case_analysis_plan(case, model, target, base):
@@ -1840,7 +1861,7 @@ def _analyze_case_rank(plan, rank_index, *, capture_hashes=None, prepare_source=
         capture_hashes[capture['sha256']] = rank
     measured = measure_capture(capture, model, case, base)
     print(f'  {rank} HC周期识别完成：{len(measured["rounds"])}轮，'
-          f'{time.perf_counter() - stage_started:.2f}s；开始层内阶段统计', flush=True)
+          f'{time.perf_counter() - stage_started:.2f}s；开始整层统计', flush=True)
     trace_path = next((item.get('trace_path') for item in case.get('inputs', [])
                        if item.get('rank') == rank), None)
     if trace_path is not None:
@@ -1861,7 +1882,7 @@ def _analyze_case_rank(plan, rank_index, *, capture_hashes=None, prepare_source=
                 for field in ('layer_diagnostics', 'swa_diagnostics'):
                     measured[field] = {'status': 'ERROR', 'reason': str(error),
                                        'layer_summary': [], 'stage_summary': [], 'stages_csv': None}
-            print(f'  {rank} 层内阶段统计结束：{time.perf_counter() - stage_started:.2f}s；'
+            print(f'  {rank} 整层统计结束：{time.perf_counter() - stage_started:.2f}s；'
                   '开始HC剩余区间/Host来源统计', flush=True)
             stage_started = time.perf_counter()
             measured['step_residuals'] = residual_analyze_capture(
@@ -1949,7 +1970,6 @@ def analyze_case(case, model, target, base, reference_rows=None):
     return _assemble_case_analysis(plan, results)
 
 
-
 @contextmanager
 def atomic_writer(path, encoding='utf-8'):
     """Close temporary handles before replace/cleanup, including on Windows."""
@@ -1965,7 +1985,6 @@ def atomic_writer(path, encoding='utf-8'):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-
 
 
 # HC-residual base measurements; all times are observations, never extra costs.
@@ -3891,11 +3910,9 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
             "trace": trace, "residual_ms_mean": statistics.fmean(windows[index]["cycle_residual_ms"] for index in range(0, len(windows), 2))}
 
 
-
 def atomic_text(path, text):
     with atomic_writer(path) as stream:
         stream.write(text)
-
 
 
 def atomic_json(path, value, progress=None):
@@ -3917,7 +3934,6 @@ def atomic_json(path, value, progress=None):
                 last = now
         stream.write(''.join(chunks))
         stream.write('\n')
-
 
 
 def write_csv(path, rows, progress=None):
@@ -3945,7 +3961,6 @@ def write_csv(path, rows, progress=None):
             if progress is not None and now - last >= 5:
                 progress(f'写入 {Path(path).name}：已写 {index:,} 行')
                 last = now
-
 
 
 def displayed_methods(case):
@@ -3991,7 +4006,6 @@ def result_rows(report):
     return rows
 
 
-
 LAYER_MEAN_STATUS = "LAYER_MEAN_ESTIMATE"
 LAYER_MEAN_METHOD_IDS = ("method1", "method2", "method3")
 LAYER_MEAN_METHOD_NAMES = {
@@ -4011,8 +4025,6 @@ LAYER_MEAN_ASSUMPTIONS = [
     "All modeled increments are exposed. Target overlap, routing, padding, graph capacity, context, network contention and stationarity are not measured.",
     "Throughput uses configured new tokens per request per round, including bonus, and explicit DP/physical cards; it is not measured accepted-token throughput.",
 ]
-
-
 
 
 def _lm_number(value, label, positive=False):
@@ -4048,22 +4060,18 @@ def _lm_method3_metadata(method):
     return method
 
 
-
 def _lm_exact_ns(value):
     return a_exact_ns(value, "HC timestamp")
-
 
 
 def _lm_union_ms(intervals):
     return sum(right - left for left, right in a_union(intervals)) / 1e6
 
 
-
 def _lm_gmm(task):
     label = re.sub(r"[^a-z0-9]", "", task.label.lower())
     return ("groupedmatmul" in label or "ggmm" in label
             or bool(re.search(r"(?:mxfp[48]|fp[48]).*gmm|gmm.*(?:mxfp[48]|fp[48])", label)))
-
 
 
 def _lm_native_layer(tasks, starts, layer, model, ep, require_compute=True):
@@ -4108,7 +4116,6 @@ def _lm_native_layer(tasks, starts, layer, model, ep, require_compute=True):
             "routed_compute_ms": duration}, evidence
 
 
-
 _LM_TARGET_STAGE_KEYS = ("attention_prepare", "attention", "attention_output", "attention_post",
                          "moe_prepare", "dispatch", "experts", "combine", "ffn_output", "ffn_post")
 
@@ -4116,18 +4123,15 @@ _LM_TARGET_STAGE_KEYS = ("attention_prepare", "attention", "attention_output", "
 _LM_OPERATOR_FIELDS = ("name", "op_type", "input_shapes", "output_shapes", "input_dtypes", "output_dtypes",
                        "stream_id", "task_type")
 _LM_OPERATOR_NOTE = (
-    "源子项为阶段内整数ns裁剪后的互斥记录覆盖，含并发集合和无设备记录间隙；跨层/跨阶段裁剪仅计覆盖，不证明业务归属。"
-    "间隙不等同CPU耗时，记录覆盖不证明关键路径或可节省时间。"
-    "成员instances保留同指纹并发实例数；同步/控制记录仍计入覆盖，不等同计算忙时。"
-    "source_ms、kernel_sum_ms与calls_mean先按每轮全部参考层平均，再按本rank全部保留轮次平均；未出现指纹计确定0，缺证据不补0。"
-    "kernel_sum_ms是每参考层轮次的累计裁剪记录时间均值，可因并发超过阶段跨度，不可相加为周期；"
-    "duration_mean_ms/p90是所有实际观察到的阶段内裁剪调用的合并分布，不含未出现调用。"
-    "目标仅保留源覆盖并另列父估算的具名模型增减项，不向单个kernel分摊；负增量保留，非实测优化收益。"
+    "按完整参考HC层区间统计Top算子，不再划分层内阶段或计算目标算子贡献。"
+    "kernel_sum_ms和calls_mean以本rank全部保留轮次、全部同类型参考层为分母，未出现调用计0；缺证据不补0。"
+    "kernel_sum_ms为相交调用裁剪时间累计的单层均值；并发调用可重叠，不可相加为周期。"
+    "duration_mean_ms/p90为实际相交调用的层内裁剪时长分布。PMU使用唯一原生整次调用，不乘外推倍率。"
 )
 
 _LM_PMU_NOTE = (
     "PMU仅为源采样实际kernel整次调用的指标，按整次Duration加权；不乘目标层数、通信或TopK倍率。"
-    "阶段裁剪只改变耗时账本，不能测出该子区间的局部PMU；跨阶段引用同次调用时不可相加。"
+    "层边界裁剪只改变耗时统计，不能测出局部PMU；跨层引用同次调用时不可相加。"
     "覆盖率分母为本项实际相交的唯一原始调用及其整次Duration，逐指标另列已知/总样本；"
     "未采集、非法或冲突值保持未知，观测到的0保留。流水可重叠，比例不能相加；"
     "bound为保守的流水倾向，非因果证明；MTE高不等于HBM饱和，cube_utilization不是MFU。"
@@ -4476,195 +4480,68 @@ def _lm_operator_example(task, start, end, scope):
             "duration_ns": end - start, "task_start_ns": str(task.start_ns), "task_end_ns": str(task.end_ns)}
 
 
-def _lm_operator_neighbor(time_index, timestamp, *, before):
-    if before:
-        if not hasattr(time_index, "_operator_ends"):
-            time_index._operator_end_tasks = sorted(time_index.tasks,
-                key=lambda task: (task.end_ns, task.start_ns, task.row_index))
-            time_index._operator_ends = [task.end_ns for task in time_index._operator_end_tasks]
-        index = bisect.bisect_right(time_index._operator_ends, timestamp) - 1
-        task = time_index._operator_end_tasks[index] if index >= 0 else None
-    else:
-        index = bisect.bisect_left(time_index.starts, timestamp)
-        task = time_index.tasks[index] if index < len(time_index.tasks) else None
-    if task is None:
-        return None
-    return {**_lm_operator_member(task, time_index),
-            **_lm_operator_example(task, task.start_ns, task.end_ns, {})}
-
-
-def _lm_operator_stage(stage, time_index, scope):
-    """Exact half-open coverage; active multiplicities preserve parallel calls."""
-    left, right = _lm_exact_ns(stage["start_ns"]), _lm_exact_ns(stage["end_ns"])
-    result = {"status": "UNAVAILABLE", "reason": None, "rows": [], "kernels": {}}
+def _lm_operator_layer(layer, time_index, scope):
+    """Scan one complete HC layer once; keep native calls without stage sweeps."""
+    result = {"layer": layer["layer"], "status": "UNAVAILABLE", "reason": None, "kernels": {}}
     try:
-        if right < left:
-            raise ValueError("operator stage has reversed bounds")
-        events, kernels, members, examples = collections.defaultdict(collections.Counter), {}, {}, collections.defaultdict(list)
-        events[left]; events[right]
+        left, right = _lm_exact_ns(layer["start_ns"]), _lm_exact_ns(layer["end_ns"])
+        if right <= left:
+            raise ValueError("operator layer has nonpositive bounds")
         for task in time_index.overlapping(left, right):
             a, b = max(left, _lm_exact_ns(task.start_ns)), min(right, _lm_exact_ns(task.end_ns))
             if b <= a:
                 continue
             member = _lm_operator_member(task, time_index)
-            key = member["key"]
-            members[key] = member
-            events[a][key] += 1
-            events[b][key] -= 1
-            examples[key].append((a, b, _lm_operator_example(task, a, b, scope)))
-            if key not in kernels:
-                kernels[key] = {"member": member, "durations_ns": [],
-                    "example": _lm_operator_example(task, a, b, scope), "pmu_observations": []}
-            kernels[key]["durations_ns"].append(b - a)
-            kernels[key]["pmu_observations"].append(_lm_operator_pmu_observation(task, a, b, scope))
-        active, rows = collections.Counter(), {}
-        points = sorted(events)
-        for index, a in enumerate(points):
-            active.update(events[a])
-            if any(value < 0 for value in active.values()):
-                raise ValueError("operator sweep has a negative active count")
-            active = collections.Counter({key: value for key, value in active.items() if value})
-            if index + 1 == len(points):
-                if active:
-                    raise ValueError("operator sweep did not finish at the stage boundary")
-                break
-            b = points[index + 1]
-            if b <= a:
-                continue
-            signature = tuple(sorted(active.items()))
-            kind = "gap" if not signature else "operator" if sum(active.values()) == 1 else "parallel"
-            key = "gap" if not signature else kind + "_" + hashlib.sha256(
-                json.dumps(signature).encode()).hexdigest()
-            if key not in rows:
-                names = [(members[identity]["name"] or members[identity]["op_type"] or "未导出名称")
-                         + (" ×" + str(count) if count > 1 else "") for identity, count in signature]
-                label = ("无设备任务记录区间（非CPU归因）" if kind == "gap" else
-                         ("并发记录：" if kind == "parallel" else "") + " + ".join(names))
-                rows[key] = {"key": key, "label": label[:240], "kind": kind, "duration_ns": 0,
-                    "members": [dict(members[identity], instances=count) for identity, count in signature],
-                    "example": None}
-            if rows[key]["example"] is None or b - a > rows[key]["example"]["duration_ns"]:
-                if signature:
-                    records = []
-                    for identity, count in signature:
-                        matching = [value for start, end, value in examples[identity] if start < b and end > a]
-                        if len(matching) != count:
-                            raise ValueError("operator instance evidence disagrees with active multiplicities")
-                        records.extend(dict(value, key=identity, start_ns=str(a), end_ns=str(b),
-                                            clip_start_ns=str(a), clip_end_ns=str(b), duration_ns=b - a)
-                                       for value in matching)
-                    example = dict(records[0], records=records)
-                else:
-                    example = {**scope, "start_ns": str(a), "end_ns": str(b), "clip_start_ns": str(a), "clip_end_ns": str(b),
-                        "duration_ns": b - a, "before": _lm_operator_neighbor(time_index, a, before=True),
-                        "after": _lm_operator_neighbor(time_index, b, before=False)}
-                rows[key]["example"] = example
-            rows[key]["duration_ns"] += b - a
-        if sum(row["duration_ns"] for row in rows.values()) != right - left:
-            raise ValueError("operator coverage does not close to the exact stage span")
-        result.update(status="MATCHED", rows=list(rows.values()), kernels=kernels)
+            kernel = result["kernels"].setdefault(member["key"], {"member": member, "durations_ns": [],
+                "example": _lm_operator_example(task, a, b, scope), "pmu_observations": []})
+            kernel["durations_ns"].append(b - a)
+            kernel["pmu_observations"].append(_lm_operator_pmu_observation(task, a, b, scope))
+        result["status"] = "MATCHED"
     except (ValueError, KeyError, TypeError, ArithmeticError) as error:
-        result["reason"] = str(error)
+        result.update(reason=str(error), kernels={})
     return result
 
 
 def _lm_operator_source_means(source_rounds):
-    """Private cached source evidence; no per-round operator payload is exported."""
+    """Whole-layer source hotspots, normalized over every reference layer-round."""
     output = {}
-    keys = {key for cycle in source_rounds for key in cycle.get("class_stage_values", {})}
-    for group in keys:
-        samples = [cycle.get("class_stage_values", {}).get(group, []) for cycle in source_rounds]
+    keys = {key for cycle in source_rounds for key in cycle.get("class_operator_values", {})}
+    for group in sorted(keys):
+        samples = [cycle.get("class_operator_values", {}).get(group, []) for cycle in source_rounds]
         references = [sample.get("layer") for sample in samples[0]]
-        for stage_key in _LM_TARGET_STAGE_KEYS:
-            item = {"status": "UNAVAILABLE", "reason": None, "rows": [], "kernels": [],
-                    "reference_layers": references, "rounds": len(source_rounds)}
-            output[group, stage_key] = item
-            try:
-                if not references or any([sample.get("layer") for sample in cycle] != references for cycle in samples):
-                    raise ValueError("operator references disagree with retained layers/rounds")
-                evidence = []
-                for cycle in samples:
-                    for sample in cycle:
-                        stage = sample.get("_operator_stages", {}).get(stage_key)
-                        if not stage or stage.get("status") != "MATCHED":
-                            raise ValueError((stage or {}).get("reason") or "operator stage evidence unavailable")
-                        evidence.append(stage)
-                denominator = len(evidence)
-                rows, kernels = {}, {}
-                for stage in evidence:
-                    for row in stage["rows"]:
-                        if row["key"] not in rows:
-                            rows[row["key"]] = dict(row, duration_ns=0)
-                        elif row["example"]["duration_ns"] > rows[row["key"]]["example"]["duration_ns"]:
-                            rows[row["key"]]["example"] = row["example"]
-                        rows[row["key"]]["duration_ns"] += row["duration_ns"]
-                    for key, kernel in stage["kernels"].items():
-                        if key not in kernels:
-                            kernels[key] = {"member": kernel["member"], "durations_ns": [], "example": kernel["example"],
-                                            "pmu_observations": []}
-                        kernels[key]["durations_ns"].extend(kernel["durations_ns"])
-                        kernels[key]["pmu_observations"].extend(kernel.get("pmu_observations", []))
-                item["rows"] = [{key: value for key, value in row.items() if key != "duration_ns"}
-                                | {"source_ms": row["duration_ns"] / denominator / 1e6} for row in rows.values()]
-                item["kernels"] = [dict(kernel["member"],
-                    calls_mean=len(kernel["durations_ns"]) / denominator,
-                    kernel_sum_ms=sum(kernel["durations_ns"]) / denominator / 1e6,
-                    duration_mean_ms=statistics.fmean(kernel["durations_ns"]) / 1e6,
-                    duration_p90_ms=quantile(kernel["durations_ns"], .9) / 1e6,
-                    example=kernel["example"], pmu=_lm_operator_pmu_summary(kernel["member"], kernel["pmu_observations"]))
-                    for kernel in kernels.values()]
-                item["kernels"].sort(key=lambda row: (-row["kernel_sum_ms"], row["key"]))
-                item.update(status="MATCHED", layer_round_samples=denominator)
-            except (ValueError, KeyError, TypeError, ArithmeticError) as error:
-                item["reason"] = str(error)
+        item = {"role": group[0], "attention": group[1], "status": "UNAVAILABLE", "reason": None,
+                "note": _LM_OPERATOR_NOTE, "kernels": [], "reference_layers": references,
+                "rounds": len(source_rounds), "layer_round_samples": None}
+        output[group] = item
+        try:
+            if not references or any([sample.get("layer") for sample in cycle] != references for cycle in samples):
+                raise ValueError("operator references disagree with retained layers/rounds")
+            evidence = [sample for cycle in samples for sample in cycle]
+            if any(sample.get("status") != "MATCHED" for sample in evidence):
+                raise ValueError(next(sample.get("reason") or "whole-layer operator evidence unavailable"
+                                      for sample in evidence if sample.get("status") != "MATCHED"))
+            denominator, kernels = len(evidence), {}
+            for sample in evidence:
+                for key, kernel in sample["kernels"].items():
+                    combined = kernels.setdefault(key, {"member": kernel["member"], "durations_ns": [],
+                        "example": kernel["example"], "pmu_observations": []})
+                    combined["durations_ns"].extend(kernel["durations_ns"])
+                    combined["pmu_observations"].extend(kernel.get("pmu_observations", []))
+            item["kernels"] = [dict(kernel["member"],
+                calls_mean=len(kernel["durations_ns"]) / denominator,
+                kernel_sum_ms=sum(kernel["durations_ns"]) / denominator / 1e6,
+                duration_mean_ms=statistics.fmean(kernel["durations_ns"]) / 1e6,
+                duration_p90_ms=quantile(kernel["durations_ns"], .9) / 1e6,
+                example=kernel["example"], pmu=_lm_operator_pmu_summary(kernel["member"], kernel["pmu_observations"]))
+                for kernel in kernels.values()]
+            item["kernels"].sort(key=lambda row: (-row["kernel_sum_ms"], row["key"]))
+            item.update(status="MATCHED", layer_round_samples=denominator)
+        except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+            item["reason"] = str(error)
     return output
 
 
-def _lm_operator_target_groups(groups, source_means, cycle_ms):
-    """Expand final selected-rank groups without changing any parent number."""
-    output = []
-    model_labels = {"dispatch": "模型增减：Dispatch通信倍率及固定附加项",
-                    "combine": "模型增减：Combine通信倍率及固定附加项",
-                    "experts": "模型增减：具名路由GMM按TopK变化（未证明全部暴露）"}
-    for group in groups:
-        stages = []
-        for stage in group["stage_rows"]:
-            source = source_means.get(((group["role"], group["attention"]), stage["stage_key"]), {})
-            breakdown = {"status": "UNAVAILABLE", "reason": None, "note": _LM_OPERATOR_NOTE,
-                         "rows": [], "kernels": []}
-            try:
-                if (source.get("status") != "MATCHED" or source.get("reference_layers") != group["reference_layers"]
-                        or source.get("rounds") != group["rounds"]):
-                    raise ValueError(source.get("reason") or "operator sample identities disagree with the parent")
-                count = group["target_layers"]
-                rows = [dict(row, delta_ms=0., target_ms=row["source_ms"],
-                             target_total_ms=count * row["source_ms"],
-                             cycle_share=count * row["source_ms"] / cycle_ms) for row in source["rows"]]
-                delta = stage["delta_ms"]
-                if delta:
-                    if stage["stage_key"] not in model_labels:
-                        raise ValueError("unexpected parent delta without a named operator model")
-                    rows.append({"key": "model_delta_" + stage["stage_key"],
-                        "label": model_labels[stage["stage_key"]], "kind": "model_delta", "source_ms": 0.,
-                        "delta_ms": delta, "target_ms": delta, "target_total_ms": count * delta,
-                        "cycle_share": count * delta / cycle_ms, "members": [], "example": None})
-                for field in ("source_ms", "delta_ms", "target_ms", "target_total_ms"):
-                    if not math.isclose(math.fsum(row[field] for row in rows), stage[field], rel_tol=1e-12, abs_tol=1e-8):
-                        raise ValueError("operator rows do not close to parent " + field)
-                rows.sort(key=lambda row: (row["kind"] == "model_delta", -row["source_ms"], row["key"]))
-                breakdown.update(status="MATCHED", rows=rows, kernels=source["kernels"],
-                    reference_layers=group["reference_layers"], rounds=group["rounds"],
-                    layer_round_samples=source["layer_round_samples"])
-                if group.get("note"):
-                    breakdown["note"] += " " + group["note"]
-            except (ValueError, KeyError, TypeError, ArithmeticError) as error:
-                breakdown["reason"] = str(error)
-            stages.append(dict(stage, operator_breakdown=breakdown))
-        output.append(dict(group, stage_rows=stages))
-    return output
-
-
-def _lm_source_layer_stages(layer, tasks, starts, native, *, time_index=None, round_id=None, rank=None):
+def _lm_source_layer_stages(layer, tasks, starts, native, *, time_index=None, round_id=None, rank=None, model=None):
     """Optional stage evidence, without changing the parent layer estimator."""
     entry = {"layer": layer["layer"], "status": "UNAVAILABLE", "reason": None,
              "note": None, "stage_rows": []}
@@ -4701,9 +4578,17 @@ def _lm_source_layer_stages(layer, tasks, starts, native, *, time_index=None, ro
                              "不把未知 GMM 耗时补零。")
         entry.update(status="MATCHED", stage_rows=[{"stage_key": row["stage_key"],
             "stage_order": row["stage_order"], "label": row["label"], "source_ms": row["duration_ms"]} for row in stages])
-        time_index = time_index if time_index is not None else ATimeIndex(tasks)
-        scope = {"rank": rank, "round_id": round_id, "layer": layer["layer"]}
-        entry["_operator_stages"] = {row["stage_key"]: _lm_operator_stage(row, time_index, scope) for row in stages}
+        prepare = stages[0]
+        try:
+            entry["_attention_prepare"] = analyze_attention_prepare(
+                (time_index if time_index is not None else ATimeIndex(tasks)).overlapping(
+                    _lm_exact_ns(prepare["start_ns"]), _lm_exact_ns(prepare["end_ns"])),
+                _lm_exact_ns(prepare["start_ns"]), _lm_exact_ns(prepare["end_ns"]),
+                model=model, attention=layer["attention"],
+                scope={"rank": rank, "round_id": round_id, "layer": layer["layer"]})
+        except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+            entry["_attention_prepare"] = {"status": "UNAVAILABLE", "reason": str(error),
+                "parent_wall_ns": None, "rows": []}
     except (ValueError, KeyError, TypeError, ArithmeticError) as error:
         entry["reason"] = str(error)
     return entry
@@ -4774,6 +4659,68 @@ def _lm_target_stage_breakdowns(classes, groups, cycle_ms, *, rounds=1, layer_sa
     return output
 
 
+def _lm_attention_prepare_source_means(source_rounds, rank):
+    """Source-only functional groups; incomplete attribution never becomes zero."""
+    keys = {key for cycle in source_rounds for key in cycle.get("class_stage_values", {})}
+    output = []
+    for key in sorted(keys):
+        samples = [cycle.get("class_stage_values", {}).get(key, []) for cycle in source_rounds]
+        references = [sample.get("layer") for sample in samples[0]]
+        total = sum(len(cycle) for cycle in samples)
+        group = {"role": key[0], "attention": key[1], "rank": rank,
+            "status": "UNAVAILABLE", "reason": None, "reference_layers": references,
+            "rounds": len(source_rounds), "layer_round_samples": total,
+            "parent_wall_ms": None, "recorded_busy_ms": None, "uncovered_ms": None, "rows": [],
+            "note": "源参考层×保留轮次均值；不乘目标层数或外推倍率。业务分支可重叠，kernel累计、各组并集和跨度均不能相加成父项。"
+                    "仅全部样本确认归属才显示分组均值；同名算子不按次序猜测，融合kernel不拆内部耗时；未覆盖区间不直接命名为CPU或同步等待。"}
+        output.append(group)
+        try:
+            if not references or any([sample.get("layer") for sample in cycle] != references for cycle in samples):
+                raise ValueError("attention preparation references disagree with the source class")
+            windows = [sample.get("_attention_prepare") for cycle in samples for sample in cycle]
+            if any(not isinstance(window, dict) or window.get("parent_wall_ns") is None for window in windows):
+                raise ValueError("source attention preparation boundaries or observations unavailable")
+            if any(window.get("status") == "UNAVAILABLE" for window in windows):
+                raise ValueError("; ".join(dict.fromkeys(window.get("reason") or "preparation unavailable"
+                    for window in windows if window.get("status") == "UNAVAILABLE")))
+            for target, field in (("parent_wall_ms", "parent_wall_ns"),
+                                  ("recorded_busy_ms", "recorded_busy_ns"), ("uncovered_ms", "uncovered_ns")):
+                group[target] = statistics.fmean(window[field] for window in windows) / 1e6
+            if not math.isclose(group["parent_wall_ms"], group["recorded_busy_ms"] + group["uncovered_ms"],
+                                rel_tol=1e-12, abs_tol=1e-8):
+                raise ValueError("source attention preparation record coverage does not close")
+            row_keys = list(dict.fromkeys(row["key"] for window in windows for row in window.get("rows") or []))
+            for row_key in row_keys:
+                observed = [next((row for row in window.get("rows") or [] if row["key"] == row_key), None)
+                            for window in windows]
+                present = [row for row in observed if row is not None]
+                template = present[0]
+                known = [row for row in present if row.get("status") == "MATCHED"
+                         or row_key == "unassigned" and row.get("status") == "UNASSIGNED"]
+                not_applicable = len(present) == total and all(row.get("status") == "NOT_APPLICABLE" for row in present)
+                complete = len(known) == total
+                row = {"key": row_key, "label": template["label"],
+                    "status": "NOT_APPLICABLE" if not_applicable else "MATCHED" if complete else "UNKNOWN",
+                    "reason": ("记录时长已知，业务归属未确认" if row_key == "unassigned" else None) if complete else "该层类型不适用" if not_applicable else
+                              "归属证据仅确认 " + str(len(known)) + "/" + str(total) + " 个参考层轮样本，未推算全样本均值",
+                    "function_entries": list(dict.fromkeys(entry for item in present for entry in item.get("function_entries") or [])),
+                    "known_samples": len(known), "total_samples": total,
+                    "kernel_count_mean": None, "kernel_sum_ms": None, "busy_union_ms": None, "span_ms": None}
+                if complete:
+                    row["kernel_count_mean"] = statistics.fmean(item["kernel_count"] for item in known)
+                    for target, field in (("kernel_sum_ms", "kernel_sum_ns"), ("busy_union_ms", "busy_union_ns"),
+                                          ("span_ms", "span_ns")):
+                        row[target] = statistics.fmean(item[field] for item in known) / 1e6
+                group["rows"].append(row)
+            group["status"] = "MATCHED" if (group["rows"]
+                and all(window.get("status") == "MATCHED" for window in windows)
+                and all(row["status"] in ("MATCHED", "NOT_APPLICABLE") for row in group["rows"])) else "PARTIAL"
+            if group["status"] == "PARTIAL":
+                group["reason"] = "部分业务归属无法从现有记录唯一确认；已保留未归属记录及未知项"
+        except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+            group["reason"] = str(error)
+    return output
+
 
 def _lm_source_round(cycle, tasks, starts, model, case, source_schedule, excluded, compute_required,
                      *, time_index=None, rank=None):
@@ -4799,6 +4746,7 @@ def _lm_source_round(cycle, tasks, starts, model, case, source_schedule, exclude
         previous = right
     time_index = time_index if time_index is not None else ATimeIndex(tasks)
     roles, class_values, evidence = {}, collections.defaultdict(list), []
+    class_operator_values = collections.defaultdict(list)
     class_stage_values = collections.defaultdict(list)
     for role in ("main", "draft"):
         selected = [layer for layer in layers if layer["role"] == role]
@@ -4823,8 +4771,11 @@ def _lm_source_round(cycle, tasks, starts, model, case, source_schedule, exclude
                 continue
             values, proof = _lm_native_layer(tasks, starts, layer, model, case["base_ep"], compute_required[role])
             class_values[(role, layer["attention"])].append((layer["layer"], values))
+            class_operator_values[(role, layer["attention"])].append(_lm_operator_layer(
+                layer, time_index, {"rank": rank, "round_id": cycle.get("round_id"),
+                                    "role": role, "attention": layer["attention"], "layer": layer["layer"]}))
             class_stage_values[(role, layer["attention"])].append(_lm_source_layer_stages(
-                layer, tasks, starts, values, time_index=time_index, round_id=cycle.get("round_id"), rank=rank))
+                layer, tasks, starts, values, time_index=time_index, round_id=cycle.get("round_id"), rank=rank, model=model))
             evidence.append({"round_id": cycle.get("round_id"), **proof})
     span_sum = math.fsum(value["source_chain_ms"] for value in roles.values())
     residual = duration - span_sum
@@ -4843,8 +4794,8 @@ def _lm_source_round(cycle, tasks, starts, model, case, source_schedule, exclude
                  "scope": "all original source layer walls and same-role gaps plus cross-role/tail residual, each once; layer0 exclusion changes references only"}
     return {"round_id": cycle.get("round_id"), "source_cycle_ms": duration,
             "roles": roles, "class_values": class_values, "source_partition": partition,
-            "compute_evidence": evidence, "class_stage_values": class_stage_values}
-
+            "compute_evidence": evidence, "class_operator_values": class_operator_values,
+            "class_stage_values": class_stage_values}
 
 
 def _lm_average_records(rounds, field, key_fields):
@@ -4865,12 +4816,10 @@ def _lm_average_records(rounds, field, key_fields):
     return output
 
 
-
 def _lm_partition_mean(rounds):
     first = rounds[0]["source_partition"]
     return {key: statistics.fmean(cycle["source_partition"][key] for cycle in rounds)
             if type(value) in (int, float) else value for key, value in first.items()}
-
 
 
 def _lm_source_summary(prepared):
@@ -4889,14 +4838,13 @@ def _lm_source_summary(prepared):
             rounds.append({"round_id": source["round_id"], "source_cycle_ms": source["source_cycle_ms"],
                            "cycle_ms": None, "class_means": classes,
                            "role_details": [{"role": role, **values} for role, values in source["roles"].items()],
-                           "source_partition": source["source_partition"], "target_stage_breakdowns": []})
+                           "source_partition": source["source_partition"]})
         output.append({"rank": rank, "rounds": rounds, "cycle_ms": None,
                        "source_cycle_ms": statistics.fmean(row["source_cycle_ms"] for row in rounds),
                        "class_means": _lm_average_records(rounds, "class_means", ("role", "attention")),
                        "role_details": _lm_average_records(rounds, "role_details", ("role",)),
-                       "source_partition": _lm_partition_mean(rounds), "target_stage_breakdowns": []})
+                       "source_partition": _lm_partition_mean(rounds)})
     return output
-
 
 
 def _lm_source_rank_selection(result, prepared=None):
@@ -5067,8 +5015,8 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
                          "breakdown": _lm_average_records(rounds, "breakdown", ("key",))})
         stage_groups = collections.defaultdict(list)
         for source_round in rounds:
-            for row in source_round["target_stage_breakdowns"]:
-                stage_groups[(row["role"], row["attention"])].append(row)
+            for group in source_round["target_stage_breakdowns"]:
+                stage_groups[(group["role"], group["attention"])].append(group)
         per_rank[-1]["target_stage_breakdowns"] = _lm_target_stage_breakdowns(
             per_rank[-1]["class_means"], stage_groups, per_rank[-1]["cycle_ms"], rounds=len(rounds))
     if not per_rank:
@@ -5082,8 +5030,11 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
     operator_cache = operator_cache if operator_cache is not None else {}
     if selected["rank"] not in operator_cache:
         operator_cache[selected["rank"]] = _lm_operator_source_means(prepared[selected["rank"]])
-    target_stages = _lm_operator_target_groups(selected["target_stage_breakdowns"],
-        operator_cache[selected["rank"]], selected["cycle_ms"])
+    hotspots = list(operator_cache[selected["rank"]].values())
+    prepare_key = ("attention_prepare", selected["rank"])
+    if prepare_key not in operator_cache:
+        operator_cache[prepare_key] = _lm_attention_prepare_source_means(prepared[selected["rank"]], selected["rank"])
+    preparation = operator_cache[prepare_key]
     cards, dp, bs = (config.get(key) for key in ("target_devices", "target_dp", "bs"))
     chips = config.get("target_chips_per_card", 1)
     if any(type(value) is not int or value <= 0 for value in (cards, dp, bs, chips)):
@@ -5115,7 +5066,8 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
             "source_rank": selected["rank"], "rank_selection": selection,
             "aggregation": "per_round_layer_type_means_on_shared_source_cycle_rank",
             "per_rank": per_rank, "class_means": selected["class_means"], "role_details": selected["role_details"],
-            "target_stage_breakdowns": target_stages,
+            "operator_hotspots": hotspots, "target_stage_breakdowns": selected["target_stage_breakdowns"],
+            "attention_prepare_breakdowns": preparation,
             "source_partition": selected["source_partition"], "breakdown": selected["breakdown"],
             "detail_rows": all_details, "compute_evidence": all_evidence, "communication": communication, "comm_model": communication,
             "compute_coverage": {"reference_layer_calls": len(all_evidence),
@@ -5125,7 +5077,6 @@ def _lm_estimate_method(result, prepared, shapes, target_schedule, communication
             "reference_policy": {"exclude_main_layers": sorted(excluded), "grouping": "role+attention, hash/normal pooled"},
             "formula": "R=NHCA*mean(Wmain_HCA+delta)+NCSA*mean(Wmain_CSA+delta)+Ndraft*mean(Wdraft_SWA+delta)+source_main_gaps+Nadded_main*mean(reference_main_gaps)+source_draft_gaps+U; U=Rsource-source_main_chain-source_draft_chain; delta=D*(mD-1)+C*(mC-1)+GMM*(Ktarget/Ksource-1)+2*extra_ms_per_call; extra_ms_per_call=" + str(communication.get("extra_ms_per_call", 0.)) + "ms (one fixed addition per Dispatch/Combine target call)"}
     return _lm_method3_metadata(method) if method_id == "method3" else method
-
 
 
 def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, comm_fn):
@@ -5253,7 +5204,7 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
                           "class_means": source_reference["class_means"] if source_reference else [],
                           "role_details": source_reference["role_details"] if source_reference else [],
                           "source_partition": source_reference["source_partition"] if source_reference else {},
-                          "breakdown": [], "detail_rows": [], "compute_evidence": [], "target_stage_breakdowns": [],
+                          "breakdown": [], "detail_rows": [], "compute_evidence": [], "operator_hotspots": [], "target_stage_breakdowns": [], "attention_prepare_breakdowns": [],
                           "communication": comm, "comm_model": comm}
             methods.append(method)
         result["projection"]["layer_mean_methods"] = methods
@@ -5261,7 +5212,6 @@ def _attach_layer_mean_estimates(report, read_capture, schedule_fn, shapes_fn, c
         result["projection"]["rank_selection"] = rank_selection
     report.setdefault("contract", {})["layer_mean"] = "per-rank/per-round attention-kind means; main0 reference excluded by default; original chain boundaries and cross-role/tail residual retained once; all methods share the rank selected by retained source full-cycle mean before extrapolation; method3 retains per-target-layer communication durations and only the existing routed-GMM TopK delta; explicit uncalibrated estimate"
     return report
-
 
 
 def attach_layer_mean_report(report):
@@ -5416,28 +5366,28 @@ def _lm_stored_method3_source(case, donor, shapes, source_schedule, excluded, se
             if not math.isclose(_lm_number(partition.get(field), "stored source " + field), expected,
                                 rel_tol=1e-12, abs_tol=1e-8):
                 raise ValueError("stored source partition disagrees with its boundary accounting for " + rank)
-        stage_groups = _aligned_source_rank_stages(donor, record, rank)
-        source_stages, cache = {}, {}
+        cache = {}
+        groups = _aligned_source_rank_hotspots(donor, record, rank)
         for key, references in schedule_classes.items():
-            matched = [group for group in stage_groups if (group.get("role"), group.get("attention")) == key
+            matches = [group for group in groups if (group.get("role"), group.get("attention")) == key
                        and group.get("reference_layers") == references and group.get("rounds") == measured["rounds"]]
-            group = matched[0] if len(matched) == 1 else {}
+            if len(matches) != 1:
+                continue
+            group = matches[0]
+            same_rank = all(isinstance(kernel.get("example"), dict) and kernel["example"].get("rank") == rank
+                            for kernel in group.get("kernels") or [])
+            cache[key] = dict(group) if same_rank else dict(group, status="UNAVAILABLE", kernels=[],
+                reason="stored operator examples do not establish same-rank source provenance")
+        stage_groups = _aligned_source_rank_stages(donor, record, rank)
+        source_stages = {}
+        for key, references in schedule_classes.items():
+            matches = [group for group in stage_groups if (group.get("role"), group.get("attention")) == key
+                       and group.get("reference_layers") == references and group.get("rounds") == measured["rounds"]]
+            group = matches[0] if len(matches) == 1 else {}
             source_stages[key] = [{"layer": number, "status": group.get("status", "UNAVAILABLE"),
-                "reason": group.get("reason") or "stored same-rank source stages are unavailable",
-                "stage_rows": group.get("stage_rows") or []} for number in references]
-            for stage in group.get("stage_rows") or []:
-                breakdown = stage.get("operator_breakdown") or {}
-                if breakdown.get("status") == "MATCHED":
-                    native_rows = [row for row in breakdown.get("rows", []) if row.get("kind") != "model_delta"]
-                    kernels = breakdown.get("kernels") or []
-                    examples = [row.get("example") for row in native_rows + kernels]
-                    same_rank = all(isinstance(example, dict) and example.get("rank") == rank
-                        and all(record.get("rank") == rank for record in example.get("records", []))
-                        for example in examples)
-                    cache[key, stage["stage_key"]] = {"status": "MATCHED" if same_rank else "UNAVAILABLE", "rounds": 1,
-                        "reason": None if same_rank else "stored operator examples do not establish same-rank source provenance",
-                        "reference_layers": references, "layer_round_samples": breakdown.get("layer_round_samples"),
-                        "rows": native_rows, "kernels": kernels}
+                "reason": group.get("reason") or (None if group.get("status") == "MATCHED" else "stored source stages unavailable"),
+                "note": group.get("note"), "stage_rows": group.get("stage_rows") or []} for number in references]
+        operator_cache[("attention_prepare", rank)] = _lm_stored_prepare_groups(donor, record, rank)
         prepared[rank] = [{"round_id": "stored_source_aggregate_not_a_measured_round",
             "source_cycle_ms": source_ms, "roles": roles, "class_values": values,
             "source_partition": partition, "compute_evidence": [], "class_stage_values": source_stages}]
@@ -5542,14 +5492,10 @@ def add_method3_report(report):
                     detail["rounds_averaged"] = round_counts[rank["rank"]]
                 for group in rank["target_stage_breakdowns"]:
                     group["rounds"] = round_counts[rank["rank"]]
-            for detail in method["detail_rows"]:
-                detail["rounds_averaged"] = round_counts[detail["rank"]]
             for group in method["target_stage_breakdowns"]:
                 group["rounds"] = round_counts[selection["selected_rank"]]
-                for stage in group.get("stage_rows", []):
-                    breakdown = stage.get("operator_breakdown") or {}
-                    if breakdown.get("status") == "MATCHED":
-                        breakdown["rounds"] = group["rounds"]
+            for detail in method["detail_rows"]:
+                detail["rounds_averaged"] = round_counts[detail["rank"]]
             method["compute_coverage"] = dict(donor.get("compute_coverage") or {
                 "reference_layer_calls": None, "matched_reference_layers": None,
                 "unmatched_reference_layers": None, "missing_metric_policy": "stored coverage was not exported"},
@@ -5569,7 +5515,7 @@ def add_method3_report(report):
                 "source_cycle_ms": selection["selected_source_cycle_ms"], "selected_rank": None,
                 "source_rank": selection["selected_rank"], "rank_selection": selection, "per_rank": [],
                 "class_means": [], "role_details": [], "source_partition": {}, "breakdown": [],
-                "detail_rows": [], "compute_evidence": [], "target_stage_breakdowns": [],
+                "detail_rows": [], "compute_evidence": [], "operator_hotspots": [], "target_stage_breakdowns": [], "attention_prepare_breakdowns": [],
                 "communication": comm, "comm_model": comm}
         method["offline_derivation"] = provenance
         if existing:
@@ -5586,13 +5532,11 @@ def add_method3_report(report):
     return dict(report, cases=cases, contract=contract)
 
 
-
 def layer_mean_complete(report):
     """Every requested case needs its primary estimate; method2 may lack a reference."""
     return bool(report['cases']) and all(any(method.get('id') == 'method1'
            and method.get('status') == 'LAYER_MEAN_ESTIMATE' and not method.get('reasons')
            for method in displayed_methods(case)) for case in report['cases'])
-
 
 
 def verify_result_rows(report, rows):
@@ -5628,7 +5572,6 @@ def verify_result_rows(report, rows):
         raise ValueError('结果一致性检查失败：最终结果表含额外记录或缺少失败记录')
 
 
-
 def iter_report_rows(report, kind):
     """Export flat records; large per-round evidence is never nested in summary cells."""
     for case in report['cases']:
@@ -5641,11 +5584,6 @@ def iter_report_rows(report, kind):
             yield from ({'case': name, **item} for item in source['per_rank'])
         elif kind == 'components':
             yield from ({'case': name, **item} for item in source.get('class_stats', []))
-        elif kind in ('layer_stage_summary', 'swa_stage_summary'):
-            for capture in case.get('measurements', []):
-                diagnostic = capture.get('layer_diagnostics' if kind == 'layer_stage_summary' else 'swa_diagnostics') or {}
-                yield from ({'case': name, 'rank': capture['rank'], **item}
-                            for item in diagnostic.get('stage_summary', []))
         elif kind in ('step_residual_focus_steps', 'step_residual_focus_summary'):
             for capture in case.get('measurements', []):
                 focus = (capture.get('step_residuals') or {}).get('focus_diagnostics') or {}
@@ -5660,6 +5598,11 @@ def iter_report_rows(report, kind):
                                     for item in stage.get('per_step', []))
                     else:
                         yield from ({**identity, **item} for item in stage.get('summary', []))
+        elif kind in ('layer_stage_summary', 'swa_stage_summary'):
+            for capture in case.get('measurements', []):
+                diagnostic = capture.get('layer_diagnostics' if kind == 'layer_stage_summary' else 'swa_diagnostics') or {}
+                yield from ({'case': name, 'rank': capture['rank'], **item}
+                            for item in diagnostic.get('stage_summary', []))
         elif kind in ('step_residual_windows', 'step_residual_summary', 'step_residual_sources',
                       'step_residual_stages', 'step_residual_substages'):
             for capture in case.get('measurements', []):
@@ -5739,7 +5682,6 @@ def report_json_payload(report):
                                                      'compute_evidence': 'compute_evidence.csv'}}
 
 
-
 def export_report(report, out, reference_rows, progress=None):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -5793,7 +5735,6 @@ def export_report(report, out, reference_rows, progress=None):
     write('model_architecture_report.md', lambda path: atomic_text(path, '\n'.join(architecture) + '\n'))
 
 
-
 def render_html(path, report):
     esc = lambda value: html.escape('待估算' if value is None else str(value), quote=True)
     rows = result_rows(report)
@@ -5809,7 +5750,6 @@ def render_html(path, report):
               '<p><a href="最终结果.csv">目标结果</a> · <a href="per_rank.csv">源基线</a> · <a href="layers.csv">源层原值</a> · <a href="round_estimates.csv">逐轮估算</a> · <a href="review.csv">复核记录</a></p>',
               '<small>生成时间：' + esc(report.get('generated_at')) + '</small></html>']
     atomic_text(path, '\n'.join(parts))
-
 
 
 def build_cli_excel(report, out, expected_method_set):
@@ -5828,7 +5768,6 @@ def build_cli_excel(report, out, expected_method_set):
         raise ValueError('Excel生成器接口不匹配或生成失败；请同步更新profile_ep128.py和build_ep128_leadership_excel.py。'
                          + '实际生成器：' + runtime['renderer_path'] + '（' + runtime['renderer_version'] + '）；'
                          + '本次预测已保存在 ' + str((Path(out) / '最终结果.csv').resolve()) + '；原始错误：' + str(error)) from error
-
 
 
 class _CaseProgressStream:
@@ -6313,7 +6252,6 @@ def main():
         build_cli_excel(report, args.out, 'layer_mean_methods')
         print('Excel: ' + str((args.out / ESTIMATE_XLSX).resolve()), flush=True)
     return int(bool(report['failures']) or not layer_mean_complete(report))
-
 
 
 if __name__ == '__main__':

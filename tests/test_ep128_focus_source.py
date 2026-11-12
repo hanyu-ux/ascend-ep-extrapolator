@@ -35,7 +35,7 @@ class FocusSourceTests(unittest.TestCase):
         methods[1]["selected_rank"] = methods[0]["selected_rank"]
         out, book, page = self.export(report)
         source = book["源采样基线"][1]
-        self.assertEqual(list(source.values()).count("保留序号"), 1)
+        self.assertEqual([str(value).split("\n", 1)[0] for value in source.values()].count("保留序号"), 1)
         formulas = []
         for name in ("方法1估算", "方法2估算"):
             values = list(book[name][1].values())
@@ -61,7 +61,7 @@ class FocusSourceTests(unittest.TestCase):
     def test_legacy_different_ranks_keep_separate_true_source_values(self):
         out, book, page = self.export(focus_fixture())
         source = book["源采样基线"][1]
-        self.assertEqual(list(source.values()).count("保留序号"), 2)
+        self.assertEqual([str(value).split("\n", 1)[0] for value in source.values()].count("保留序号"), 2)
         references = []
         for name, factor in (("方法1估算", 1.), ("方法2估算", 10.)):
             line = self.focus_line(out, book, name)

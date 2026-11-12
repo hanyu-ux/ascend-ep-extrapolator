@@ -4,12 +4,13 @@
 
 使用 Python 3.10 或更新版本。核心统计、Excel 写入和 HTML 导出均只依赖标准库，不需要安装 requirements，也不需要在运行统计的机器上安装 PyTorch、CANN 或连接 NPU。
 
-日常使用需要根目录的三个运行脚本和配置文件；使用方法2时，还须保留随仓提供的 `data/communication-reference.csv`。另行准备自己的采样数据，三个脚本应保持在同一目录：
+日常使用需要根目录的主脚本、两个报表模块、新增Attention准备识别模块和配置文件；使用方法2时，还须保留随仓提供的 `data/communication-reference.csv`。另行准备自己的采样数据，四个Python文件应保持在同一目录：
 
 ```text
 profile_ep128.py
 build_ep128_leadership_excel.py
 ep128_xlsx_writer.py
+ep128_attention_prepare.py
 profile_ep128_cases.example.json
 data/communication-reference.csv
 ```
@@ -138,6 +139,8 @@ python -u profile_ep128.py cases.local.json --comm-reference data/communication-
 python -u build_ep128_leadership_excel.py --report ep128_report/model_architecture_report.json --out "ep128_report/10T模型推理估算.xlsx"
 ```
 
+每个case的表格均就近标注 `BS8 · S9` 这样的参数标识：Excel显示在首列表头的第二行，HTML显示在表题中并支持滚动时保持表题与表头可见，图表目录中的表格条目也包含标识。标识读取该case配置中的BS和S，缺失时显示“未声明”，不从case名称猜测。跨case汇总和通信参考表保留原有范围，不标成某个单独case。已有报告JSON可直接重绘，无需重新采样或重新分析CSV。
+
 重绘只读指定 JSON，不再读取原 CSV、trace 或 cases，也不会自动扫描新增 BS。使用绝对路径可减少误读其他目录旧报告的可能。`schema_version=2` 不因新增 BS 而改变。
 
 新版原始统计默认生成方法1、方法2和方法3。方法3将每层 Dispatch/Combine 的通信倍率设为1、附加耗时设为0，路由专家GMM仍按现有TopK倍率修正；目标层数、参考层、层间衔接和U不改。新增层仍包含原有通信，因此不能将该假设表述为整轮通信总量固定。
@@ -162,7 +165,7 @@ python -u build_ep128_leadership_excel.py --report ep128_report_7/model_architec
 
 总览、源页及方法页顶部可按 case 跳转，第4行有固定“本页完整图表目录”入口；完整目录列出图和分析表并提供返回链接。HTML 目录支持按 case/方法/图表名搜索，跳转到折叠的详情会自动展开。目录只改变位置与链接，单元格值、图缓存及原报告不改。
 
-新版统计先用各 rank 外推前的完整源周期求保留轮次均值，选最大者作为同一 case 三种方法共用的 rank；均值并列按源输入顺序取第一个。选 rank 时包含主0、主/草稿、衔接和 U，主0只从后续参考层均值中排除。三种方法仍各自计算并保留全部 rank 的外推结果，最终卡片、五项、阶段和源诊断固定取共同 rank；不保证该 rank 也是外推后最慢者。最大值只限已采 rank。
+新版统计先用各 rank 外推前的完整源周期求保留轮次均值，选最大者作为同一 case 三种方法共用的 rank；均值并列按源输入顺序取第一个。选 rank 时包含主0、主/草稿、衔接和 U，主0只从后续参考层均值中排除。三种方法仍各自计算并保留全部 rank 的外推结果，最终卡片、五项、U阶段和源热点固定取共同 rank；不保证该 rank 也是外推后最慢者。最大值只限已采 rank。
 
 旧 JSON 直接重绘会保留所存数据并标明旧口径。要使用已存的逐 rank 外推结果切换到共同源 rank，无需重读九个 case 的 CSV：
 
@@ -170,7 +173,7 @@ python -u build_ep128_leadership_excel.py --report ep128_report_7/model_architec
 python -u build_ep128_leadership_excel.py --report ep128_report/model_architecture_report.json --align-source-rank --out "ep128_report/共同源rank.xlsx"
 ```
 
-生成 `共同源rank.xlsx`、同名 HTML 和 `共同源rank.source_rank.json`，原 JSON 不变；原有 CSV 导出仍属于旧报告。共同 rank 的周期、吞吐、TPOT、五项、分类和阶段取自各方法自己的 `per_rank` 行；U/逐 step 从相同 rank 的实测诊断取值。旧报告未保存新 rank 的 Top8/PMU 时显示缺证据，不沿用旧 rank 明细，也不将另一方法的目标增量复制过来。缺少共同 rank 的完整结果时停止并报具体缺项，不只改标签。若需要补齐缺失证据，再用新版核心处理原 CSV，不要求重新采样。
+生成 `共同源rank.xlsx`、同名 HTML 和 `共同源rank.source_rank.json`，原 JSON 不变；原有 CSV 导出仍属于旧报告。共同rank的周期、吞吐、TPOT、五项和整层分类取自各方法自己的 `per_rank` 行；U/逐 step 从相同 rank 的实测诊断取值。旧报告未保存新 rank 的 Top8/PMU 时显示缺证据，不沿用旧 rank 明细，也不将另一方法的目标增量复制过来。缺少共同 rank 的完整结果时停止并报具体缺项，不只改标签。若需要补齐缺失证据，再用新版核心处理原 CSV，不要求重新采样。
 
 新结果在 `projection.rank_selection` 和各方法的 `rank_selection` 中保存选择口径、源均值、平局规则和 rank 覆盖；共同策略为 `max_of_captured_rank_mean_source_cycle`。不可用方法保持不可用，并用 `source_rank` 记录共同源参考，不伪填目标结果。
 
@@ -202,44 +205,40 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 | 源采样基线 | 源单卡吞吐、TPOT、完整周期和整轮五项耗时，分别随 BS 和 S 变化 |
 | 方法1估算、方法2估算、方法3估算 | 各方法单卡吞吐、TPOT、完整周期和整轮五项耗时随 BS 和 S 变化；原细节表及横向柱状图保留 |
 
-完整周期明确标为 **ITL代理（ms/轮）**，只表示每轮输出间隔，非实测逐 token ITL。源 TPOT 使用源周期/配置 Neff，源单卡吞吐直接保留核心 aggregate 的原值。源五项从 aggregate 所选源 rank 的全部保留轮次、整数纳秒层边界计算，包含主0，逐轮和均值均须闭合；不借用目标分解，旧报告也不借用方法页中可能不同的 rank。旧 JSON 缺测量边界时，已有吞吐/周期仍可展示，缺证据的五项留空并说明原因。所有图可通过上面的离线重绘命令生成，不需原 CSV；本次同步更新核心与生成器，保持三个运行脚本在同目录。
+完整周期明确标为 **ITL代理（ms/轮）**，只表示每轮输出间隔，非实测逐 token ITL。源 TPOT 使用源周期/配置 Neff，源单卡吞吐直接保留核心 aggregate 的原值。源五项从 aggregate 所选源 rank 的全部保留轮次、整数纳秒层边界计算，包含主0，逐轮和均值均须闭合；不借用目标分解，旧报告也不借用方法页中可能不同的 rank。旧 JSON 缺测量边界时，已有吞吐/周期仍可展示，缺证据的五项留空并说明原因。所有图可通过上面的离线重绘命令生成，不需原 CSV；本次同步更新核心与生成器，保持主脚本、生成器、XLSX写入模块及新增Attention准备识别模块在同目录。
 
-### 方法页中的阶段展开
+### 方法页中的保留视图
 
-“方法1估算”、“方法2估算”和“方法3估算”三个 sheet 中，每个 case 的“轮次剩余区间耗时构成”图下，依次展示五组独立表格和原生可编辑横向柱状图：
+“方法1估算”、“方法2估算”和“方法3估算”三个sheet中，每个case继续展示整轮五项、U15和下一主准备阶段，并提供CSA、HCA、SWA各自的源实测Top8、PMU及bound。保留这三类层的层内十阶段展开；仅删除阶段下面的逐算子贡献下钻，包括算子覆盖账本、并行组合与gap明细，不再为这些逐算子账本执行互斥区间扫描。
 
-1. 主模型 CSA 的目标层内 10 阶段估算。
-2. 主模型 HCA 的目标层内 10 阶段估算。
-3. 草稿模型 SWA 的目标层内 10 阶段估算。
-4. 下一主模型 KV 与输入准备子阶段。
-5. 下一主 metadata 及输入映射准备子阶段。
+整层识别、同类参考层均值及原外推公式保留：Dispatch/Combine与路由GMM只按既有父模型增加对应增量，激活和其他层成本不整体乘倍率。默认主0仍只排除参考，完整源周期与目标层数不因此缩减。三个方法共用外推前按源整轮均值选定的rank，各方法的通信假设及五项账本不变。
 
-前三组使用当前方法 `selected_rank`、保留轮次和原估算相同的参考层：先在每轮内取同类型参考层均值，再按保留轮次取均值，默认主0不参加参考。表格同时给出源单层均值、目标单层均值、目标同类全部层合计以及占完整目标周期的比例；主图采用目标同类全部层合计，便于比较目标模型的耗时构成。各方法使用自己的通信假设（方法3为通信零增量），共用在外推前按源整轮均值选定的 rank，不混用其他 rank 的诊断。
+U中的“下一主模型KV与输入准备”和“下一主metadata及输入映射准备”继续各自提供表格、横向柱状图、函数入口与逐step折线。这些源实测子阶段作为U的展开保留一次，不乘目标层数。缺失或不闭合的证据标为不可用，未知不补0。
 
-Dispatch 阶段只追加核心的 Dispatch 增量，Combine 阶段只追加 Combine 增量；“专家计算及衔接”整段只追加其中路由 GMM 的增量，激活及衔接时间不整体乘倍率。其他阶段沿用源参考均值。目标 10 段之和必须等于目标单层耗时，乘同类型目标层数后等于该类型层区间合计；这些费用已经包含在完整周期内，不再次追加。占周期比例的分母包含其他类型层、层间衔接和 U，因此单个类型的比例之和通常小于 100%。
+### Attention准备段的业务细分
 
-后两组 U 子阶段仍按该方法所选 rank 的源实测展示，作为保留一次的 U 的展开，不套目标层数。源采样的逐层 CSA/HCA/SWA 诊断继续保存在“层与组件实测”和“时间账本”中。缺锚点、子阶段不完整或与父层不能闭合时，只把对应类型的目标细分标为不可用，父目标估算仍保留；未知值不补 0。旧 JSON 缺少 `target_stage_breakdowns` 时须用新版核心重新处理采样，仅重绘不能生成目标阶段估算。
+十阶段第一项仍以首HCPre.start到Attention.start的真实区间为父项。方法1/2/3另显示 `attention_prepare_breakdowns` 的源业务细分，不乘目标层数或通信/TopK倍率；同case三方法复用同一源rank和同一份细分。细分只解释已有父项，不增加整层、整轮、TPOT或吞吐成本。
 
-### 算子下钻的读取口径
+细项包含HCPre、输入归一化/可选AllGather/可确认的共享输入量化、Q低秩投影/Q展开/Q最终处理、窗口KV投影/归一化/RoPE/写入、Attention压缩、CSA Indexer Query/Key缓存/索引选择。各行提供函数入口、调用数均值、kernel累计、记录并集、首尾跨度及样本覆盖。Q/KV/压缩/Indexer可能重叠，因此分组并集、累计和跨度均不可相加成父耗时。父项保留记录并集和CSV未覆盖量；未覆盖不直接等同于CPU或同步等待。
 
-CSA、HCA、SWA 各自的10阶段图后，增加两组独立表格与横向柱状图；HTML预览使用同样的数据和口径。
+只有全部同类参考层×保留轮次均能确认归属，才给出该行全样本均值。部分确认保留known_samples/total_samples、未知原因和空值，不把缺证据补为0。重复MatMul/RmsNorm不按第N次调用或固定stream号猜归属；Compressor内部与评分/TopK融合kernel不虚拆内部时长。缺少必要shape/scope证据的记录进入“未归属记录”。SWA的压缩/Indexer、HCA的Indexer按结构标为不适用。旧JSON没有这份细分时，离线重绘明确标未采集；用新版重新处理原CSV可尝试识别，不需先重采样，但CSV缺失的关联不会凭空恢复。
 
-- **目标覆盖与外推增减账本**：阶段内各流任务按整数纳秒起止边界切成互斥区间。串行项显示原生算子，并行项列出具体成员；任务间隔保留前后记录位置。源覆盖按同类目标层数累计，Dispatch/Combine/GMM的父模型增减单独列出，减少项保留负号。全部子项与原10阶段及同类层总成本闭合，不再加到周期或TPOT。
-- **源实测算子热点**：按原生名称、类型、输入输出形状、dtype、stream和Task Type保留不同指纹。展示每参考层每轮平均相交调用次数、阶段内执行累计、段内单次均值/P90及代表性原始行号/轮次/层号。跨阶段任务分别裁剪，相交次数不能当成整个周期唯一调用次数直接相加；并发的执行累计也不能当成周期耗时相加。
+新增模块 `ep128_attention_prepare.py` 仅用Python标准库，与 `profile_ep128.py` 放在同目录。
 
-可见预览保留Top项，目标账本另列其余覆盖、间隔及正负模型增量合计；这些折叠合计包含多项，不作为单个热点排名。完整条目在 JSON 的 `projection.layer_mean_methods[].target_stage_breakdowns[].stage_rows[].operator_breakdown` 中。只有最终所选rank的顶层分组附算子证据，逐轮和其他rank的原10阶段结构保持轻量。
+### Top算子的读取口径
 
-每个预览项按完整父阶段、算子类型、输入形状和stream分行显示，并行项逐个列出成员。来源列保留完整原生名称、输出形状和dtype。Excel表格与柱状图、HTML图表按文本长度增加高度，不再用省略号截断名称；超高单元格使用续行，续行不是新的统计项。更新生成器后，可用已有算子证据的JSON重新导出：
+新报告使用 `projection.layer_mean_methods[].operator_hotspots[]` 保存每个 `role+attention` 的完整参考层热点及其 `kernels`。Top8以源 `kernel_sum_ms` 排序，不再依赖层内10阶段锚点或目标贡献账本。
+
+- **参考范围**：取本方法共同源rank的同类参考层及保留轮次，按完整层首HCPre至末HCPost的边界裁剪任务；主0按原参考策略排除。保留任务的完整原生名称、类型、输入输出形状、dtype、stream和Task Type，不凭名称猜测Q/KV业务。
+- **调用与耗时**：相交调用次数、kernel累计先在每轮对全部参考层取均值，再对保留轮次取均值。已完整读取的样本中指纹未出现，按确定的0参与均值；证据缺失保持未知。单次均值/P90取实际观察到的层内裁剪调用分布，不是逐轮P90或整个周期P90。
+- **解释范围**：kernel累计允许并发重叠，不能相加成完整层或整轮墙钟，也不等于目标模型的可节省时间。Top8保持源实测，不乘目标层数、通信或TopK倍率；融合kernel内部不按比例拆时。
+- **来源与排版**：保留原始CSV行号、rank、轮次与层号，完整指纹和长形状在Excel／HTML中换行或续行。续行不是额外调用或统计项，Top8之后的PMU表与上方热点一一对应。
+
+旧JSON可以直接重绘：生成器保留旧十阶段展开，忽略逐算子目标贡献账本，读取已有 `target_stage_breakdowns[].stage_rows[].operator_breakdown.kernels` 作为兼容热点，明确标注“旧阶段内统计范围”。重绘不重建阶段、不读取CSV，也不会把旧的阶段裁剪均值当成完整层均值；其热点排序和取值依旧数据保留。要得到新的完整层Top8，用新版核心重新处理原CSV，不需重新采样。旧报告没有所选rank热点时仍显示缺证据，不借用其他rank。
 
 ```bash
 python build_ep128_leadership_excel.py --report ep128_report/model_architecture_report.json --out "ep128_report/10T模型推理估算.xlsx"
 ```
-
-这次名称显示更新不需要重新采样或运行核心统计；原有Top项数量、排序和耗时值保持不变。
-
-各方法继承父项的选中rank、参考层、保留轮次及权重：先在每轮取同类参考层均值，再对该rank的全部保留轮次取均值。指纹在某个已完整解析的样本中未出现时按确定的0参与全样本均值；证据缺失保持不可用，不补0。主模型第0层仍不进入参考样本，目标层数不因排除参考层减少。单次P90描述已观察到的段内调用分布，不是整轮P90，也不用于相加闭合。
-
-读图时先看目标贡献，再结合相交次数、单次耗时、并行成员、任务间隔和原始行号确定检查对象。当前算子视图只提供覆盖和执行证据，关键路径与优化收益保持未验证：长耗时或独占覆盖不能证明整轮正在等待该任务；通信及GMM增量仍是父模型中全部暴露的估算假设。无任务记录间隔不等于CPU时间，融合kernel内部不按比例猜分。旧JSON或某组证据不完整时只禁用对应新图，保留原有父结果与阶段图。
 
 ### U15 与输入、metadata 子阶段
 
@@ -275,7 +274,7 @@ python build_ep128_leadership_excel.py --report ep128_report/model_architecture_
 
 ### 下一主准备阶段的细项与逐 step 变化
 
-方法1和方法2在原 U 15父阶段表图之后，追加 `main_inputs`、`main_metadata` 的细项、函数对应和逐 step 变化，保留原有15父阶段、level=1子阶段及估算公式。`measurements[].step_residuals.focus_diagnostics` 保存各 rank 的新增证据。
+方法1、方法2和方法3在原U15父阶段表图之后，追加 `main_inputs`、`main_metadata` 的细项、函数对应和逐 step 变化，保留原有15父阶段、level=1子阶段及估算公式。`measurements[].step_residuals.focus_diagnostics` 保存各 rank 的新增证据。
 
 - 细项采用原始整数纳秒区间，在父段内合并所有可见 stream 的时间边界，分为单算子覆盖、具名并发组合、无设备记录间隙。各项互斥且覆盖父段，完整证据缺失时不编造函数归属。
 - 函数表给出设备入口、对应 Python 包装入口、相对源码路径、版本依据和原始 CSV 行号。它表示静态源码对应，不表示 trace 已测得该 Python 函数的入口到返回耗时。间隙没有足够来源证据时保留未知，不归成某个 CPU 函数。
@@ -287,7 +286,7 @@ python build_ep128_leadership_excel.py --report ep128_report/model_architecture_
 
 ### Top8 热点的 PMU 与 bound
 
-每类层的源实测 Top8 热点保持原排序，在各方法页追加对应的 PMU 表、方向判断和高级指标详情。PMU 仅描述源采样中的完整原生 kernel 调用，不是目标 10T 估算的硬件指标。
+每类层的源实测Top8按核心保存的完整层热点排序；旧JSON则保留原阶段内统计口径及排序，在各方法页追加对应的 PMU 表、方向判断和高级指标详情。PMU 仅描述源采样中的完整原生 kernel 调用，不是目标 10T 估算的硬件指标。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -317,24 +316,11 @@ python -u build_ep128_leadership_excel.py --report ep128_report_7/model_architec
 
 另存 `.bound.json`、Excel和HTML，共保留10个sheet。未存逐调用诊断的旧JSON无法恢复联合覆盖/短任务检查，明确降级；指标值和时间账本保留。`--bound-template bound_profile.local.json` 生成全空硬件/工作量模板，核实后使用 `--bound-profile bound_profile.local.json`；不需要定量模型时无需填写。参数可与 `--align-source-rank` 合用；先按已存数据对齐，再更新bound，缺证据仍不借用其他rank。
 
-### CSA、HCA、SWA 10 段与同 rank 对照
+### CSA、HCA、SWA整层统计与旧输出
 
-报告 JSON 的 `measurements[].layer_diagnostics` 保存 CSA、HCA、SWA 的源层内阶段诊断；`layer_stage_summary.csv` 给出每 case、每 rank、每层的汇总，`*-layer-stages.csv` 保留逐轮 stage 边界与状态，位于 `step_residual_details/` 相应 case/rank 的证据目录。原有 `swa_stage_summary.csv`、`*-swa-stages.csv` 和 SWA 诊断字段继续保留兼容。源诊断读取旧 JSON 时，若只有 SWA 证据，就只展示可用的 SWA，主模型 CSA/HCA 保持不可用；方法页的目标阶段图另需新版核心提供 `target_stage_breakdowns`，不从这些源诊断反推。
+整层HCPre→末HCPost边界、层类型、组件实测、同类参考层均值和Top8继续保留；核对时固定case、rank和周期，并区分整层wall与单个Attention／GMM kernel时长。具体采样还要核对主／草稿token数、padding、图模式和Task Type。
 
-| stage key | 含义 |
-| --- | --- |
-| `attention_prepare` | Attention HCPre、Q/KV 投影与 cache 准备；主模型 CSA/HCA 还含压缩或索引准备 |
-| `attention` | Attention 内核 |
-| `attention_output` | Attention 输出投影与整理 |
-| `attention_post` | Attention HCPost 与层内衔接 |
-| `moe_prepare` | FFN HCPre、共享/路由准备至 Dispatch 前 |
-| `dispatch` | 专家 Dispatch |
-| `experts` | 路由专家计算及其间隔 |
-| `combine` | 专家 Combine |
-| `ffn_output` | FFN 输出投影与整理 |
-| `ffn_post` | FFN HCPost |
-
-10 段按原层首 HCPre → 末 HCPost 的连续锚点分割，合计闭合到该层的实测 wall。它们不额外加入外推层均值或周期；不支持模板保留未识别状态。对照时先固定 case、rank 和周期，再区分“整层 wall”与“attention 内核”，并核对主、草稿实际输入 token 数、padding、图模式与 Task Type。具体采样的分析结果和优化方案仅保存在本地。
+新版核心保留 `measurements[].layer_diagnostics.layer_summary` 整层统计、`stage_summary`、`swa_diagnostics`、方法级 `target_stage_breakdowns` 及层内十阶段CSV（`layer_stage_summary.csv`、`swa_stage_summary.csv`、`*-layer-stages.csv`、`*-swa-stages.csv`）。新版不生成各阶段的 `operator_breakdown`，Top8单独保存在 `operator_hotspots`。`layers.csv`、`components.csv`、`layer_means.csv`、五项账本、U15及其输入／metadata明细继续导出。旧输出目录已有的历史文件不作为新结果，应以本次JSON及导出日志为准；可用新的 `--out` 目录避免混读。
 
 ## 7. 运行回归测试
 
