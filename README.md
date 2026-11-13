@@ -40,7 +40,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-主脚本、Excel生成器、XLSX写入器和Attention准备识别模块应放在同一目录。当前版本：统计 `20261112.1.layer_stages_restored`、Excel生成器 `20261112.2.case_table_labels`、写入器 `20261111.1.internal_links`。
+主脚本、Excel生成器、XLSX写入器和Attention准备识别模块应放在同一目录。当前版本：统计／Excel生成器 `20261113.1.exclusive_hcpre`、写入器 `20261111.1.internal_links`。
 
 ## 快速运行
 
@@ -287,13 +287,13 @@ TPOT（ms/token） = R / Neff
 
 U 保留下一主模型 KV/输入准备、主/草稿 metadata 的子阶段；metadata 本体与前后的映射准备分开。原始 Task Type 保留 AI_CPU 等执行类型，busy 不等于 AICORE 有效算力。详见[结果读取说明](docs/usage.md#6-如何核对结果)。
 
-CSA、HCA、SWA 保留**层内十阶段展开**以及独立的完整参考层源实测 Top8、PMU、bound 和 Roofline。删除的是各阶段下面的逐算子贡献、互斥覆盖和算子模型增减账本；层内阶段计算、JSON、CSV和表图继续保留。层识别、整层均值、Dispatch/Combine与路由GMM外推、整轮五项、共同源rank及U15保持原口径。
+CSA、HCA、SWA 保留**层内阶段展开**（新分析为11项）以及独立的完整参考层源实测 Top8、PMU、bound 和 Roofline。删除的是各阶段下面的逐算子贡献、互斥覆盖和算子模型增减账本；层内阶段计算、JSON、CSV和表图继续保留。层识别、整层均值、Dispatch/Combine与路由GMM外推、整轮五项、共同源rank及U15保持原口径。
 
 新报告在 `projection.layer_mean_methods[].operator_hotspots[]` 按层类型保存源热点，按原生名称、类型、形状、dtype、stream和Task Type区分指纹。调用次数与kernel累计按同一rank的参考层和保留轮次取均值，单次均值/P90反映实际相交调用在完整层边界内的耗时；并发累计不是互斥周期成本，不乘目标层数或外推倍率。正文保留完整指纹、输入形状、stream和原CSV行号；长文本使用换行或续行。
 
-已有JSON可直接重绘层内十阶段，并复用已保存的热点及PMU；不再绘制目标逐算子贡献账本。旧热点标明原阶段内统计范围。旧热点不会被冒充为新的完整层统计；需要完整层Top8时，用新版核心重新处理原CSV即可，不要求重新采样。证据缺失继续显示未知。详见[Top算子的读取口径](docs/usage.md#top算子的读取口径)。
+已有JSON可直接重绘所存层内阶段，并复用已保存的热点及PMU；旧十阶段保持HCPre合并项，不猜拆；不再绘制目标逐算子贡献账本。旧热点标明原阶段内统计范围。旧热点不会被冒充为新的完整层统计；需要完整层Top8时，用新版核心重新处理原CSV即可，不要求重新采样。证据缺失继续显示未知。详见[Top算子的读取口径](docs/usage.md#top算子的读取口径)。
 
-“HCPre与Q/KV、压缩/索引准备”另提供业务细分表和横向图：HCPre、输入归一化/聚合/量化、Q低秩及展开、Q末处理、窗口KV投影/归一化/RoPE/写入、Attention压缩、CSA Indexer Query/Key缓存/索引选择等。源业务项可能并行，不相加成父项；未知归属不补0，融合kernel不虚拆。新接口为 `attention_prepare_breakdowns`。函数识别在新增标准库模块 `ep128_attention_prepare.py`；同步更新脚本时需将该模块放在主脚本同目录。
+“HCPre与Q/KV、压缩/索引准备”在原层内阶段表中仅拆成两行：`attention_hcpre` 为首个Attention HCPre的 `[start,end)`，`attention_prepare` 从其结束延续到Attention开始，保留Q/KV及压缩/索引准备的合并项。其余九项边界不变，新11项连续互斥并闭合到原层跨度；HCPre时段可能伴随其他流活动，各流任务按时间裁剪，不用kernel累计相减。两个新子项均沿用源值，目标增量仍只落在Dispatch、Combine和路由GMM，整层与周期指标不变。正文不再另加Q/KV业务分组面板；辅助 `attention_prepare_breakdowns` 仍保留原完整准备窗的源证据。旧JSON缺少精确HCPre边界时保留旧合并项；需要拆分时用新版核心重新分析原CSV，无需重新采样。
 
 三个方法页还提供“下一主模型 KV 与输入准备”和“下一主 metadata 及输入映射准备”的额外细分：表格、横向柱状图和源码函数入口对应。细项按真实设备区间拆成单算子覆盖、具名并发组合和无记录间隙，合计等于原父段；函数入口是带版本依据的源码映射，不是 Python 函数实测耗时。
 
@@ -338,7 +338,7 @@ Context-KV 的 `KvCompressEpilog` 在融合结果有 padding 时，允许各草�
 | `boundary_accounting.csv` / `compute_evidence.csv` | 边界计账与路由 GMM 证据 |
 | `step_residual_stages.csv` / `step_residual_substages.csv` | U15 父阶段与 Markov、下一主输入及 metadata 子阶段汇总 |
 | `step_residual_focus_steps.csv` / `step_residual_focus_summary.csv` | 两个下一主准备阶段的逐 rank、逐 HC 周期变化及互斥细分汇总 |
-| `step_residual_details/` | 各 rank 的原始设备明细、精确阶段边界、来源链、两段关注区间的逐步与分段证据；包含层内十阶段明细 |
+| `step_residual_details/` | 各 rank 的原始设备明细、精确阶段边界、来源链、两段关注区间的逐步与分段证据；包含层内阶段明细（新分析11项，兼容旧10项） |
 
 Excel 的 BS 折线取 `config.bs` 数值排序；S 折线取配置投机步长排序。同方法、同指标、可比条件下的不同固定参数曲线合并展示，其他声明条件不同仍分组。某条曲线有重复横坐标时保留原行并停止绘制该条歧义曲线；缺值留空断线，不补0。单点可在合并图中显示为标记，整个条件组只有一个横坐标时仅保留表格。顶部索引列出全部采样组合，避免把单独分组误认为遗漏。
 

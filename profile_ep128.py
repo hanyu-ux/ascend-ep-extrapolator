@@ -32,7 +32,7 @@ import time
 from ep128_attention_prepare import analyze_attention_prepare
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261112.1.layer_stages_restored"
+PROFILE_VERSION = "20261113.1.exclusive_hcpre"
 ACCEPTANCE_SEMANTICS = "mean_output_fraction_including_bonus"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
@@ -2887,7 +2887,7 @@ RESIDUAL_STAGE_BASIS = ("同次设备锚点之间的连续时间跨度，包含�
 
 def diagnostic_metrics(tasks, left, right):
     """Clipped wall/busy clocks and locateable evidence; waits are not wall costs."""
-    tasks = sorted((task for task in tasks if task.start_ns < right and task.end_ns > left),
+    tasks = sorted((task for task in tasks if left < right and task.start_ns < right and task.end_ns > left),
                    key=lambda task: (task.start_ns, task.end_ns, task.row_index))
     clips = [(max(left, task.start_ns), min(right, task.end_ns)) for task in tasks]
     union = a_union(clips)
@@ -3667,7 +3667,7 @@ def residual_stage_summary(stages, windows, level):
 
 
 def layer_stage_plan(layer, tasks):
-    """Ten exclusive anchor spans for main CSA/HCA and draft SWA HC layers.
+    """Eleven exclusive anchor spans for main CSA/HCA and draft SWA HC layers.
 
     Compression and indexer work, when present, remains within attention
     preparation. Neither an indexer nor a compression kernel is a required
@@ -3699,13 +3699,14 @@ def layer_stage_plan(layer, tasks):
         if pre[0].start_ns != left or post[1].end_ns != right or any(
                 a.end_ns > b.start_ns for a, b in zip(chain, chain[1:])):
             raise ValueError(attention_type + " anchors overlap, are reversed or disagree with the HC layer boundary")
-        stamps = [left, attention.start_ns, attention.end_ns, post[0].start_ns, pre[1].start_ns,
+        stamps = [left, pre[0].end_ns, attention.start_ns, attention.end_ns, post[0].start_ns, pre[1].start_ns,
                   dispatch.start_ns, dispatch.end_ns, combine.start_ns, combine.end_ns, post[1].start_ns, right]
-        anchors = [point(pre[0]), point(attention), point(attention, True), point(post[0]), point(pre[1]),
+        anchors = [point(pre[0]), point(pre[0], True), point(attention), point(attention, True), point(post[0]), point(pre[1]),
                    point(dispatch), point(dispatch, True), point(combine), point(combine, True), point(post[1]), point(post[1], True)]
-        prepare = {"CSA": "CSA HCPre与Q/KV、压缩/索引准备",
-                   "HCA": "HCA HCPre与Q/KV、压缩准备"}.get(attention_type, attention_type + " HCPre与Q/KV准备")
-        labels = [("attention_prepare", prepare), ("attention", attention_type + " attention本体"),
+        prepare = {"CSA": "CSA Q/KV、压缩/索引准备",
+                   "HCA": "HCA Q/KV、压缩准备"}.get(attention_type, attention_type + " Q/KV准备")
+        labels = [("attention_hcpre", attention_type + " HCPre"), ("attention_prepare", prepare),
+                  ("attention", attention_type + " attention本体"),
                   ("attention_output", attention_type + "输出投影与拷贝"), ("attention_post", "Attention HCPost与衔接"),
                   ("moe_prepare", "FFN HCPre与MoE路由准备"), ("dispatch", "MoE Dispatch"),
                   ("experts", "专家计算与Dispatch/Combine衔接"), ("combine", "MoE Combine"),
@@ -3714,7 +3715,8 @@ def layer_stage_plan(layer, tasks):
                  "start_ns": str(stamps[number]), "end_ns": str(stamps[number + 1]),
                  "duration_ns": stamps[number + 1] - stamps[number], "duration_ms": (stamps[number + 1] - stamps[number]) / 1e6,
                  "start_anchor": anchors[number], "end_anchor": anchors[number + 1],
-                 "boundary_basis": "设备锚点连续跨度；含段内间隙，已包含于" + attention_type + "层，不额外计入周期或TPOT"}
+                 "boundary_basis": "设备锚点连续半开区间，统一按时间边界裁剪；HCPre时段可能伴随其他流任务；含段内间隙，已包含于"
+                                   + attention_type + "层，不额外计入周期或TPOT"}
                 for number, (key, label) in enumerate(labels)]
     except ValueError as error:
         return [{"stage_key": "unresolved", "label": attention_type + "细分未识别（保留层实测总跨度）", "stage_order": 1,
@@ -4116,8 +4118,9 @@ def _lm_native_layer(tasks, starts, layer, model, ep, require_compute=True):
             "routed_compute_ms": duration}, evidence
 
 
-_LM_TARGET_STAGE_KEYS = ("attention_prepare", "attention", "attention_output", "attention_post",
-                         "moe_prepare", "dispatch", "experts", "combine", "ffn_output", "ffn_post")
+_LM_LEGACY_TARGET_STAGE_KEYS = ("attention_prepare", "attention", "attention_output", "attention_post",
+                              "moe_prepare", "dispatch", "experts", "combine", "ffn_output", "ffn_post")
+_LM_TARGET_STAGE_KEYS = ("attention_hcpre",) + _LM_LEGACY_TARGET_STAGE_KEYS
 
 
 _LM_OPERATOR_FIELDS = ("name", "op_type", "input_shapes", "output_shapes", "input_dtypes", "output_dtypes",
@@ -4552,8 +4555,8 @@ def _lm_source_layer_stages(layer, tasks, starts, native, *, time_index=None, ro
         if (len(stages) != len(_LM_TARGET_STAGE_KEYS)
                 or tuple(row["stage_key"] for row in stages) != _LM_TARGET_STAGE_KEYS
                 or any(row["status"] != "MATCHED" for row in stages)):
-            raise ValueError("; ".join(row.get("reason") or "ten native stage anchors unavailable" for row in stages
-                                       if row.get("status") != "MATCHED") or "ten native stages unavailable")
+            raise ValueError("; ".join(row.get("reason") or "native stage anchors unavailable" for row in stages
+                                       if row.get("status") != "MATCHED") or "native stages unavailable")
         cursor = left
         for row in stages:
             a, b = _lm_exact_ns(row["start_ns"]), _lm_exact_ns(row["end_ns"])
@@ -4561,7 +4564,7 @@ def _lm_source_layer_stages(layer, tasks, starts, native, *, time_index=None, ro
                 raise ValueError("reference stage intervals are not an exclusive continuous partition")
             cursor = b
         if cursor != right or sum(row["duration_ns"] for row in stages) != right - left:
-            raise ValueError("reference ten stages do not close to the source layer wall")
+            raise ValueError("reference stages do not close to the source layer wall")
         experts = stages[_LM_TARGET_STAGE_KEYS.index("experts")]
         expert_left, expert_right = _lm_exact_ns(experts["start_ns"]), _lm_exact_ns(experts["end_ns"])
         named = [task for task in inside if _lm_gmm(task)]
@@ -4578,12 +4581,15 @@ def _lm_source_layer_stages(layer, tasks, starts, native, *, time_index=None, ro
                              "不把未知 GMM 耗时补零。")
         entry.update(status="MATCHED", stage_rows=[{"stage_key": row["stage_key"],
             "stage_order": row["stage_order"], "label": row["label"], "source_ms": row["duration_ms"]} for row in stages])
-        prepare = stages[0]
+        # Auxiliary legacy evidence keeps the original complete preparation
+        # window. The main stage table partitions it at HCPre.end instead.
+        prepare_left = _lm_exact_ns(stages[0]["start_ns"])
+        prepare_right = _lm_exact_ns(next(row for row in stages if row["stage_key"] == "attention_prepare")["end_ns"])
         try:
             entry["_attention_prepare"] = analyze_attention_prepare(
                 (time_index if time_index is not None else ATimeIndex(tasks)).overlapping(
-                    _lm_exact_ns(prepare["start_ns"]), _lm_exact_ns(prepare["end_ns"])),
-                _lm_exact_ns(prepare["start_ns"]), _lm_exact_ns(prepare["end_ns"]),
+                    prepare_left, prepare_right),
+                prepare_left, prepare_right,
                 model=model, attention=layer["attention"],
                 scope={"rank": rank, "round_id": round_id, "layer": layer["layer"]})
         except (ValueError, KeyError, TypeError, ArithmeticError) as error:
@@ -4599,7 +4605,8 @@ def _lm_target_stage_breakdowns(classes, groups, cycle_ms, *, rounds=1, layer_sa
 
     A single round first averages its reference layers.  Rank results then
     average those round means, using the exact same retained rounds as the
-    parent estimator.  Only native D/C/GMM deltas change the ten source spans.
+    parent estimator. Only native D/C/GMM deltas change the source spans.
+    Stored legacy ten-stage inputs keep their original unsplit preparation.
     """
     output = []
     for parent in classes:
@@ -4622,13 +4629,16 @@ def _lm_target_stage_breakdowns(classes, groups, cycle_ms, *, rounds=1, layer_sa
                 reasons = [row.get("reason") or "reference stage evidence unavailable" for row in samples
                            if row.get("status") != "MATCHED"]
                 raise ValueError("; ".join(dict.fromkeys(reasons)) or "reference stage evidence unavailable")
+            keys = tuple(row["stage_key"] for row in samples[0]["stage_rows"])
+            if keys not in (_LM_TARGET_STAGE_KEYS, _LM_LEGACY_TARGET_STAGE_KEYS):
+                raise ValueError("reference stage keys/order do not match a supported stage definition")
             for sample in samples:
-                if tuple(row["stage_key"] for row in sample["stage_rows"]) != _LM_TARGET_STAGE_KEYS:
-                    raise ValueError("reference stage keys/order do not match the ten-stage definition")
+                if tuple(row["stage_key"] for row in sample["stage_rows"]) != keys:
+                    raise ValueError("reference stage schemas disagree across retained samples")
             delta_fields = {"dispatch": "dispatch_delta_ms", "combine": "combine_delta_ms",
                             "experts": "routed_compute_delta_ms"}
             rows = []
-            for index, key in enumerate(_LM_TARGET_STAGE_KEYS):
+            for index, key in enumerate(keys):
                 source_ms = statistics.fmean(_lm_number(sample["stage_rows"][index]["source_ms"], "source stage")
                                              for sample in samples)
                 delta = parent[delta_fields[key]] if key in delta_fields else 0.
@@ -4643,13 +4653,15 @@ def _lm_target_stage_breakdowns(classes, groups, cycle_ms, *, rounds=1, layer_sa
             for field, expected in (("source_ms", parent["wall_ms"]), ("target_ms", parent["target_wall_ms"]),
                                     ("target_total_ms", entry["target_total_ms"])):
                 if not math.isclose(math.fsum(row[field] for row in rows), expected, rel_tol=1e-12, abs_tol=1e-8):
-                    raise ValueError("ten target stages do not close to parent " + field)
+                    raise ValueError("target stages do not close to parent " + field)
             if any(not 0 <= row["cycle_share"] <= 1 for row in rows):
                 raise ValueError("target stage cycle share is outside the parent cycle")
             notes = list(dict.fromkeys(sample["note"].replace(entry["note"], "").strip()
                                       for sample in samples if sample.get("note")))
             notes = [note for note in notes if note]
             entry.update(status="MATCHED", stage_rows=rows)
+            if keys == _LM_LEGACY_TARGET_STAGE_KEYS:
+                entry["note"] += " 旧十阶段证据未单独拆分HCPre，保留原准备合并项，不推算拆分值。"
             if notes:
                 entry["note"] += " " + " ".join(notes)
         except (ValueError, KeyError, TypeError, ArithmeticError) as error:

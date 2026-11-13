@@ -144,7 +144,7 @@ class FullLayerHotspotTests(unittest.TestCase):
                 self.assertEqual(group["rounds"], 2)
                 parent = stages_by_class[group["role"], group["attention"]]
                 self.assertEqual(group["reference_layers"], parent["reference_layers"])
-                self.assertAlmostEqual(group["parent_wall_ms"], parent["stage_rows"][0]["source_ms"])
+                self.assertAlmostEqual(group["parent_wall_ms"], sum(row["source_ms"] for row in parent["stage_rows"][:2]))
                 self.assertEqual(group["layer_round_samples"], 2 * len(group["reference_layers"]))
                 self.assertNotIn("target_ms", group)
                 self.assertTrue(all("target_ms" not in row for row in group["rows"]))
@@ -211,8 +211,8 @@ class TargetStageTests(unittest.TestCase):
             self.assertEqual(group["status"], "MATCHED", group["reason"])
             self.assertEqual(group["reference_layers"], parent["reference_layers"])
             self.assertEqual(group["target_layers"], parent["target_layers"])
-            self.assertEqual(len(group["stage_rows"]), 10)
-            self.assertEqual([row["stage_order"] for row in group["stage_rows"]], list(range(1, 11)))
+            self.assertEqual(len(group["stage_rows"]), 11)
+            self.assertEqual([row["stage_order"] for row in group["stage_rows"]], list(range(1, 12)))
             self.assertAlmostEqual(sum(row["source_ms"] for row in group["stage_rows"]), parent["wall_ms"])
             self.assertAlmostEqual(sum(row["target_ms"] for row in group["stage_rows"]), parent["target_wall_ms"])
             total = parent["target_layers"] * parent["target_wall_ms"]
@@ -227,7 +227,7 @@ class TargetStageTests(unittest.TestCase):
         for role in method["role_details"]:
             self.assertAlmostEqual(weighted[role["role"]], role["target_layer_envelopes_ms"])
 
-    def test_method1_native_ten_stages_only_apply_parent_component_deltas(self):
+    def test_method1_native_stages_only_apply_parent_component_deltas(self):
         report, native = native_stage_report()
         method = attach(report, native)[0]
         self.assert_closes(method)
