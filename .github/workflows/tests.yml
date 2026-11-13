@@ -69,5 +69,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           python -B -S -m unittest discover -s tests -p 'test_ep128_target_stages.py' -v
+          python -B -S -m unittest discover -s tests -p 'test_ep128_hcpre*.py' -v
           python -B -S -m unittest discover -s tests -p 'test_ep128_attention_prepare.py' -v
           python -B -S -m unittest discover -s tests -p 'test_ep128_case_table_labels.py' -v

@@ -23,7 +23,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261112.2.case_table_labels"
+RENDERER_VERSION = "20261113.1.exclusive_hcpre"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -1721,8 +1721,14 @@ METHOD_STAGE_SCOPE = ("CSA/HCA/SWA展示核心提供的目标估算；两项U子
 TARGET_STAGE_HEADERS = ["细分阶段（已含）", "源单层均值(ms)", "目标单层均值(ms)",
                         "目标同类全部层合计(ms/完整周期)", "占完整周期", "状态 / 说明"]
 TARGET_STAGE_SPANS = ((1, 3), (4, 4), (5, 5), (6, 7), (8, 8), (9, 12))
-SWA_STAGE_KEYS = ("attention_prepare", "attention", "attention_output", "attention_post", "moe_prepare",
-                  "dispatch", "experts", "combine", "ffn_output", "ffn_post")
+LEGACY_LAYER_STAGE_KEYS = ("attention_prepare", "attention", "attention_output", "attention_post", "moe_prepare",
+                           "dispatch", "experts", "combine", "ffn_output", "ffn_post")
+SWA_STAGE_KEYS = ("attention_hcpre",) + LEGACY_LAYER_STAGE_KEYS
+HCPRE_STAGE_SCOPE = ("HCPre时段为首HCPre.start→HCPre.end，剩余Q/KV准备为HCPre.end→Attention.start；"
+                     "两项按设备时间连续分界、互不重叠，跨流活动按相交区间归入对应时段；"
+                     "不是按kernel耗时累计相减，也不表示时段内只有该业务算子。")
+LEGACY_HCPRE_NOTE = ("旧10项格式：HCPre未拆分，保留原合并准备项；"
+                     "请用新版核心重算已有原始CSV后展示HCPre与剩余准备两项，旧JSON不猜拆。")
 
 
 def _matched_stage(item, rounds):
@@ -1780,10 +1786,12 @@ def _target_layer_expansion_data(method, role, attention, title):
         problems.append("目标阶段分组与本方法选中rank的同类参考不一致")
     stages = sorted((item for item in group.get("stage_rows") or [] if isinstance(item, dict)),
                     key=lambda item: item.get("stage_order") if type(item.get("stage_order")) is int else -1)
-    ordered = ([item.get("stage_order") for item in stages] == list(range(1, 11))
-               and tuple(item.get("stage_key") for item in stages) == SWA_STAGE_KEYS)
+    keys = tuple(item.get("stage_key") for item in stages)
+    known_schema = keys in (LEGACY_LAYER_STAGE_KEYS, SWA_STAGE_KEYS)
+    ordered = (known_schema and all(type(item.get("stage_order")) is int for item in stages)
+               and [item["stage_order"] for item in stages] == list(range(1, len(keys) + 1)))
     if not ordered:
-        problems.append("目标10阶段标识或顺序不完整/重复")
+        problems.append("目标阶段标识或顺序不完整/重复；仅支持完整旧10项或新11项")
     cycle = method.get("cycle_ms")
     valid_cycle = _number(cycle) and cycle > 0
     fields = ("source_ms", "delta_ms", "target_ms", "target_total_ms", "cycle_share")
@@ -1797,7 +1805,7 @@ def _target_layer_expansion_data(method, role, attention, title):
         if (not close(math.fsum(item["source_ms"] for item in stages), group.get("source_wall_ms"))
                 or not close(math.fsum(item["target_ms"] for item in stages), group.get("target_wall_ms"))
                 or not close(math.fsum(item["target_total_ms"] for item in stages), group.get("target_total_ms"))):
-            problems.append("目标10阶段未与源单层、目标单层或同类全部层父项闭合")
+            problems.append("目标阶段未与源单层、目标单层或同类全部层父项闭合")
         if not close(group.get("source_wall_ms"), matching.get("wall_ms")) or not close(group.get("target_wall_ms"), matching.get("target_wall_ms")):
             problems.append("目标阶段父项与本方法同类单层均值不一致")
         parent_total = group.get("target_total_ms")
@@ -1819,6 +1827,8 @@ def _target_layer_expansion_data(method, role, attention, title):
                       + ("主模型参考层由核心给定，实际层号见清单；逐源层诊断保留在层与组件实测。" if role == "main" else "草稿同类目标层数由核心提供。")
                       + "Dispatch/Combine增量分别落在对应阶段；专家只追加路由GMM增量，激活与衔接不整体倍增；其他阶段保持核心给定值。"
                       + ("核心说明：" + _text(group["note"]) if group.get("note") else ""))
+    if known_schema:
+        result["note"] += HCPRE_STAGE_SCOPE if keys == SWA_STAGE_KEYS else LEGACY_HCPRE_NOTE
     if problems:
         result["note"] += "未绘图：" + "；".join(dict.fromkeys(problems)) + "。"
     else:
@@ -2293,11 +2303,18 @@ def _attention_prepare_expansion_data(method, role, attention):
                if isinstance(entry, dict) and entry.get("role") == role and entry.get("attention") == attention
                and entry.get("status") == "MATCHED"]
     if len(parents) == 1:
-        stages = [entry for entry in parents[0].get("stage_rows") or [] if entry.get("stage_key") == "attention_prepare"]
-        if (len(stages) != 1 or not _number(stages[0].get("source_ms"))
+        parent_stages = parents[0].get("stage_rows") or []
+        prepare_keys = (("attention_hcpre", "attention_prepare")
+                        if any(entry.get("stage_key") == "attention_hcpre" for entry in parent_stages)
+                        else ("attention_prepare",))
+        stages = [entry for entry in parent_stages if entry.get("stage_key") in prepare_keys]
+        if (len(stages) != len(prepare_keys)
+                or any(sum(entry.get("stage_key") == key for entry in stages) != 1 for key in prepare_keys)
+                or not all(_number(entry.get("source_ms")) for entry in stages)
                 or not _number(group.get("parent_wall_ms"))
-                or not math.isclose(stages[0]["source_ms"], group["parent_wall_ms"], rel_tol=1e-9, abs_tol=1e-8)):
-            issues.append("细分父跨度与10阶段的源Attention准备不一致")
+                or not math.isclose(math.fsum(entry["source_ms"] for entry in stages),
+                                    group["parent_wall_ms"], rel_tol=1e-9, abs_tol=1e-8)):
+            issues.append("细分父跨度与源Attention完整准备窗不一致")
     items = group.get("rows")
     keys = [item.get("key") for item in items if isinstance(item, dict)] if isinstance(items, list) else []
     if not keys or any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys):
@@ -2358,8 +2375,6 @@ def _attention_prepare_section(sheet, row, method, role, attention):
 def _method_stage_expansions(sheet, row, case, method):
     for group in _method_expansion_data(case, method):
         row = _write_method_expansion(sheet, row, group, method)
-        if group.get("operator_group"):
-            row = _attention_prepare_section(sheet, row, method, *group["operator_group"])
     for role, attention in (("main", "CSA"), ("main", "HCA"), ("draft", "SWA")):
         row = _method_operator_section(sheet, row, method, role, attention)
     return row
@@ -3142,8 +3157,6 @@ def _method_stage_expansions_html(case, method):
                         + '</span></div>')
             parts.append('</div>')
         parts.append('</section>')
-        if group.get("operator_group"):
-            parts.append(_attention_prepare_html(method, *group["operator_group"]))
     parts.extend(_method_operator_html(method, role, attention)
                  for role, attention in (("main", "CSA"), ("main", "HCA"), ("draft", "SWA")))
     return ''.join(parts)

@@ -593,7 +593,7 @@ raise SystemExit(p.main())
                 self.assertEqual(len(new['target_stage_breakdowns']), 3)
                 for group in new['target_stage_breakdowns']:
                     self.assertEqual(group['status'], 'MATCHED', group['reason'])
-                    self.assertEqual(len(group['stage_rows']), 10)
+                    self.assertEqual(len(group['stage_rows']), 11)
                     self.assertAlmostEqual(sum(row['target_ms'] for row in group['stage_rows']), group['target_wall_ms'])
                     self.assertTrue(all('operator_breakdown' not in stage for stage in group['stage_rows']))
                 for group in new['operator_hotspots']:

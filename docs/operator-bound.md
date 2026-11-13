@@ -1,12 +1,12 @@
 # 源算子 bound 的证据口径
 
-bound判据版本：`20261110.1.evidence_roofline`；热点统计接口：核心／生成器 `20261112.1.layer_stages_restored`。运行时保持Python标准库依赖；Attention准备识别单列为同目录模块，不安装外部 Skill，不调用设备，保留整层时间、外推公式和共同源rank；新热点按完整层区间统计，旧JSON保留所存阶段内热点口径。
+bound判据版本：`20261110.1.evidence_roofline`；热点统计接口：核心／生成器 `20261113.1.exclusive_hcpre`。运行时保持Python标准库依赖；Attention准备识别单列为同目录模块，不安装外部 Skill，不调用设备，保留整层时间、外推公式和共同源rank；新热点按完整层区间统计，旧JSON保留所存阶段内热点口径。
 
 公开检索、实际代码审查与不采用的规则见 [Skill 调研](operator-bound-skill-survey.md)。这里把统计事实、候选判断和定量模型分开，不把某个百分比的最大值当作已定位根因。
 
 ## 报告如何读
 
-方法1、方法2和方法3的CSA、HCA、SWA各自源实测Top8后依次展示：流水表、完整高级指标与候选依据、Roofline 定量表、模型依据与缺失项。包含这些Top8中的Attention/MoE；不是声称每个算子均有硬件证据。新报告从 `projection.layer_mean_methods[].operator_hotspots[].kernels` 读取热点，层内十阶段独立保留，不计算逐算子互斥覆盖或目标算子贡献。源PMU不乘目标层数和外推倍率。
+方法1、方法2和方法3的CSA、HCA、SWA各自源实测Top8后依次展示：流水表、完整高级指标与候选依据、Roofline 定量表、模型依据与缺失项。包含这些Top8中的Attention/MoE；不是声称每个算子均有硬件证据。新报告从 `projection.layer_mean_methods[].operator_hotspots[].kernels` 读取热点，层内阶段独立保留（新11项将HCPre单列，旧10项保持原证据），不计算逐算子互斥覆盖或目标算子贡献。源PMU不乘目标层数和外推倍率。
 
 | 层级 | 说明 | 能得出的结论 |
 | --- | --- | --- |

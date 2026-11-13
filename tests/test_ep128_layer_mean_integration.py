@@ -247,7 +247,7 @@ class SWADrilldownTests(unittest.TestCase):
             self.assertEqual(diagnostic["status"], "MATCHED")
             self.assertEqual(len(diagnostic["layer_summary"]), 11)
             self.assertFalse(diagnostic["layer_summary"][0]["reference_eligible"])
-            self.assertEqual(len(diagnostic["stage_summary"]), 30)
+            self.assertEqual(len(diagnostic["stage_summary"]), 33)
             for layer in (0, 1, 2):
                 rows = [row for row in diagnostic["stage_summary"] if row["layer"] == layer]
                 baseline = next(row for row in diagnostic["layer_summary"] if row["role"] == "draft" and row["layer"] == layer)
@@ -334,13 +334,13 @@ class AllLayerDrilldownTests(unittest.TestCase):
             self.assertEqual(measured, before)
             self.assertEqual(diagnostic['status'], 'MATCHED')
             self.assertEqual(len(diagnostic['layer_summary']), 11)
-            self.assertEqual(len(diagnostic['stage_summary']), 110)
+            self.assertEqual(len(diagnostic['stage_summary']), 121)
             for parent in diagnostic['layer_summary']:
                 stages = [row for row in diagnostic['stage_summary']
                           if (row['role'], row['attention'], row['layer']) ==
                              (parent['role'], parent['attention'], parent['layer'])]
-                self.assertEqual([row['stage_order'] for row in stages], list(range(1, 11)))
-                self.assertEqual(len({row['stage_key'] for row in stages}), 10)
+                self.assertEqual([row['stage_order'] for row in stages], list(range(1, 12)))
+                self.assertEqual(len({row['stage_key'] for row in stages}), 11)
                 self.assertTrue(all(row['status'] == 'MATCHED' for row in stages))
                 self.assertTrue(all(row['rounds'] == row['matched_windows'] == len(measured['rounds'])
                                     for row in stages))
@@ -350,14 +350,14 @@ class AllLayerDrilldownTests(unittest.TestCase):
                 self.assertAlmostEqual(attention['duration_ms_mean'], {'CSA': .004, 'HCA': .005, 'SWA': .003}[parent['attention']])
             with Path(diagnostic['stages_csv']).open() as stream:
                 exported = list(csv.DictReader(stream))
-            self.assertEqual(len(exported), 110 * len(measured['rounds']))
+            self.assertEqual(len(exported), 121 * len(measured['rounds']))
             self.assertEqual({row['role'] for row in exported}, {'main', 'draft'})
             self.assertEqual({row['attention'] for row in exported}, {'CSA', 'HCA', 'SWA'})
             report = {'cases': [dict(name='SYNTHETIC_ALL_LAYER_DRILLDOWN',
                                      source={}, projection={'methods': []},
                                      measurements=[dict(rank=capture['rank'], layer_diagnostics=diagnostic)])]}
             summary_rows = list(core.iter_report_rows(report, 'layer_stage_summary'))
-            self.assertEqual(len(summary_rows), 110)
+            self.assertEqual(len(summary_rows), 121)
             self.assertEqual({row['rank'] for row in summary_rows}, {capture['rank']})
             self.assertEqual({row['attention'] for row in summary_rows}, {'CSA', 'HCA', 'SWA'})
 
@@ -368,17 +368,17 @@ class AllLayerDrilldownTests(unittest.TestCase):
             for role, attention in (('main', 'CSA'), ('main', 'HCA'), ('draft', 'SWA')):
                 layer = next(row for row in cycle['layers'] if row['role'] == role and row['attention'] == attention)
                 stages = core.layer_stage_plan(layer, capture['tasks'])
-                self.assertEqual(len(stages), 10)
+                self.assertEqual(len(stages), 11)
                 self.assertEqual(int(stages[0]['start_ns']), int(layer['start_ns']))
                 self.assertEqual(int(stages[-1]['end_ns']), int(layer['end_ns']))
                 self.assertTrue(all(left['end_ns'] == right['start_ns'] for left, right in zip(stages, stages[1:])))
                 self.assertEqual(sum(row['duration_ns'] for row in stages), int(layer['end_ns']) - int(layer['start_ns']))
                 self.assertTrue(all(row['status'] == 'MATCHED' for row in stages))
-                self.assertIn('Q/KV', stages[0]['label'])
+                self.assertIn('Q/KV', stages[1]['label'])
                 if attention in ('CSA', 'HCA'):
-                    self.assertIn('压缩', stages[0]['label'])
+                    self.assertIn('压缩', stages[1]['label'])
                 if attention == 'CSA':
-                    self.assertIn('索引', stages[0]['label'])
+                    self.assertIn('索引', stages[1]['label'])
 
     def test_optional_indexer_and_metadata_do_not_replace_or_duplicate_the_native_attention_anchor(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -394,7 +394,7 @@ class AllLayerDrilldownTests(unittest.TestCase):
             metadata.op_type = 'SparseFlashAttentionMetadata'
             metadata.start_ns, metadata.end_ns = attention.start_ns - 1000, attention.start_ns
             stages = core.layer_stage_plan(layer, [*tasks, metadata])
-            self.assertEqual(len(stages), 10)
+            self.assertEqual(len(stages), 11)
             self.assertTrue(all(row['status'] == 'MATCHED' for row in stages))
             body = next(row for row in stages if row['stage_key'] == 'attention')
             self.assertEqual(int(body['start_ns']), attention.start_ns)
@@ -424,7 +424,7 @@ class AllLayerDrilldownTests(unittest.TestCase):
             self.assertTrue(any(row['status'] == 'PARTIAL' for row in partial))
             other = [row for row in diagnostic['stage_summary']
                      if row['role'] != 'main' or row['layer'] != layer['layer']]
-            self.assertEqual(len(other), 100)
+            self.assertEqual(len(other), 110)
             self.assertTrue(all(row['status'] == 'MATCHED' for row in other))
             self.assertTrue(all(row['wall_ms_mean'] > 0 for row in diagnostic['layer_summary']))
 
@@ -433,8 +433,8 @@ class AllLayerDrilldownTests(unittest.TestCase):
             capture, measured = self.fixture(Path(temp))
             generic, legacy = core.layer_analyze_capture(capture, measured, temp, with_swa_compat=True)
             standalone = core.swa_analyze_capture(capture, measured, Path(temp) / 'legacy')
-            self.assertEqual(len(generic['stage_summary']), 110)
-            self.assertEqual(len(legacy['stage_summary']), 30)
+            self.assertEqual(len(generic['stage_summary']), 121)
+            self.assertEqual(len(legacy['stage_summary']), 33)
             self.assertTrue(all(row['role'] == 'draft' and row['attention'] == 'SWA'
                                 for row in legacy['stage_summary']))
             self.assertEqual(legacy['stage_summary'], standalone['stage_summary'])
@@ -646,7 +646,7 @@ class OperatorHotspotIntegrationTests(unittest.TestCase):
                     for attention in ('CSA', 'HCA', 'SWA'):
                         stage_chart = next(chart for title, chart in titles.items()
                                            if title.startswith(attention + '层内阶段展开'))
-                        self.assertEqual([len(values) for values in numeric_series(stage_chart)], [10])
+                        self.assertEqual([len(values) for values in numeric_series(stage_chart)], [11])
                     u_chart = next(chart for title, chart in titles.items()
                                    if title.startswith('轮次剩余区间耗时构成'))
                     self.assertEqual([len(values) for values in numeric_series(u_chart)], [15])

@@ -61,7 +61,7 @@ class Method3Tests(unittest.TestCase):
                 self.assertNotIn("operator_hotspots", record)
                 for group in record["target_stage_breakdowns"]:
                     self.assertEqual(group["status"], "MATCHED", group["reason"])
-                    self.assertEqual(len(group["stage_rows"]), 10)
+                    self.assertEqual(len(group["stage_rows"]), 11)
                     self.assertAlmostEqual(math.fsum(row["target_total_ms"] for row in group["stage_rows"]),
                                            group["target_total_ms"])
                     for stage in group["stage_rows"]:

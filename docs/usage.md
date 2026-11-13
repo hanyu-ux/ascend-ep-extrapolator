@@ -209,21 +209,26 @@ python build_ep128_leadership_excel.py --cases profile_ep128_cases.example.json 
 
 ### 方法页中的保留视图
 
-“方法1估算”、“方法2估算”和“方法3估算”三个sheet中，每个case继续展示整轮五项、U15和下一主准备阶段，并提供CSA、HCA、SWA各自的源实测Top8、PMU及bound。保留这三类层的层内十阶段展开；仅删除阶段下面的逐算子贡献下钻，包括算子覆盖账本、并行组合与gap明细，不再为这些逐算子账本执行互斥区间扫描。
+“方法1估算”、“方法2估算”和“方法3估算”三个sheet中，每个case继续展示整轮五项、U15和下一主准备阶段，并提供CSA、HCA、SWA各自的源实测Top8、PMU及bound。保留这三类层的层内阶段展开（新分析11项，兼容旧10项）；仅删除阶段下面的逐算子贡献下钻，包括算子覆盖账本、并行组合与gap明细，不再为这些逐算子账本执行互斥区间扫描。
 
 整层识别、同类参考层均值及原外推公式保留：Dispatch/Combine与路由GMM只按既有父模型增加对应增量，激活和其他层成本不整体乘倍率。默认主0仍只排除参考，完整源周期与目标层数不因此缩减。三个方法共用外推前按源整轮均值选定的rank，各方法的通信假设及五项账本不变。
 
 U中的“下一主模型KV与输入准备”和“下一主metadata及输入映射准备”继续各自提供表格、横向柱状图、函数入口与逐step折线。这些源实测子阶段作为U的展开保留一次，不乘目标层数。缺失或不闭合的证据标为不可用，未知不补0。
 
-### Attention准备段的业务细分
+### HCPre直接在原阶段表单列
 
-十阶段第一项仍以首HCPre.start到Attention.start的真实区间为父项。方法1/2/3另显示 `attention_prepare_breakdowns` 的源业务细分，不乘目标层数或通信/TopK倍率；同case三方法复用同一源rank和同一份细分。细分只解释已有父项，不增加整层、整轮、TPOT或吞吐成本。
+新分析将原来的“HCPre与Q/KV、压缩/索引准备”在同一阶段表中拆为两行，其余九项保持原边界，共11项：
 
-细项包含HCPre、输入归一化/可选AllGather/可确认的共享输入量化、Q低秩投影/Q展开/Q最终处理、窗口KV投影/归一化/RoPE/写入、Attention压缩、CSA Indexer Query/Key缓存/索引选择。各行提供函数入口、调用数均值、kernel累计、记录并集、首尾跨度及样本覆盖。Q/KV/压缩/Indexer可能重叠，因此分组并集、累计和跨度均不可相加成父耗时。父项保留记录并集和CSV未覆盖量；未覆盖不直接等同于CPU或同步等待。
+| stage key | 互斥时间范围 |
+| --- | --- |
+| `attention_hcpre` | 首个Attention HCPre的 `[start,end)` |
+| `attention_prepare` | `[HCPre.end,Attention.start)`，合并保留Q/KV与压缩/索引准备 |
 
-只有全部同类参考层×保留轮次均能确认归属，才给出该行全样本均值。部分确认保留known_samples/total_samples、未知原因和空值，不把缺证据补为0。重复MatMul/RmsNorm不按第N次调用或固定stream号猜归属；Compressor内部与评分/TopK融合kernel不虚拆内部时长。缺少必要shape/scope证据的记录进入“未归属记录”。SWA的压缩/Indexer、HCA的Indexer按结构标为不适用。旧JSON没有这份细分时，离线重绘明确标未采集；用新版重新处理原CSV可尝试识别，不需先重采样，但CSV缺失的关联不会凭空恢复。
+两项连续不重叠，合计等于原准备跨度；完整11项闭合到原层。跨流任务统一按时间边界裁剪，HCPre时段可能伴随其他流任务，不将各算子的kernel累计相减当作互斥时长。两项的目标增量均为0，沿用源均值；目标增量仍只落在Dispatch、Combine和路由GMM。整层均值、完整周期、TPOT、吞吐和共同源rank保持原值。
 
-新增模块 `ep128_attention_prepare.py` 仅用Python标准库，与 `profile_ep128.py` 放在同目录。
+方法1/2/3在原阶段表中展示这两行，不再另加Q/KV等业务分组面板；独立整层Top8、PMU、bound和U细分保留。辅助JSON的 `attention_prepare_breakdowns` 仍保存原完整准备窗的源证据，不能拿它与新的剩余准备段直接比较。
+
+旧十阶段JSON继续显示原合并项并注明“HCPre未拆分”，不会从Top8或分组累计猜测两个新值。需要新拆分时，用新版核心重新分析已有原CSV，无需重新采样；缺少合法HCPre/Attention边界的层保持未识别，父层与周期仍保留。
 
 ### Top算子的读取口径
 
@@ -320,7 +325,7 @@ python -u build_ep128_leadership_excel.py --report ep128_report_7/model_architec
 
 整层HCPre→末HCPost边界、层类型、组件实测、同类参考层均值和Top8继续保留；核对时固定case、rank和周期，并区分整层wall与单个Attention／GMM kernel时长。具体采样还要核对主／草稿token数、padding、图模式和Task Type。
 
-新版核心保留 `measurements[].layer_diagnostics.layer_summary` 整层统计、`stage_summary`、`swa_diagnostics`、方法级 `target_stage_breakdowns` 及层内十阶段CSV（`layer_stage_summary.csv`、`swa_stage_summary.csv`、`*-layer-stages.csv`、`*-swa-stages.csv`）。新版不生成各阶段的 `operator_breakdown`，Top8单独保存在 `operator_hotspots`。`layers.csv`、`components.csv`、`layer_means.csv`、五项账本、U15及其输入／metadata明细继续导出。旧输出目录已有的历史文件不作为新结果，应以本次JSON及导出日志为准；可用新的 `--out` 目录避免混读。
+新版核心保留 `measurements[].layer_diagnostics.layer_summary` 整层统计、`stage_summary`、`swa_diagnostics`、方法级 `target_stage_breakdowns` 及层内阶段CSV（新分析11项）（`layer_stage_summary.csv`、`swa_stage_summary.csv`、`*-layer-stages.csv`、`*-swa-stages.csv`）。新版不生成各阶段的 `operator_breakdown`，Top8单独保存在 `operator_hotspots`。`layers.csv`、`components.csv`、`layer_means.csv`、五项账本、U15及其输入／metadata明细继续导出。旧输出目录已有的历史文件不作为新结果，应以本次JSON及导出日志为准；可用新的 `--out` 目录避免混读。
 
 ## 7. 运行回归测试
 

@@ -699,7 +699,7 @@ class LayerMeanRendererTests(unittest.TestCase):
         self.assertNotIn('主0排除', rendered['note'])
         self.assertEqual(rendered['series'][0][1], [row['target_total_ms'] for row in group['stage_rows']])
 
-    def test_attention_prepare_business_branches_are_source_only_and_unknowns_stay_blank(self):
+    def test_stored_prepare_business_branches_remain_source_only_without_automatic_extra_panels(self):
         report = attention_prepare_report()
         before = copy.deepcopy(report)
         out, (book, _) = self.build(report)
@@ -713,12 +713,12 @@ class LayerMeanRendererTests(unittest.TestCase):
                 self.assertGreater(sum(row[3] for row in data['rows'][:2]), group['parent_wall_ms'])
                 self.assertEqual(data['rows'][2][1:5], [renderer.NA] * 4)
                 self.assertEqual(data['rows'][3][1:5], [renderer.NA] * 4)
-                chart = next(chart for chart in by_sheet[name] if self.chart_title(chart).startswith(data['title']))
-                series = self.assert_bar_cache_matches_own_sheet(chart, book, name)
-                self.assertEqual(series[0][1], [row['busy_union_ms'] for row in group['rows'][:2]])
-                self.assertIn(group['rows'][2]['label'], page)
-                self.assertIn('synthetic_function_0', page)
-            self.assertIn('各业务分支可并行', '\n'.join(map(str, book[name][1].values())))
+                self.assertFalse(any(self.chart_title(chart).startswith(data['title'])
+                                     for chart in by_sheet[name]))
+                self.assertNotIn(group['rows'][2]['label'], page)
+                self.assertNotIn('synthetic_function_0', page)
+            self.assertNotIn('Attention准备细分（源实测）', '\n'.join(map(str, book[name][1].values())))
+        self.assertNotIn('class="attention-prepare-expansion"', page)
         self.assertEqual(report, before)
 
     def test_attention_prepare_invalid_source_identity_coverage_or_parent_suppresses_only_its_chart(self):

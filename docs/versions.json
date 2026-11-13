@@ -7,15 +7,15 @@
   },
   "components": {
     "profile_ep128.py": {
-      "version": "20261112.1.layer_stages_restored",
-      "sha256": "7aaa708b4e4dbe27ee925c93d16eb88549feb7746e8703a1e3c4af0500003823",
+      "version": "20261113.1.exclusive_hcpre",
+      "sha256": "2a08974ead32c6207481af956cbbcacdd452165ba1beb68fdf524db968b1f104",
       "imported_version": "20261103.12.native_stages",
       "imported_sha256": "035f0c6312354ca0937361f1ab301452ed61c68239845b2c0c76f08653f9d7f7",
       "matches_imported_source": false
     },
     "build_ep128_leadership_excel.py": {
-      "version": "20261112.2.case_table_labels",
-      "sha256": "baaee164bf999d3eae630066f2ef6e42b443555ce96b29e1ab4368c183045fab",
+      "version": "20261113.1.exclusive_hcpre",
+      "sha256": "f628ac58929cf3c535f83cc97aa68d3f3b0a0ad0814e1bf5d221ccead94b6b4b",
       "imported_version": "20261104.2.bs_inventory",
       "imported_sha256": "95009582d730956e19f72c8eafb88b95a4ae5da6573f7870679e0eb1454fb47a",
       "matches_imported_source": false
@@ -79,11 +79,12 @@
     "Method3 retains each target layer Dispatch/Combine duration with multipliers exactly one and no fixed overhead, while applying the existing routed-GMM TopK delta; target depth, gaps, source-rank selection and original methods remain unchanged. New raw analyses export three methods and ten workbook sheets. Optional --add-method3 derives means from validated saved source aggregates into separate JSON/XLSX/HTML without CSV rereads, input mutation or fabricated per-round observations; missing source evidence remains unavailable. All three methods share BS/S trends, five parts, stages, source-linked U charts, operator/PMU evidence and navigation. HTML directory anchors now assemble in one ordered pass instead of repeatedly copying the whole document, retaining exact content and adding body/directory/write progress. Core, renderer, CLI, legacy JSON, source provenance, closure, chart caches, serial/spawn equivalence and Windows regression checks are included; real old-report and nine-case synthetic smoke artifacts stay local.",
     "New analyses define acceptance as the mean effective output fraction including bonus: SAL=(1+S)*r, canonical semantics mean_output_fraction_including_bonus. Each case may override its rate; changes in S recompute inherited rate-derived lengths, explicit SAL-only cases remain supported, conflicting Neff/SAL/r declarations and active historical semantics are rejected with migration guidance. Strict output/rate endpoints handle the representable 1/3 boundary without admitting lower floats. Source and all three methods use the derived Neff for throughput and TPOT; original cycle, five-part, stage and rank calculations remain unchanged. CSV, Excel, HTML, templates and the independent capture validator share the definition. Existing JSON is never reinterpreted, old formulas stay labeled and new/old/different-rate trend conditions remain separate. Pure configuration preview exposes declared rates without inventing Neff or performance. Core/validator parity, boundary, inheritance, input immutability, historical method3 preservation and real CLI synthetic sensitivity regressions cover the update, including Windows checks.",
     "CSA/HCA/SWA retain their source and target ten-stage layer breakdowns, stage CSVs, U15/focus diagnostics and independent whole-layer source Top8/PMU/bound/Roofline evidence. Only the per-stage operator contribution, mutually exclusive operator coverage and target operator-delta ledgers are removed. The new standard-library Attention preparation helper separates evidenced business groups while retaining unresolved work and same-call provenance; it never infers a critical path or decomposes fused kernels. Legacy JSON redraw keeps saved stage-local hotspot scope explicit. Layer means, Dispatch/Combine/GMM extrapolation, five-part cycles and shared source-rank selection remain unchanged. Raw profiling inputs and generated artifacts stay local.",
-    "Each per-case Excel table repeats the declared BS/S in its first header cell without moving rows, numeric values or chart references. Offline HTML adds escaped per-table BS/S captions, sticky caption/header styles and searchable directory labels, including independently rendered fixed-rank source tables. Same-name cases remain isolated; report-wide summaries, communication references and failures are not mislabelled as one case. Existing JSON can be redrawn without profiling reads, timing changes or rank reselection."
+    "Each per-case Excel table repeats the declared BS/S in its first header cell without moving rows, numeric values or chart references. Offline HTML adds escaped per-table BS/S captions, sticky caption/header styles and searchable directory labels, including independently rendered fixed-rank source tables. Same-name cases remain isolated; report-wide summaries, communication references and failures are not mislabelled as one case. Existing JSON can be redrawn without profiling reads, timing changes or rank reselection.",
+    "New source and target layer-stage tables split only the first Attention HCPre interval from the existing Q/KV/compression/index preparation row. The resulting eleven half-open time spans are mutually exclusive, use exact native HCPre end timestamps and close to the original layer wall; cross-stream records are clipped at that boundary instead of subtracting kernel sums. Both split rows have zero extrapolation delta. Cycle, class means, TPOT, throughput, shared rank, Top8/PMU and U diagnostics remain unchanged. Additional preparation business-group panels are no longer automatically rendered. Legacy ten-stage JSON remains unsplit and labelled honestly, including offline method3, with no invented HCPre timings. Existing raw CSVs suffice for the new split; resampling is not required. Boundary/overlap/precision, zero remainder, mixed-schema rejection, legacy method3 and original-table/chart-reference regressions run on Linux and Windows."
   ],
   "validation": {
-    "discovered_tests": 612,
-    "passed": 602,
+    "discovered_tests": 626,
+    "passed": 616,
     "skipped": 10,
     "skip_reasons": {
       "private_capture_fixture_unavailable": 8,
@@ -113,5 +114,5 @@
       "added_at": "2026-11-05"
     }
   },
-  "updated_at": "2026-11-12"
+  "updated_at": "2026-11-13"
 }
