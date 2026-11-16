@@ -952,8 +952,8 @@ class LayerMeanRendererTests(unittest.TestCase):
         report = layer_mean_fixture()
         out, (book, files) = self.build(report)
         self.assertEqual(tuple(book), renderer.SHEETS)
-        for sheet, _ in book.values():
-            self.assertEqual(len(sheet.findall('.//{*}cols/{*}col')), 12)
+        for name, (sheet, _) in book.items():
+            self.assertEqual(len(sheet.findall('.//{*}cols/{*}col')), 24 if name == '额外图表统计' else 12)
             self.assertEqual(sheet.findall('.//{*}f'), [])
         overview = book['估算总览'][1]
         for method in report['cases'][0]['projection']['layer_mean_methods']:
@@ -1160,7 +1160,8 @@ class LayerMeanRendererTests(unittest.TestCase):
         out, _ = self.build(report)
         preview = out.with_suffix('.html').read_text(encoding='utf-8')
         svgs = [ET.fromstring(svg) for svg in re.findall(r'<svg\b.*?</svg>', preview, re.DOTALL)]
-        svgs = [svg for svg in svgs if not (svg.findtext('title') or '').startswith('源采样基线 · ')]
+        svgs = [svg for svg in svgs if not (svg.findtext('title') or '').startswith(
+            ('源采样基线 · ', '轮次剩余区间占比 · '))]
         self.assertEqual(len(svgs), 14)  # Overview 2*3; each method's 3 metrics plus five parts.
         for identity in ('method1', 'method2'):
             selected = [svg for svg in svgs if renderer._layer_mean_name({'id': identity}) in svg.findtext('title')]
@@ -1532,7 +1533,8 @@ class LayerMeanRendererTests(unittest.TestCase):
             self.assertEqual(method_html.count('class="u-bar"'), 15)
             self.assertNotIn(other_rank + '_PARENT_', method_html)
             self.assertNotIn('_CHILD_NOT_ADDED_', method_html)
-        self.assertEqual(out.with_suffix('.html').read_text().count('class="u-bar"'), 30)
+        self.assertEqual(renderer._extra_charts_html(report).count('class="u-bar"'), 30)
+        self.assertEqual(out.with_suffix('.html').read_text().count('class="u-bar"'), 60)
         titles = [''.join(chart.find('c:chart/c:title', chart_ns).itertext()) for chart in charts]
         self.assertTrue(titles[0].startswith('完整周期分解'))
         self.assertTrue(titles[1].startswith('轮次剩余区间耗时构成'))

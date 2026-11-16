@@ -23,13 +23,13 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261113.1.exclusive_hcpre"
+RENDERER_VERSION = "20261116.1.extra_residual_charts"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
 METHOD_IDS = ("method1", "method2", "method3")
 SHEETS = ("估算总览", "源采样基线", "层与组件实测", "时间账本", "方法1估算",
-          "方法2估算", "通信参考原表", "公式与假设", "复核记录", "方法3估算")
+          "方法2估算", "通信参考原表", "公式与假设", "复核记录", "方法3估算", "额外图表统计")
 WIDTHS = [29, 12, 19, 19, 19, 19, 19, 19, 22, 22, 47, 24]
 DEFAULT_DETAIL_ROWS = 1000
 # Excel cells allow 32,767 UTF-16 code units; leave room for continuation labels.
@@ -1711,6 +1711,271 @@ def _method_residual_section(sheet, row, case, method):
                      values_ref=reference + "$I$" + str(written[0]) + ":$I$" + str(written[-1]))],
         anchor=(row, 1, row + height, 12), stacked=False, x_axis_title="ms/HC周期；已计入完整周期，不额外相加")
     return row + height + 2
+
+
+EXTRA_CHART_SCOPE = ("固定S、按配置BS升序比较三种方法各自的外推结果。柱高和折线均为U÷外推完整周期，"
+    "共用百分比轴，折线点位于柱顶中央；标签同时显示占比和U绝对时间。"
+    "U沿用核心所选rank的剩余区间，仅保留一次，不按目标层数放大。"
+    "下方横向图为各父阶段÷U，分母与上图不同；细分子项不重复相加。")
+
+
+def _extra_residual_point(case, identity):
+    """Derive display ratios from stored target results, never remeasure inputs."""
+    method = _method(case, identity)
+    point = dict(bs=(case.get("config") or {}).get("bs"), name=case["name"],
+        rank=method.get("selected_rank"), cycle_ms=None, u_ms=None, share=None,
+        label=None, status="", items=None, stage_rows=[], stage_note="")
+    cycle = method.get("cycle_ms")
+    problems, values = [], []
+    if not _layer_mean_publishable(method) or not _number(cycle) or cycle <= 0:
+        point["status"] = "本方法外推结果不可用；" + _layer_mean_status(method)
+        return point
+    point["cycle_ms"] = cycle
+
+    def partition_values(partition):
+        for key in ("cross_role_tail_residual_ms", "residual_ms"):
+            if key in partition:
+                value = partition[key]
+                if not _number(value) or value < 0:
+                    problems.append("U原值缺失或无效")
+                else:
+                    values.append(value)
+
+    partition_values(method.get("source_partition") or {})
+    selected = [item for item in method.get("per_rank") or [] if item.get("rank") == point["rank"]]
+    if len(selected) > 1:
+        problems.append("所选rank存在重复结果")
+    elif selected:
+        partition_values(selected[0].get("source_partition") or {})
+        rank_cycle = selected[0].get("cycle_ms")
+        if rank_cycle is not None and (not _number(rank_cycle)
+                or not math.isclose(cycle, rank_cycle, rel_tol=1e-9, abs_tol=1e-8)):
+            problems.append("所选rank与外推完整周期不一致")
+    if method.get("breakdown"):
+        parts = _bs_breakdown_values(method)
+        if parts is None:
+            problems.append("外推周期五项分解缺失或不闭合")
+        else:
+            values.append(parts[-1])
+    if not values:
+        problems.append("核心缺少U原值")
+    elif any(not math.isclose(value, values[0], rel_tol=1e-9, abs_tol=1e-8) for value in values[1:]):
+        problems.append("U分区、所选rank或外推分解原值矛盾")
+    elif values[0] > cycle:
+        problems.append("U超过外推完整周期")
+    if problems:
+        point["status"] = "；".join(dict.fromkeys(problems))
+        return point
+    point.update(u_ms=values[0], share=values[0] / cycle, status="沿用核心外推原值")
+    point["label"] = format(point["share"], ".2%") + " · " + format(point["u_ms"], ".6f") + " ms"
+    rows, items, note = _method_residual_data(case, method)
+    point.update(stage_rows=rows, items=items, stage_note=note)
+    if point["u_ms"] == 0:
+        point.update(items=None, stage_note="U为0，内部阶段占比无定义；不绘制横向图。")
+    return point
+
+
+def _extra_residual_groups(report):
+    groups = []
+    for group in _bs_comparison_groups(report):
+        step = _s_value(group["cases"][0])
+        reason = ("配置S缺失、无效或别名矛盾，未从case名称猜测。" if step is None else
+                  _bs_chart_reason(group) if group["invalid_bs"] or group["duplicate_bs"] else None)
+        for identity in METHOD_IDS:
+            groups.append(dict(label=group["label"], s=step, reason=reason, identity=identity,
+                points=[_extra_residual_point(case, identity) for case in group["cases"]]))
+    return groups
+
+
+def _extra_stage_table(sheet, row, point, col):
+    """Keep the four BS source tables aligned beneath their horizontal charts."""
+    headers = ((0, 2, "U内父阶段"), (3, 3, "绝对时间(ms)"), (4, 4, "占U比例"), (5, 5, "图上标签"))
+    for first, last, text in headers:
+        sheet.merge(row, col + first, row, col + last, text, "header")
+    sheet.row_height(row, 40)
+    first_row = row + 1
+    items = point["items"]
+    records = items if items is not None else [dict(label=record[1], value_ms=record[2]) for record in point["stage_rows"]]
+    categories, shares, labels = [], [], []
+    contiguous = True
+    for item in records:
+        label = item["label"]
+        value = item["value_ms"]
+        share = value / point["u_ms"] if _number(value) and point["u_ms"] and items is not None else None
+        text = format(share, ".2%") + " · " + format(value, ".6f") + " ms" if share is not None else "未绘图；见阶段状态"
+        parts = _text_parts(str(label))
+        for index, part in enumerate(parts):
+            row += 1
+            sheet.merge(row, col, row, col + 2, part, "body")
+            sheet.row_height(row, 48)
+            if index == 0:
+                sheet.write(row, col + 3, value, "number" if _number(value) else "body")
+                sheet.write(row, col + 4, share, "percent")
+                sheet.write(row, col + 5, text)
+        contiguous = contiguous and len(parts) == 1
+        categories.append(label)
+        shares.append(share)
+        labels.append(text)
+    if not records:
+        row += 1
+        sheet.merge(row, col, row, col + 5, "缺少可用阶段证据，未以0补齐。", "warning")
+    ref = "'" + sheet.name.replace("'", "''") + "'!"
+    def reference(column):
+        letter = cell_reference(1, column)[:-1]
+        return ref + "$" + letter + "$" + str(first_row) + ":$" + letter + "$" + str(row)
+    return row + 2, dict(categories=categories, shares=shares, labels=labels,
+        categories_ref=reference(col), values_ref=reference(col + 4), labels_ref=reference(col + 5), contiguous=contiguous)
+
+
+def _extra_charts_sheet(book, report):
+    sheet = book.add_sheet(SHEETS[10], widths=[12] * 24, paper_size=8)
+    sheet.detail_rows, sheet.report_origin = book.detail_rows, book.report_origin
+    sheet.merge(1, 1, 2, 24, "额外图表统计 · 外推后轮次剩余区间占比", "title")
+    sheet.row_height(1, 29).row_height(2, 14).freeze(5, 2)
+    row = _note(sheet, 3, EXTRA_CHART_SCOPE, columns=24)
+    sheet.add_internal_link(row, 1, "返回估算总览", SHEETS[0], "A1")
+    sheet.add_internal_link(row, 7, "查看源采样基线", SHEETS[1], "A1")
+    row += 2
+    groups = _extra_residual_groups(report)
+    if not groups:
+        _note(sheet, row, "当前报告没有采样组合；未构造性能数据。", warning=True, columns=24)
+    for group in groups:
+        method_label = _layer_mean_name(dict(id=group["identity"]))
+        row = _note(sheet, row, method_label + " · " + group["label"], columns=24)
+        if group["reason"]:
+            row = _note(sheet, row, group["reason"], warning=True, columns=24)
+        # Four real BS values per panel; absent/failed cases are never fabricated.
+        for offset in range(0, len(group["points"]), 4):
+            points = group["points"][offset:offset + 4]
+            title = "轮次剩余区间占比 · " + method_label + " · S=" + _text(group["s"])
+            if offset:
+                title += " · 续组" + str(offset // 4 + 1)
+            written = []
+            row = _table(sheet, row, ["配置BS", "采样组合", "所选rank", "外推完整周期(ms)", "U绝对时间(ms)",
+                "U/外推完整周期", "柱顶标签", "状态"],
+                [[p["bs"], p["name"], p["rank"], p["cycle_ms"], p["u_ms"], p["share"], p["label"], p["status"]] for p in points],
+                record_rows=written, spans=((1, 2), (3, 8), (9, 10), (11, 13), (14, 16), (17, 19), (20, 22), (23, 24)),
+                blank_columns=(4, 5, 6, 7))
+            for position, point in zip(written, points):
+                sheet.write(position, 17, point["share"], "percent")
+            consecutive = written == list(range(written[0], written[0] + len(points)))
+            if not group["reason"] and consecutive and any(p["share"] is not None for p in points):
+                ref = "'" + sheet.name.replace("'", "''") + "'!"
+                def source(column):
+                    return ref + "$" + column + "$" + str(written[0]) + ":$" + column + "$" + str(written[-1])
+                values = [p["share"] for p in points]
+                sheet.add_combo_chart(title, categories=[str(p["bs"]) for p in points],
+                    columns=[dict(name="U占外推完整周期", values=values, color="168B8D", values_ref=source("Q"), data_labels=False)],
+                    lines=[dict(name="柱顶占比连线", values=values, color="D2675B", values_ref=source("Q"),
+                        data_labels=[p["label"] for p in points], data_labels_ref=source("T"))],
+                    anchor=(row, 1, row + 25, 25), categories_ref=source("A"), secondary_axis=False,
+                    column_value_format="0.0%", line_value_format="0.0%", column_axis_title="U占外推完整周期（%）")
+                row += 27
+            elif not consecutive:
+                row = _note(sheet, row, "源表存在长文本续行，保留原值，本组未绘制歧义范围图。", warning=True, columns=24)
+            row = _note(sheet, row, "下方按上图BS顺序排列：各父阶段占U的比例，同时标注毫秒数；U只保留一次。", columns=24)
+            chart_row = row
+            height = max([38, *[2 * len(p["items"]) + 8 for p in points if p["items"]]])
+            table_row, next_row = chart_row + height + 2, chart_row + height + 2
+            for index, point in enumerate(points):
+                col = 1 + index * 6
+                end, data = _extra_stage_table(sheet, table_row, point, col)
+                next_row = max(next_row, end)
+                if point["items"] is not None and data["contiguous"]:
+                    partial = any(item.get("unresolved_window") for item in point["items"])
+                    sheet.add_bar_chart("BS=" + _text(point["bs"]) + " · rank=" + _text(point["rank"])
+                        + (" · 含未识别整窗" if partial else " · U内部区间占比"),
+                        categories=data["categories"], categories_ref=data["categories_ref"],
+                        series=[dict(name="阶段占U", values=data["shares"], color="168B8D", values_ref=data["values_ref"],
+                            data_labels=data["labels"], data_labels_ref=data["labels_ref"])],
+                        anchor=(chart_row, col, chart_row + height, col + 6), stacked=False,
+                        x_axis_title="阶段时间/U（%）", value_format="0.0%")
+                else:
+                    sheet.merge(chart_row, col, chart_row + 3, col + 5,
+                        "BS=" + _text(point["bs"]) + "；" + point["status"] + "；" + point["stage_note"], "warning")
+                    sheet.row_height(chart_row, 80)
+            row = next_row
+    if report.get("failures"):
+        row = _note(sheet, row, "以下组合统计失败，未构造对应BS柱子。", warning=True, columns=24)
+        _table(sheet, row, ["失败组合", "原因"], [[item.get("case"), item.get("error")] for item in report["failures"]],
+               spans=((1, 6), (7, 24)))
+    return sheet
+
+
+def _extra_combo_svg(title, points):
+    esc = lambda value: html.escape(_text(value), quote=True)
+    width, height = max(960, 240 * len(points)), 400
+    left, right, top, bottom = 75, width - 30, 65, 335
+    maximum = max([.01, *[point["share"] * 1.25 for point in points if point["share"] is not None]])
+    slot = (right - left) / len(points)
+    parts = ['<figure class="extra-combo"><figcaption>' + esc(title) + '</figcaption><svg role="img" viewBox="0 0 '
+             + str(width) + ' ' + str(height) + '"><title>' + esc(title) + '</title>']
+    for tick in range(5):
+        value = maximum * tick / 4
+        y = bottom - (bottom - top) * tick / 4
+        parts.append(f'<line x1="{left}" x2="{right}" y1="{y}" y2="{y}" stroke="#d2dde8"/>'
+                     + f'<text x="{left - 10}" y="{y + 5}" text-anchor="end">{value:.1%}</text>')
+    runs, run = [], []
+    for index, point in enumerate(points):
+        x = left + (index + .5) * slot
+        parts.append(f'<text x="{x}" y="{bottom + 28}" text-anchor="middle">BS={esc(point["bs"])}</text>')
+        if point["share"] is None:
+            if run:
+                runs.append(run)
+                run = []
+            parts.append(f'<text x="{x}" y="{top + 30}" text-anchor="middle">缺失；见原值表</text>')
+            continue
+        y = bottom - (bottom - top) * point["share"] / maximum
+        run.append((x, y))
+        parts.append(f'<rect x="{x - slot * .2}" y="{y}" width="{slot * .4}" height="{bottom - y}" fill="#168b8d">'
+                     + '<title>' + esc(point["name"] + '；' + point["label"]) + '</title></rect>')
+        parts.append(f'<text x="{x}" y="{y - 12}" text-anchor="middle">{esc(point["label"])}</text>')
+    if run:
+        runs.append(run)
+    for run in runs:
+        parts.append('<polyline points="' + ' '.join(f'{x},{y}' for x, y in run) + '" fill="none" stroke="#d2675b" stroke-width="2"/>')
+        for x, y in run:
+            parts.append(f'<circle cx="{x}" cy="{y}" r="5" fill="#d2675b"/>')
+    parts.append('</svg></figure>')
+    return ''.join(parts)
+
+
+def _extra_charts_html(report):
+    esc = lambda value: html.escape(_text(value), quote=True)
+    parts = ['<section class="extra-charts"><h2>额外图表统计 · 外推后轮次剩余区间占比</h2><p>' + esc(EXTRA_CHART_SCOPE) + '</p>']
+    for group in _extra_residual_groups(report):
+        method_label = _layer_mean_name(dict(id=group["identity"]))
+        parts.append('<h3>' + esc(method_label + ' · ' + group["label"]) + '</h3>')
+        if group["reason"]:
+            parts.append('<p>' + esc(group["reason"]) + '</p>')
+        for offset in range(0, len(group["points"]), 4):
+            points = group["points"][offset:offset + 4]
+            title = '轮次剩余区间占比 · ' + method_label + ' · S=' + _text(group["s"])
+            if not group["reason"] and any(p["share"] is not None for p in points):
+                parts.append(_extra_combo_svg(title, points))
+            parts.append(_html_table(["配置BS", "采样组合", "所选rank", "外推完整周期(ms)", "U绝对时间(ms)", "占比", "状态"],
+                [[p["bs"], p["name"], p["rank"], p["cycle_ms"], p["u_ms"], format(p["share"], '.2%') if p["share"] is not None else NA,
+                  p["status"]] for p in points]))
+            parts.append('<div class="extra-u-scroll"><div class="extra-u-panels" style="grid-template-columns:repeat('
+                         + str(len(points)) + ',minmax(360px,1fr));min-width:' + str(384 * len(points) - 24) + 'px">')
+            for point in points:
+                parts.append('<article><h4>BS=' + esc(point["bs"]) + ' · rank=' + esc(point["rank"]) + ' · U内部区间占比</h4>')
+                if point["items"] is None:
+                    parts.append('<p>' + esc(point["status"] + '；' + point["stage_note"]) + '</p>')
+                else:
+                    parts.append('<div class="u-bars" role="img" aria-label="各父阶段占U比例及毫秒数">')
+                    for item in point["items"]:
+                        share = item["value_ms"] / point["u_ms"]
+                        label = format(share, '.2%') + ' · ' + format(item["value_ms"], '.6f') + ' ms'
+                        parts.append('<div class="u-bar"><span>' + esc(item["label"]) + '</span><span class="u-track"><i style="width:'
+                            + str(100 * share) + '%"></i></span><span>' + esc(label) + '</span></div>')
+                    parts.append('</div><p>' + esc(point["stage_note"]) + '</p>')
+                if point["stage_rows"]:
+                    parts.append('<details><summary>阶段原值与状态</summary>' + _html_table(METHOD_RESIDUAL_HEADERS, point["stage_rows"]) + '</details>')
+                parts.append('</article>')
+            parts.append('</div></div>')
+    parts.append('</section>')
+    return ''.join(parts)
 
 
 METHOD_STAGE_TITLES = ("SWA层内阶段展开", "下一主模型KV与输入准备 · 阶段展开",
@@ -3577,11 +3842,12 @@ def _html_preview(report, out, progress=None):
     parts = ['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
              '<title>10T模型推理估算</title><style>body{margin:24px;font:16px system-ui;color:#173451}table{border-collapse:collapse;width:100%;margin:20px 0}th,td{border:1px solid #d2dde8;padding:10px}th{background:#edf2f7}p{line-height:1.7}section{margin:32px 0}code{white-space:pre-wrap;overflow-wrap:anywhere}.stages table{table-layout:fixed}.stages th:first-child{width:42%}.stages th:last-child{width:14%}.stages th,.stages td{overflow-wrap:anywhere}.sources th:first-child{width:31%}.sources td:last-child{white-space:pre-line}.method-residual th:nth-child(2){width:45%}.u-bars{margin:24px 0}.u-bar{display:grid;grid-template-columns:minmax(16em,2fr) 3fr 8em;gap:12px;align-items:center;margin:10px 0}.u-track{background:#edf2f7;height:18px}.u-track i{display:block;background:#168b8d;height:100%}.u-bar>span:last-child{text-align:right;font-variant-numeric:tabular-nums}</style>',
              '<h1>10T模型推理估算</h1><p>' + esc(LAYER_MEAN_SCOPE) + '</p>',
-             '<p><a href="' + esc(Path(out).name) + '">打开Excel（10个工作表）</a>；来源：' + esc(report.get('source_kind')) + '</p>']
+             '<p><a href="' + esc(Path(out).name) + '">打开Excel（' + str(len(SHEETS)) + '个工作表）</a>；来源：' + esc(report.get('source_kind')) + '</p>']
     parts.append('<style>.bs-table{overflow-x:auto}.bs-table table{min-width:1200px}.bs-table th,.bs-table td{white-space:pre-line}.bs-trend{margin:28px 0;max-width:1120px}.bs-trend svg{display:block;width:100%;font:14px system-ui}.bs-trend figcaption{font-weight:600}</style>')
     parts.append('<style>.operator-chart svg{width:100%;font:12px system-ui;display:block;margin:24px 0}.operator-hotspot-section table{table-layout:fixed;font-size:13px}.operator-hotspot-section th:first-child{width:34%}.operator-hotspot-section th:last-child{width:29%}.operator-hotspot-section td{overflow-wrap:anywhere;white-space:pre-line}.operator-hotspot-section pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>')
     parts.append('<style>.u-focus table{table-layout:fixed;font-size:13px}.u-focus td,.u-focus th{white-space:pre-line;overflow-wrap:anywhere}.u-focus th:first-child{width:25%}.u-focus th:last-child{width:25%}.pmu-metrics{overflow-x:auto}.pmu-metrics table{min-width:1500px}.pmu-metrics th:first-child{width:20%}.pmu-metrics th:last-child{width:14%}details>summary{cursor:pointer;font-weight:600;padding:12px;background:#edf2f7}</style>')
     parts.append('<style>.case-table-caption{caption-side:top;text-align:left;background:#173451;color:white;font-weight:700;line-height:24px;padding:8px 10px;position:sticky;top:0;z-index:3}.case-table-caption+thead th{position:sticky;top:40px;z-index:2}@media print{.case-table-caption,.case-table-caption+thead th{position:static}}</style>')
+    parts.append('<style>.extra-combo{margin:24px 0;overflow-x:auto}.extra-combo svg{display:block;width:100%;min-width:960px;font:14px system-ui}.extra-u-scroll{overflow-x:auto}.extra-u-panels{display:grid;gap:24px}.extra-u-panels .u-bar{grid-template-columns:minmax(8em,2fr) 1fr 10em;font-size:12px;gap:6px}.extra-u-panels article{min-width:0}.extra-u-panels td{overflow-wrap:anywhere}</style>')
     parameter_headers, parameter_rows, _ = _case_parameter_table(report)
     parts.append('<section class="case-parameters"><h2>' + esc(CASE_PARAMETERS_TITLE) + '</h2><p>'
                  + esc(CASE_PARAMETERS_SCOPE) + '</p>'
@@ -3589,6 +3855,7 @@ def _html_preview(report, out, progress=None):
     parts.append(_bs_comparison_html(report))
     parts.append(_s_comparison_html(report))
     parts.append(_source_sweeps_html(report))
+    parts.append(_extra_charts_html(report))
     parts.append(_focus_source_html(report))
     case_counts = collections.Counter(case['name'] for case in report['cases'])
     for case_index, case in enumerate(report["cases"]):
@@ -3722,6 +3989,9 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
     if not callable(getattr(xlsx_writer.Worksheet, "add_line_chart", None)):
         raise ValueError("Excel写入器缺少BS趋势图接口；请同步更新build_ep128_leadership_excel.py和ep128_xlsx_writer.py。"
                          + "实际写入器：" + runtime["writer_path"] + "（" + runtime["writer_version"] + "）")
+    if not callable(getattr(xlsx_writer.Worksheet, "add_combo_chart", None)):
+        raise ValueError("Excel写入器缺少柱线组合图接口；请同步更新build_ep128_leadership_excel.py和ep128_xlsx_writer.py。"
+                         + "实际写入器：" + runtime["writer_path"] + "（" + runtime["writer_version"] + "）")
     if not callable(getattr(xlsx_writer.Worksheet, "add_internal_link", None)):
         raise ValueError("Excel写入器缺少图表目录内部跳转接口；请同步更新build_ep128_leadership_excel.py和ep128_xlsx_writer.py。"
                          + "实际写入器：" + runtime["writer_path"] + "（" + runtime["writer_version"] + "）")
@@ -3774,6 +4044,7 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
     stage(SHEETS[7], lambda: _formula_sheet(book,payload))
     stage(SHEETS[8], lambda: _review_sheet(book,payload,report or cases))
     stage(SHEETS[9], lambda: _method_sheet(book,payload,'method3',SHEETS[9]))
+    stage(SHEETS[10], lambda: _extra_charts_sheet(book,payload))
     stage("核对Excel关键结果", lambda: _check_result_cells(book, payload))
     path = stage("写入XLSX", lambda: book.save(out))
     stage("写入HTML预览", lambda: _html_preview(payload,path,progress=progress))

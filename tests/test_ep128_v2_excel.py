@@ -174,7 +174,7 @@ class RendererV2Tests(unittest.TestCase):
         data = fixture()
         out, (book, files) = self.build(data)
         self.assertEqual(tuple(book), renderer.SHEETS)
-        self.assertEqual(len(book), 10)
+        self.assertEqual(len(book), 11)
         self.assertEqual([method['id'] for method in data['cases'][0]['projection']['layer_mean_methods']],
                          ['method1', 'method2'])  # A legacy fixture must stay a two-method input.
         self.assertIn('核心未提供本方法', str(book['方法3估算'][1]))

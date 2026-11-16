@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
-WRITER_VERSION = "20261111.1.internal_links"
+WRITER_VERSION = "20261116.1.combo_charts"
 MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -75,7 +75,7 @@ def _chart_title(parent, text, size=1400):
     _chart_node(title, "overlay", {"val": 0})
 
 
-def _chart_data(parent, values, reference=None, numeric=False):
+def _chart_data(parent, values, reference=None, numeric=False, format_code="0.000"):
     """Write range caches, preserving sparse point indices for missing values."""
     if reference is None:
         data = _chart_node(parent, "numLit" if numeric else "strLit")
@@ -84,12 +84,43 @@ def _chart_data(parent, values, reference=None, numeric=False):
         _chart_node(ref, "f", text=reference)
         data = _chart_node(ref, "numCache" if numeric else "strCache")
     if numeric:
-        _chart_node(data, "formatCode", text="0.000")
+        _chart_node(data, "formatCode", text=format_code)
     _chart_node(data, "ptCount", {"val": len(values)})
     for index, value in enumerate(values):
         if value is None:
             continue
         _chart_node(_chart_node(data, "pt", {"idx": index}), "v", text=value)
+
+
+def _chart_labels(parent, series, default_format=None, position="ctr"):
+    """Keep ordinary charts unchanged; custom labels retain editable cell links."""
+    supplied = series.get("data_labels", default_format is not None)
+    if supplied is False:
+        return
+    labels = _chart_node(parent, "dLbls")
+    if isinstance(supplied, list):
+        for index, text in enumerate(supplied):
+            if text is None or series["values"][index] is None:
+                continue
+            label = _chart_node(labels, "dLbl")
+            _chart_node(label, "idx", {"val": index})
+            tx = _chart_node(label, "tx")
+            references = series.get("data_label_refs")
+            if references:
+                _chart_data(tx, [text], references[index])
+            else:
+                rich = _chart_node(tx, "rich")
+                _art_node(rich, "bodyPr")
+                _art_node(rich, "lstStyle")
+                paragraph = _art_node(rich, "p")
+                _art_node(_art_node(paragraph, "r"), "t", text=text)
+    if default_format:
+        _chart_node(labels, "numFmt", {"formatCode": default_format, "sourceLinked": 0})
+    _chart_node(labels, "dLblPos", {"val": position})
+    for name, enabled in (("showLegendKey", False), ("showVal", supplied is True),
+                          ("showCatName", False), ("showSerName", False),
+                          ("showPercent", False), ("showBubbleSize", False)):
+        _chart_node(labels, name, {"val": int(enabled)})
 
 
 def _bar_chart_xml(spec):
@@ -117,8 +148,10 @@ def _bar_chart_xml(spec):
         shape = _chart_node(ser, "spPr")
         _art_node(_art_node(shape, "solidFill"), "srgbClr", {"val": series["color"]})
         _art_node(_art_node(shape, "ln"), "noFill")
+        _chart_labels(ser, series, position="ctr" if spec["stacked"] else "outEnd")
         _chart_data(_chart_node(ser, "cat"), spec["categories"], spec["categories_ref"])
-        _chart_data(_chart_node(ser, "val"), series["values"], series.get("values_ref"), numeric=True)
+        _chart_data(_chart_node(ser, "val"), series["values"], series.get("values_ref"),
+                    numeric=True, format_code=spec.get("value_format", "0.000"))
     _chart_node(bar, "gapWidth", {"val": 65})
     _chart_node(bar, "overlap", {"val": 100 if spec["stacked"] else 0})
     for number in (100, 200):
@@ -146,7 +179,7 @@ def _bar_chart_xml(spec):
               "srgbClr", {"val": "DFE7EE"})
     if spec["x_axis_title"]:
         _chart_title(value, spec["x_axis_title"], size=1000)
-    _chart_node(value, "numFmt", {"formatCode": "0.000", "sourceLinked": 0})
+    _chart_node(value, "numFmt", {"formatCode": spec.get("value_format", "0.000"), "sourceLinked": 0})
     _chart_node(value, "majorTickMark", {"val": "none"})
     _chart_node(value, "minorTickMark", {"val": "none"})
     _chart_node(value, "tickLblPos", {"val": "nextTo"})
@@ -195,6 +228,7 @@ def _line_chart_xml(spec):
         _art_node(_art_node(marker_shape, "solidFill"), "srgbClr", {"val": series["color"]})
         _art_node(_art_node(_art_node(marker_shape, "ln"), "solidFill"),
                   "srgbClr", {"val": series["color"]})
+        _chart_labels(ser, series)
         _chart_data(_chart_node(ser, "cat"), spec["categories"], spec["categories_ref"])
         _chart_data(_chart_node(ser, "val"), series["values"], series.get("values_ref"), numeric=True)
         _chart_node(ser, "smooth", {"val": 0})
@@ -234,6 +268,112 @@ def _line_chart_xml(spec):
     _chart_node(value, "crossAx", {"val": 100})
     _chart_node(value, "crosses", {"val": "autoZero"})
     _chart_node(value, "crossBetween", {"val": "between"})
+    legend = _chart_node(chart, "legend")
+    _chart_node(legend, "legendPos", {"val": "b"})
+    _chart_node(legend, "layout")
+    _chart_node(legend, "overlay", {"val": 0})
+    _chart_node(chart, "plotVisOnly", {"val": 1})
+    _chart_node(chart, "dispBlanksAs", {"val": "gap"})
+    _chart_node(chart, "showDLblsOverMax", {"val": 0})
+    _art_node(_art_node(_chart_node(root, "spPr"), "solidFill"), "srgbClr", {"val": "FFFFFF"})
+    return root
+
+
+def _combo_chart_xml(spec):
+    """Native columns and lines sharing category centers and optional value axes."""
+    root = ET.Element("{" + CHART + "}chartSpace")
+    _chart_node(root, "lang", {"val": "zh-CN"})
+    _chart_node(root, "roundedCorners", {"val": 0})
+    chart = _chart_node(root, "chart")
+    _chart_title(chart, spec["title"])
+    _chart_node(chart, "autoTitleDeleted", {"val": 0})
+    plot = _chart_node(chart, "plotArea")
+    _chart_node(plot, "layout")
+    column_count = spec["column_series_count"]
+    for is_line, series_values in ((False, spec["series"][:column_count]),
+                                   (True, spec["series"][column_count:])):
+        group = _chart_node(plot, "lineChart" if is_line else "barChart")
+        if not is_line:
+            _chart_node(group, "barDir", {"val": "col"})
+        _chart_node(group, "grouping", {"val": "standard" if is_line else "clustered"})
+        _chart_node(group, "varyColors", {"val": 0})
+        value_format = spec["line_value_format" if is_line else "column_value_format"]
+        for local_index, series in enumerate(series_values):
+            index = local_index + (column_count if is_line else 0)
+            ser = _chart_node(group, "ser")
+            _chart_node(ser, "idx", {"val": index})
+            _chart_node(ser, "order", {"val": index})
+            tx = _chart_node(ser, "tx")
+            if series.get("name_ref"):
+                _chart_data(tx, [series["name"]], series["name_ref"])
+            else:
+                _chart_node(tx, "v", text=series["name"])
+            shape = _chart_node(ser, "spPr")
+            if is_line:
+                stroke = _art_node(shape, "ln", {"w": 25400})
+                _art_node(_art_node(stroke, "solidFill"), "srgbClr", {"val": series["color"]})
+                _art_node(stroke, "prstDash", {"val": "solid"})
+                marker = _chart_node(ser, "marker")
+                _chart_node(marker, "symbol", {"val": "circle"})
+                _chart_node(marker, "size", {"val": 6})
+                marker_shape = _chart_node(marker, "spPr")
+                _art_node(_art_node(marker_shape, "solidFill"), "srgbClr", {"val": series["color"]})
+                _art_node(_art_node(_art_node(marker_shape, "ln"), "solidFill"),
+                          "srgbClr", {"val": series["color"]})
+            else:
+                _art_node(_art_node(shape, "solidFill"), "srgbClr", {"val": series["color"]})
+                _art_node(_art_node(shape, "ln"), "noFill")
+            _chart_labels(ser, series, value_format, "t" if is_line else "outEnd")
+            _chart_data(_chart_node(ser, "cat"), spec["categories"], spec["categories_ref"])
+            _chart_data(_chart_node(ser, "val"), series["values"], series.get("values_ref"),
+                        numeric=True, format_code=value_format)
+            if is_line:
+                _chart_node(ser, "smooth", {"val": 0})
+        if is_line:
+            _chart_node(group, "marker", {"val": 1})
+            _chart_node(group, "smooth", {"val": 0})
+        else:
+            _chart_node(group, "gapWidth", {"val": 100})
+            _chart_node(group, "overlap", {"val": 0})
+        for number in (100, 300 if is_line and spec["secondary_axis"] else 200):
+            _chart_node(group, "axId", {"val": number})
+    category = _chart_node(plot, "catAx")
+    _chart_node(category, "axId", {"val": 100})
+    _chart_node(_chart_node(category, "scaling"), "orientation", {"val": "minMax"})
+    _chart_node(category, "delete", {"val": 0})
+    _chart_node(category, "axPos", {"val": "b"})
+    if spec["x_axis_title"]:
+        _chart_title(category, spec["x_axis_title"], size=1000)
+    _chart_node(category, "majorTickMark", {"val": "none"})
+    _chart_node(category, "minorTickMark", {"val": "none"})
+    _chart_node(category, "tickLblPos", {"val": "nextTo"})
+    _chart_node(category, "crossAx", {"val": 200})
+    _chart_node(category, "crosses", {"val": "autoZero"})
+    _chart_node(category, "auto", {"val": 1})
+    _chart_node(category, "lblAlgn", {"val": "ctr"})
+    _chart_node(category, "lblOffset", {"val": 100})
+    axes = [(200, "l", spec["column_axis_title"], spec["column_value_format"])]
+    if spec["secondary_axis"]:
+        axes.append((300, "r", spec["line_axis_title"], spec["line_value_format"]))
+    for number, position, title, value_format in axes:
+        value = _chart_node(plot, "valAx")
+        _chart_node(value, "axId", {"val": number})
+        _chart_node(_chart_node(value, "scaling"), "orientation", {"val": "minMax"})
+        _chart_node(value, "delete", {"val": 0})
+        _chart_node(value, "axPos", {"val": position})
+        if number == 200:
+            grid = _chart_node(value, "majorGridlines")
+            _art_node(_art_node(_art_node(_chart_node(grid, "spPr"), "ln"), "solidFill"),
+                      "srgbClr", {"val": "DFE7EE"})
+        if title:
+            _chart_title(value, title, size=1000)
+        _chart_node(value, "numFmt", {"formatCode": value_format, "sourceLinked": 0})
+        _chart_node(value, "majorTickMark", {"val": "none"})
+        _chart_node(value, "minorTickMark", {"val": "none"})
+        _chart_node(value, "tickLblPos", {"val": "nextTo"})
+        _chart_node(value, "crossAx", {"val": 100})
+        _chart_node(value, "crosses", {"val": "max" if number == 300 else "autoZero"})
+        _chart_node(value, "crossBetween", {"val": "between"})
     legend = _chart_node(chart, "legend")
     _chart_node(legend, "legendPos", {"val": "b"})
     _chart_node(legend, "layout")
@@ -515,7 +655,7 @@ class Worksheet:
         return self
 
     def add_bar_chart(self, title, categories, series, anchor, stacked=True,
-                      x_axis_title="耗时（ms）", categories_ref=None):
+                      x_axis_title="耗时（ms）", categories_ref=None, value_format="0.000"):
         """Add a native, editable horizontal Excel bar chart.
 
         ``anchor=(r1,c1,r2,c2)`` uses one-based worksheet corners; the chart
@@ -527,9 +667,13 @@ class Worksheet:
         References always include supplied caches, so the same chart works in
         readers before recalculation and updates when cells change in Excel.
         Unknown values must be kept out of charts; no missing value becomes 0.
+        Opt-in ``data_labels`` series lists supply custom point text;
+        ``data_labels_ref`` links a row or column range containing that text.
+        ``value_format`` controls the numeric cache and value-axis format.
         """
         return self._add_chart("bar", title, categories, series, anchor, stacked=stacked,
-                               x_axis_title=x_axis_title, categories_ref=categories_ref)
+                               x_axis_title=x_axis_title, categories_ref=categories_ref,
+                               value_format=value_format)
 
     def add_line_chart(self, title, categories, series, anchor, x_axis_title="BS",
                        y_axis_title="", categories_ref=None):
@@ -543,8 +687,39 @@ class Worksheet:
                                x_axis_title=x_axis_title, y_axis_title=y_axis_title,
                                categories_ref=categories_ref)
 
+    def add_combo_chart(self, title, categories, columns, lines, anchor, *,
+                        x_axis_title="BS", column_axis_title="轮次剩余区间（ms）",
+                        line_axis_title="占完整周期（%）", categories_ref=None,
+                        secondary_axis=True, column_value_format='0.000" ms"',
+                        line_value_format="0.0%"):
+        """Add editable columns and lines with common category centers.
+
+        Both groups accept the normal series dictionaries and ``None`` gaps.
+        The default uses time columns and a second axis for share fractions.
+        With ``secondary_axis=False`` both groups use the same value axis;
+        equal values in a single column/line pair therefore coincide at each
+        column's top center. Formats do not multiply stored numeric values.
+        Series ``data_labels=False`` suppresses labels, ``True`` shows formatted
+        values, or a list supplies custom text (optionally cell-linked using a
+        one-dimensional ``data_labels_ref`` range). Labels default to values.
+        """
+        columns, lines = list(columns), list(lines)
+        if not columns or not lines:
+            raise ValueError("A combo chart requires column and line series")
+        if type(secondary_axis) is not bool:
+            raise ValueError("secondary_axis must be Boolean")
+        return self._add_chart("combo", title, categories, columns + lines, anchor,
+                               x_axis_title=x_axis_title, categories_ref=categories_ref,
+                               column_series_count=len(columns), secondary_axis=secondary_axis,
+                               column_axis_title=column_axis_title, line_axis_title=line_axis_title,
+                               column_value_format=column_value_format,
+                               line_value_format=line_value_format)
+
     def _add_chart(self, kind, title, categories, series, anchor, *, stacked=False,
-                   x_axis_title="", y_axis_title="", categories_ref=None):
+                   x_axis_title="", y_axis_title="", categories_ref=None,
+                   value_format="0.000", column_series_count=None, secondary_axis=True,
+                   column_axis_title="", line_axis_title="", column_value_format="0.000",
+                   line_value_format="0.0%"):
         title, x_axis_title = _text(title), _text(x_axis_title)
         if not title.strip():
             raise ValueError("A chart title must not be empty")
@@ -569,6 +744,25 @@ class Worksheet:
                 raise ValueError("Chart range references must be nonempty Excel formulas")
             return value
 
+        def label_references(value):
+            value = reference(value)
+            if value is None:
+                return None
+            match = re.fullmatch(r"(.+!)(\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6})"
+                                 r"(?::(\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6}))?", value)
+            if match is None:
+                raise ValueError("Chart data label references require a worksheet row or column range")
+            sheet, start, end = match.groups()
+            first_row, first_col = _internal_cell(start)
+            last_row, last_col = _internal_cell(end or start)
+            if ((first_row != last_row and first_col != last_col)
+                    or first_row > last_row or first_col > last_col
+                    or max(last_row - first_row, last_col - first_col) + 1 != len(categories)):
+                raise ValueError("Chart data label range must match the category count in one row or column")
+            return [sheet + cell_reference(first_row + (index if first_col == last_col else 0),
+                                            first_col + (index if first_row == last_row else 0), absolute=True)
+                    for index in range(len(categories))]
+
         colors = ("167D8D", "4F90C6", "D59440", "7668AA", "5BA28A", "D06F6F", "6C8498")
         normalized = []
         for index, item in enumerate(series):
@@ -580,7 +774,7 @@ class Worksheet:
             values = list(item.get("values", []))
             if len(values) != len(categories):
                 raise ValueError("Chart series and categories must have the same length")
-            if any((value is None and kind != "line") or value is not None and
+            if any((value is None and kind == "bar") or value is not None and
                    (isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value))
                    for value in values):
                 raise ValueError("Chart values must be finite numbers, not unknown or Boolean values"
@@ -588,9 +782,23 @@ class Worksheet:
             color = str(item.get("color", colors[index % len(colors)])).upper()
             if not re.fullmatch(r"[0-9A-F]{6}", color):
                 raise ValueError("Chart colors must be six hexadecimal RGB digits")
-            normalized.append({"name": name, "values": values, "color": color,
-                               "values_ref": reference(item.get("values_ref")),
-                               "name_ref": reference(item.get("name_ref"))})
+            normalized_series = {"name": name, "values": values, "color": color,
+                                 "values_ref": reference(item.get("values_ref")),
+                                 "name_ref": reference(item.get("name_ref"))}
+            if "data_labels" in item:
+                labels = item["data_labels"]
+                if type(labels) is not bool:
+                    if isinstance(labels, (str, bytes)) or not isinstance(labels, (list, tuple)):
+                        raise ValueError("Chart data_labels must be Boolean or a sequence of point text")
+                    labels = [None if label is None else _text(label) for label in labels]
+                    if len(labels) != len(categories):
+                        raise ValueError("Chart data_labels and categories must have the same length")
+                normalized_series["data_labels"] = labels
+            if item.get("data_labels_ref") is not None:
+                if not isinstance(normalized_series.get("data_labels"), list):
+                    raise ValueError("Chart data_labels_ref requires cached custom data_labels")
+                normalized_series["data_label_refs"] = label_references(item["data_labels_ref"])
+            normalized.append(normalized_series)
         if not normalized:
             raise ValueError("A " + kind + " chart requires at least one series")
         spec = {"title": title, "categories": categories,
@@ -599,6 +807,14 @@ class Worksheet:
                 "categories_ref": reference(categories_ref)}
         if kind == "line":
             spec.update(kind="line", y_axis_title=_text(y_axis_title))
+        if kind == "bar" and value_format != "0.000":
+            spec["value_format"] = _text(value_format)
+        if kind == "combo":
+            spec.update(kind="combo", column_series_count=column_series_count,
+                        secondary_axis=secondary_axis, column_axis_title=_text(column_axis_title),
+                        line_axis_title=_text(line_axis_title),
+                        column_value_format=_text(column_value_format),
+                        line_value_format=_text(line_value_format))
         self.charts.append(spec)
         return self
 
@@ -773,7 +989,9 @@ class Workbook:
                 for local_index, spec in enumerate(sheet.charts, 1):
                     chart_number += 1
                     chart_name = "chart" + str(chart_number) + ".xml"
-                    chart_xml = _line_chart_xml(spec) if spec.get("kind") == "line" else _bar_chart_xml(spec)
+                    renderer = {"line": _line_chart_xml, "combo": _combo_chart_xml}.get(
+                        spec.get("kind"), _bar_chart_xml)
+                    chart_xml = renderer(spec)
                     chart_parts.append(("xl/charts/" + chart_name, chart_xml))
                     overrides.append(("/xl/charts/" + chart_name,
                                       "application/vnd.openxmlformats-officedocument.drawingml.chart+xml"))
