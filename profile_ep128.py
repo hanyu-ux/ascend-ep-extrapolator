@@ -21,6 +21,7 @@ import hashlib
 import html
 import json
 import math
+import ntpath
 from pathlib import Path
 import re
 import statistics
@@ -75,9 +76,33 @@ class ATask:
         return self.op_type + " " + self.name
 
 
+def _io_path(value):
+    """Use Win32 extended paths for I/O, including long descendants of short roots."""
+    path = Path(value)
+    if sys.platform != "win32":
+        return path
+    # Normalize relative paths and dot segments before adding the prefix: Win32
+    # does not normalize them in its extended-path namespace. No filesystem I/O.
+    name = ntpath.abspath(str(path))
+    if not name.startswith(("\\\\?\\", "\\\\.\\")):
+        name = "\\\\?\\UNC\\" + name[2:] if name.startswith("\\\\") else "\\\\?\\" + name
+    return Path(name)
+
+
+def _source_path(value):
+    """Resolve through the I/O path while keeping report provenance paths ordinary."""
+    name = str(_io_path(value).resolve())
+    if sys.platform == "win32":
+        if name[:8].upper() == "\\\\?\\UNC\\":
+            name = "\\\\" + name[8:]
+        elif name.startswith("\\\\?\\"):
+            name = name[4:]
+    return Path(name)
+
+
 def a_sha(path):
     digest = hashlib.sha256()
-    with Path(path).open("rb") as source:
+    with _io_path(path).open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
@@ -341,10 +366,11 @@ def _a_merge_pmu(left, right):
 
 def read_capture(path, rank):
     """Keep original row references and metadata; deduplicate identical events."""
-    path = Path(path).resolve()
-    before = path.stat()
+    path = _source_path(path)
+    access = _io_path(path)
+    before = access.stat()
     tasks, seen, devices, duplicates, warnings = [], {}, set(), 0, []
-    with path.open(encoding="utf-8-sig", newline="") as source:
+    with access.open(encoding="utf-8-sig", newline="") as source:
         reader = csv.DictReader(source)
         normalized_headers = [str(name).strip() for name in reader.fieldnames or []]
         if len(set(normalized_headers)) != len(normalized_headers):
@@ -414,7 +440,7 @@ def read_capture(path, rank):
     if not tasks or not any(task.end_ns > task.start_ns for task in tasks):
         raise ValueError(str(path) + ": no timed device tasks")
     digest = a_sha(path)
-    after = path.stat()
+    after = access.stat()
     if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
         raise ValueError(str(path) + ": CSV changed while being read; wait for export to complete")
     return {"rank": str(rank), "path": str(path), "sha256": digest,
@@ -927,7 +953,7 @@ def finite_number(value, name, *, minimum=None, maximum=None):
 def referenced_object(value, base, name):
     if isinstance(value, str):
         path = Path(value).expanduser()
-        value = json.loads((path if path.is_absolute() else base / path).read_text(encoding='utf-8-sig'))
+        value = json.loads(_io_path(path if path.is_absolute() else base / path).read_text(encoding='utf-8-sig'))
     if not isinstance(value, dict):
         raise ValueError(f'{name} must be an object or a JSON file path')
     return value
@@ -1119,11 +1145,12 @@ def find_files(source, base, progress=None):
         path = base / path
     if progress is not None:
         progress('  查找 kernel_details.csv：' + str(path))
-    if path.is_file():
-        return [path.resolve()]
-    if not path.is_dir():
+    access = _io_path(path)
+    if access.is_file():
+        return [_source_path(access)]
+    if not access.is_dir():
         raise ValueError('Profile path not found: ' + str(path))
-    files = sorted({p.resolve() for p in path.rglob('kernel_details.csv')})
+    files = sorted({_source_path(p) for p in access.rglob('kernel_details.csv')})
     if not files:
         raise ValueError('No parsed kernel_details.csv in ' + str(path))
     return files
@@ -1808,7 +1835,7 @@ def refresh_report_operator_bounds(report, profile=None):
 def read_reference(path):
     if path is None:
         return []
-    with Path(path).open(encoding='utf-8-sig', newline='') as stream:
+    with _io_path(path).open(encoding='utf-8-sig', newline='') as stream:
         reader = csv.DictReader(stream)
         if not reader.fieldnames or len(reader.fieldnames) != len(set(reader.fieldnames)):
             raise ValueError('Communication reference has empty or duplicate headers')
@@ -1842,7 +1869,7 @@ def _analyze_case_rank(plan, rank_index, *, capture_hashes=None, prepare_source=
     excluded, required = plan['excluded'], plan['required']
     prepared, source_errors = None, []
     rank_started = stage_started = time.perf_counter()
-    for info in path.parent.parent.glob('profiler_info*.json'):
+    for info in _io_path(path.parent.parent).glob('profiler_info*.json'):
         common = json.loads(info.read_text(encoding='utf-8-sig')).get('config', {}).get('common_config', {})
         if common.get('with_stack') is True or common.get('with_modules') is True:
             raise ValueError(f'{info}: enabled stack/modules capture conflicts with timing baseline')
@@ -2140,7 +2167,7 @@ def residual_device_rows(capture, windows, index, path):
 class residual_JSONStream:
     """Decode one trace event at a time; bound each individual JSON value."""
     def __init__(self, path, chunk_size):
-        self.stream = Path(path).open("rb")
+        self.stream = _io_path(path).open("rb")
         self.chunk_size = chunk_size
         self.buffer, self.position, self.eof = "", 0, False
         self.utf8 = codecs.getincrementaldecoder("utf-8-sig")()
@@ -3849,7 +3876,8 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
             row["source_device_tasks"] = len(tasks)
         stages.extend(rows)
     path = Path(trace_path) if trace_path is not None else Path(source_path).parent / "trace_view.json"
-    path = path.resolve()
+    path = _source_path(path)
+    access = _io_path(path)
     trace = {"status": "NOT_FOUND", "path": str(path), "sha256": None}
     host_path = None
     sources = {"source_links_csv": None, "source_status": "UNAVAILABLE", "source_scope": RESIDUAL_SOURCE_SCOPE}
@@ -3857,7 +3885,7 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
         trace.update(status="UNSUPPORTED_GZIP", reason="provide the uncompressed trace_view.json")
     else:
         try:
-            before = path.stat()
+            before = access.stat()
             residual_progress(progress, "扫描trace元数据与设备时钟锚点")
             scanned, offset = residual_trace_scan(path, capture["tasks"], progress)
             trace.update(scanned)
@@ -3865,7 +3893,7 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
                 residual_progress(progress, "流式导出U窗口内主机事件")
                 sources = residual_host_rows(path, capture, windows, uncovered, trace, offset, host, directory, progress, stages)
                 host_path = str(host)
-            after = path.stat()
+            after = access.stat()
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 raise ValueError("trace changed during residual analysis")
         except FileNotFoundError as error:
@@ -6188,8 +6216,8 @@ def main():
         print('输入清单模式：只查找文件，不读取CSV内容、不生成报告。', flush=True)
         print('脚本：' + str(Path(__file__).absolute()), flush=True)
         print('配置：' + str(args.cases.absolute()), flush=True)
-    config = json.loads(args.cases.read_text(encoding='utf-8-sig'))
-    bound_profile = validate_bound_profile(json.loads(args.bound_profile.read_text(encoding='utf-8-sig'))) if args.bound_profile else None
+    config = json.loads(_io_path(args.cases).read_text(encoding='utf-8-sig'))
+    bound_profile = validate_bound_profile(json.loads(_io_path(args.bound_profile).read_text(encoding='utf-8-sig'))) if args.bound_profile else None
     if type(config.get('schema_version')) is not int or config['schema_version'] != SCHEMA_VERSION:
         raise ValueError('Use the V2 example manifest (schema_version=2)')
     if not isinstance(config.get('cases'), list) or not config['cases']:
@@ -6197,7 +6225,7 @@ def main():
     defaults = config.get('defaults', {})
     if not isinstance(defaults, dict):
         raise ValueError('defaults must be an object')
-    base = args.cases.resolve().parent
+    base = _source_path(args.cases).parent
     if args.list_inputs:
         return list_inputs(config, base)
     model = referenced_object(config['sample_model'], base, 'sample_model')
