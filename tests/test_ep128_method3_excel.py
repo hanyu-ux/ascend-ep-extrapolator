@@ -70,7 +70,7 @@ class MethodThreeRendererTests(unittest.TestCase):
         self.assertNotEqual(third["cycle_ms"], methods[0]["cycle_ms"])
         out, book, saved, page = self.build(report)
         self.assertEqual(tuple(book)[:9], ORIGINAL_SHEETS)
-        self.assertEqual(tuple(book), (*ORIGINAL_SHEETS, "方法3估算"))
+        self.assertEqual(tuple(book), (*ORIGINAL_SHEETS, "方法3估算", "额外图表统计"))
         for name in ("估算总览", "方法3估算"):
             sheet = next(sheet for sheet in saved.sheets if sheet.name == name)
             for field in ("cycle_ms", "per_device_tokens_s", "tpot_ms"):
@@ -81,7 +81,7 @@ class MethodThreeRendererTests(unittest.TestCase):
         self.assertIn("方法三每层通信保持源参考值", formula)
         self.assertIn("multipliers.main.dispatch", formula)
         self.assertIn("不表示整轮通信总量必定与源模型相同", page)
-        self.assertIn("10个工作表", page)
+        self.assertIn("11个工作表", page)
 
     def test_old_json_missing_method_three_is_explicitly_unavailable_without_recalculation(self):
         report = focus_fixture()

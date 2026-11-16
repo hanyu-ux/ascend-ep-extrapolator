@@ -113,7 +113,7 @@ class CLIIntegrationTests(unittest.TestCase):
             with ZipFile(base / 'report/10T模型推理估算.xlsx') as archive:
                 self.assertIsNone(archive.testzip())
                 root = ET.fromstring(archive.read('xl/workbook.xml'))
-                self.assertEqual(len(root.findall('{*}sheets/{*}sheet')), 10)
+                self.assertEqual(len(root.findall('{*}sheets/{*}sheet')), 11)
             with (base / 'report/最终结果.csv').open(encoding='utf-8-sig', newline='') as stream:
                 rows = list(csv.DictReader(stream))
             self.assertEqual(len(rows), 3)
@@ -388,7 +388,7 @@ raise SystemExit(p.main())
                 self.assertEqual([row['方法'] for row in own_rows], [method['name'] for method in methods])
                 self.assertEqual(methods[2]['status'], 'LAYER_MEAN_ESTIMATE', methods[2]['reasons'])
             with ZipFile(base / 'out/10T模型推理估算.xlsx') as archive:
-                self.assertEqual(len(ET.fromstring(archive.read('xl/workbook.xml')).findall('{*}sheets/{*}sheet')), 10)
+                self.assertEqual(len(ET.fromstring(archive.read('xl/workbook.xml')).findall('{*}sheets/{*}sheet')), 11)
                 for index in (1, 2, 3, 4, 5, 6, 8, 9, 10):
                     xml = archive.read(f'xl/worksheets/sheet{index}.xml').decode()
                     for name in expected:
