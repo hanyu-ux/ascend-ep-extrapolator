@@ -164,13 +164,13 @@ class NextMainTraceTests(unittest.TestCase):
 
 
 class FixedRankCLITests(unittest.TestCase):
-    def native_capture(self, directory, bs, steps, *, with_trace=True):
+    def native_capture(self, directory, bs, steps, *, with_trace=True, draft_start_stream="1"):
         # Use the repository's full HC fixture and overlay the ordered DSpark
         # transitions. Scale the transition nanoseconds to fit in the HC gaps.
         stage_fixture = fixtures.ResidualStageTests.stage_fixture
         _, head, _ = stage_fixture(self, "main_to_draft")
         _, tail, _ = stage_fixture(self, "draft_to_nextmain")
-        head.append(device_task("draft_graph_start", 88, 89, 0, "49", 0))
+        head.append(device_task("draft_graph_start", 88, 89, 0, "49", 0, stream=draft_start_stream))
         if steps > 7:
             markov = [task for task in tail if 68 <= task.start_ns - EPOCH <= 72]
             for task in tail:
@@ -274,6 +274,58 @@ class FixedRankCLITests(unittest.TestCase):
                                 for row in rounds if row["case"] == "bs4-s7"))
             self.assertTrue((out / "u_next_main_overlap_summary.csv").is_file())
             self.assertFalse((out / "model_architecture_report.json").exists())
+
+    def test_s15_probe_attributes_graph_gate_and_fallback_clock_outlier(self):
+        with tempfile.TemporaryDirectory(prefix="ep128-s15 probe-") as temporary:
+            base = Path(temporary)
+            graph_csv = self.native_capture(base, 16, 15, with_trace=False, draft_start_stream="77")
+            clock_csv, trace = base / "clock.csv", base / "explicit trace.json"
+            name = "MoeDistributeDispatchV2"
+            events = []
+            with clock_csv.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(("Name", "Start Time(us)", "Duration(us)", "Model ID", "Stream ID", "Task ID"))
+                for index in range(4):
+                    start, duration = 200_000_000 + index * 100_000, 4000 + index
+                    writer.writerow((name, us(EPOCH + start), us(duration), "49", "1", str(index)))
+                    bad_match = index == 3
+                    events.append(event(name, start, start + duration, 900, 1,
+                                        105_937_310 if bad_match else 0,
+                                        args={"Task Type": "AI_CORE", "Physic Stream Id": "1",
+                                              "Model Id": "49", "Task Id": "999" if bad_match else str(index)}))
+            trace.write_text(json.dumps({"traceEvents": events}), encoding="utf-8")
+            config = json.loads((ROOT / "profile_ep128_cases.example.json").read_text(encoding="utf-8"))
+            config.update(sample_model=fixtures.MODEL, cases=[
+                {"name": "bs8-s15", "bs": 8, "draft_tokens": 15, "synthetic_acceptance_length": 5.2,
+                 "inputs": [{"rank": "dp4", "path": clock_csv.name, "trace_path": trace.name}]},
+                {"name": "bs16-s15", "bs": 16, "draft_tokens": 15, "synthetic_acceptance_length": 5.2,
+                 "inputs": [{"rank": "dp4", "path": Path(graph_csv).name}]},
+            ])
+            manifest = base / "cases.local.json"
+            manifest.write_text(json.dumps(config), encoding="utf-8-sig")
+            result = subprocess.run(
+                [sys.executable, "-B", "-S", str(ROOT / "tools" / "u_overlap_dp4_s15_probe.py"),
+                 "--cases", str(manifest)], cwd=base, capture_output=True, text=True, encoding="utf-8",
+                timeout=45, env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = (base / "u_overlap_dp4_s15_probe.json").read_bytes()
+            self.assertLessEqual(len(payload), 65536)
+            report = json.loads(payload)
+            self.assertEqual(report["rank"], "dp4")
+            graph = report["graph"]
+            self.assertGreater(graph["rounds"], 0)
+            self.assertEqual(graph["matched_rounds"], 0)
+            self.assertEqual(graph["failed_check_counts"], {"one_task_zero_on_embedding_stream": graph["rounds"]})
+            self.assertEqual(graph["examples"][0]["task_zero_same_model_other_stream"][0]["stream"], "77")
+            clock = report["clock"]
+            expected, _ = core.residual_trace_scan(trace, core.read_capture(clock_csv, "dp4")["tasks"], None)
+            for key in ("status", "anchor_count", "clock_offset_ns", "max_clock_residual_ns"):
+                self.assertEqual(clock[key], expected[key], key)
+            self.assertEqual(clock["max_clock_residual_ns"], 105_937_310)
+            worst = clock["worst_anchors"][0]
+            self.assertEqual(worst["matched_key"], "kind+duration")
+            self.assertEqual(worst["id_disagreements"], ["task_id"])
 
 
 if __name__ == "__main__":

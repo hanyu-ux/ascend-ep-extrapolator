@@ -311,6 +311,14 @@ Host 端先看 `host_linked_ms` 和 `host_in_draft_graph_ms`。脚本对第13或
 
 缺少 trace、Host 来源或可验证图边界时，相应列留空，并记录状态及有效样本数。已有可关联来源且交集为空时才填 `0`。`host_complete_rounds`、`host_partial_rounds` 和 `linked_device_tasks` 反映来源覆盖度，比较均值时也要检查各指标对应的 `_n`。缺少指定 rank 的 case 会在汇总中保留错误，该 case 不会改读其他 rank。此模式单独运行，输出源采样诊断，常规外推和 Excel 用原命令生成。
 
+已有 `bs16-s15` 和 `bs8-s15` 两个 `dp4` case 时，可以在仓库根目录用 PowerShell 运行专项诊断，复用原来的采集文件和 `cases.local.json`。
+
+```powershell
+python -B -u .\tools\u_overlap_dp4_s15_probe.py --cases .\cases.local.json
+```
+
+输出 `u_overlap_dp4_s15_probe.json`（最多 64 KiB）。`graph.failed_check_counts` 统计 `bs16-s15` 草稿图边界的各项失败条件。`clock.worst_anchors` 给出 `bs8-s15` 残差最大的 8 条锚点，包括使用的匹配键及双方的 Stream、Task、Model ID。
+
 ### Top8 热点的 PMU 与 bound
 
 每类层的源实测Top8按核心保存的完整层热点排序；旧JSON则保留原阶段内统计口径及排序，在各方法页追加对应的 PMU 表、方向判断和高级指标详情。PMU 仅描述源采样中的完整原生 kernel 调用，不是目标 10T 估算的硬件指标。
