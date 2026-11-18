@@ -299,6 +299,8 @@ python -u profile_ep128.py cases.local.json --u-overlap-rank dp4 --out u_overlap
 
 Windows 可用 `py -3`，Linux 可用 `python3`。此模式需要仓库根目录的 `ep128_next_main_overlap.py`。每个 case 读取同一 rank 的 `kernel_details.csv`。优先用 `inputs` 显式声明 rank，或者沿用带 rank 标识的采样目录。`trace_view.json` 放在 CSV 旁边，也可以在该 input 指定 `trace_path`。trace 需与该 CSV 属于同一次采样。脚本复用原有分段、时钟对齐和 Host 来源分析。
 
+时钟锚点优先使用通信类型、时长及 Stream、Task、Model ID 匹配。回退到类型与时长时，任一双方都有的 ID 冲突即拒绝该候选，计入 `rejected_id_conflicts`。常规报表和固定 rank 分析共用此规则。
+
 | 输出 | 内容 |
 | --- | --- |
 | `u_next_main_overlap_summary.csv` | 每 case 每阶段的均值、P50、P90、各指标有效轮数，按 S、BS 排序 |
@@ -317,7 +319,7 @@ Host 端先看 `host_linked_ms` 和 `host_in_draft_graph_ms`。脚本对第13或
 python -B -u .\tools\u_overlap_dp4_s15_probe.py --cases .\cases.local.json
 ```
 
-输出 `u_overlap_dp4_s15_probe.json`（最多 64 KiB）。`graph.failed_check_counts` 统计 `bs16-s15` 草稿图边界的各项失败条件。`clock.worst_anchors` 给出 `bs8-s15` 残差最大的 8 条锚点，包括使用的匹配键及双方的 Stream、Task、Model ID。
+输出 `u_overlap_dp4_s15_probe.json`（最多 64 KiB）。`graph.failed_check_counts` 统计 `bs16-s15` 草稿图边界的各项失败条件。`clock.worst_anchors` 给出 `bs8-s15` 残差最大的 8 条已接受锚点，`clock.rejected_conflict_examples` 保留因 ID 冲突被拒绝的样本。
 
 ### Top8 热点的 PMU 与 bound
 

@@ -123,11 +123,12 @@ def _graph_checks(cycle, parents, task_index, hc):
 
 def diagnose_clock(core, capture, trace_path):
     """Record provenance for the exact anchor-selection rules in core."""
-    tasks = capture["tasks"]
-    candidates, lookup = core.residual_anchor_candidates(tasks)
-    candidate_rows = set(lookup.values())
+    lookup = core.residual_anchor_candidates(capture["tasks"])
+    candidate_starts = {task.start_ns for task in lookup.values()}
     matches, processes, trace_stats = {}, {}, {}
-    counts = Counter()
+    counts = Counter(rejected_id_conflicts=0)
+    rejected = []
+    id_fields = ("stream_id", "task_id", "model_id")
     for event in core.residual_iter_trace_events(trace_path, stats=trace_stats):
         counts["events"] += 1
         phase = event.get("ph")
@@ -145,20 +146,24 @@ def diagnose_clock(core, capture, trace_path):
             counts["invalid_timed_events"] += 1
             continue
         args = core.residual_args(event)
-        ids = tuple(core.residual_id(value) for value in (
-            args.get("physicstreamid", args.get("streamid")), args.get("taskid"), args.get("modelid")
-        ))
-        key = kind, duration
-        source = lookup.get(("full", key + ids))
-        matched_key = "full"
-        if source is None:
-            source = lookup.get(("base", key))
-            matched_key = "base"
-        if source is None:
+        task, matched_key, ids = core.residual_find_clock_anchor(lookup, kind, duration, args)
+        if task is None:
             continue
-        hits = matches.setdefault(source, [])
+        if matched_key == "id_conflict":
+            counts["rejected_id_conflicts"] += 1
+            if len(rejected) < 8:
+                rejected.append({
+                    "csv_row_index": task.row_index, "trace_event_index": counts["events"] - 1,
+                    "kind": kind, "duration_ns": duration,
+                    "csv_ids": dict(zip(id_fields, core.residual_clock_task_ids(task))),
+                    "trace_ids": dict(zip(id_fields, ids)),
+                    "csv_minus_trace_ns": str(task.start_ns - start),
+                })
+            continue
+        hits = matches.setdefault(task.start_ns, [])
         if len(hits) < 9:
             hits.append({
+                "csv_task": task,
                 "trace_start": start, "trace_pid": core.residual_id(event.get("pid")),
                 "trace_tid": core.residual_id(event.get("tid")), "trace_event_index": counts["events"] - 1,
                 "trace_name": str(event.get("name", ""))[:120], "trace_ids": ids,
@@ -177,13 +182,14 @@ def diagnose_clock(core, capture, trace_path):
         accepted.append(hit)
     result = {
         "anchor_count": len(accepted),
-        "candidate_csv_starts": len(candidate_rows),
+        "candidate_csv_starts": len(candidate_starts),
         "candidates_with_trace_hits": len(matches),
         "counts": dict(counts),
         "required_anchor_count": core.RESIDUAL_MIN_ANCHORS,
         "clock_tolerance_ns": core.RESIDUAL_CLOCK_TOLERANCE_NS,
         "trace_sha256": trace_stats.get("sha256"),
         "accepted_by_key": dict(Counter(hit["key"] for hit in accepted)),
+        "rejected_conflict_examples": rejected,
         "status": "CLOCK_UNCONFIRMED",
         "clock_offset_ns": None,
         "max_clock_residual_ns": None,
@@ -199,10 +205,9 @@ def diagnose_clock(core, capture, trace_path):
     worst = sorted(accepted, key=lambda hit: -abs(hit["residual"]))[:8]
     maximum = abs(worst[0]["residual"])
     csv_origin = min(hit["csv_start"] for hit in accepted)
-    id_fields = ("stream_id", "task_id", "model_id")
     for hit in worst:
-        task = candidates[hit["csv_start"]]
-        csv_ids = tuple(core.residual_id(getattr(task, name, None)) for name in id_fields)
+        task = hit["csv_task"]
+        csv_ids = core.residual_clock_task_ids(task)
         result["worst_anchors"].append({
             "csv_row_index": task.row_index,
             "csv_name": str(task.name)[:120],
@@ -217,8 +222,7 @@ def diagnose_clock(core, capture, trace_path):
             "trace_ids": dict(zip(id_fields, hit["trace_ids"])),
             "id_disagreements": [field for field, csv_id, trace_id
                                  in zip(id_fields, csv_ids, hit["trace_ids"]) if csv_id != trace_id],
-            "csv_full_key_available": lookup.get(("full", (hit["kind"], hit["duration_ns"]) + csv_ids))
-                                      == hit["csv_start"],
+            "csv_full_key_available": lookup.get(("full", (hit["kind"], hit["duration_ns"]) + csv_ids)) is task,
             "candidate_trace_hits": hit["candidate_trace_hits"],
             "device_verified_by": "event_hint" if hit["device_hint"] else "trace_process_name",
             "csv_start_ns_relative": hit["csv_start"] - csv_origin,

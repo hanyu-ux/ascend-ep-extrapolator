@@ -33,7 +33,7 @@ import time
 from ep128_attention_prepare import analyze_attention_prepare
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261118.1.fixed_rank_u_overlap"
+PROFILE_VERSION = "20261118.2.clock_anchor_identity"
 ACCEPTANCE_SEMANTICS = "mean_output_fraction_including_bonus"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
@@ -2391,21 +2391,37 @@ def residual_anchor_candidates(tasks):
             continue
         key = kind, duration
         base.setdefault(key, []).append(task)
-        ids = tuple(residual_id(getattr(task, field, None)) for field in ("stream_id", "task_id", "model_id"))
+        ids = residual_clock_task_ids(task)
         if all(value is not None for value in ids):
             full.setdefault(key + ids, []).append(task)
-    candidates = {task.start_ns: task for values in list(full.values()) + list(base.values())
-                  if len(values) == 1 for task in values}
-    values = sorted(candidates.values(), key=lambda task: task.start_ns)
-    if len(values) > RESIDUAL_ANCHOR_LIMIT:
-        values = [values[i * (len(values) - 1) // (RESIDUAL_ANCHOR_LIMIT - 1)] for i in range(RESIDUAL_ANCHOR_LIMIT)]
-    allowed = {task.start_ns for task in values}
+    starts = sorted({matches[0].start_ns for groups in (full, base) for matches in groups.values() if len(matches) == 1})
+    if len(starts) > RESIDUAL_ANCHOR_LIMIT:
+        starts = [starts[i * (len(starts) - 1) // (RESIDUAL_ANCHOR_LIMIT - 1)] for i in range(RESIDUAL_ANCHOR_LIMIT)]
+    allowed = set(starts)
     lookup = {}
     for label, groups in (("full", full), ("base", base)):
         for key, matches in groups.items():
             if len(matches) == 1 and matches[0].start_ns in allowed:
-                lookup[label, key] = matches[0].start_ns
-    return {task.start_ns: task for task in values}, lookup
+                lookup[label, key] = matches[0]
+    return lookup
+
+
+def residual_clock_task_ids(task):
+    return tuple(a_id(getattr(task, field, None)) for field in ("stream_id", "task_id", "model_id"))
+
+
+def residual_find_clock_anchor(lookup, kind, duration, args):
+    """Use a duration-only key when the available native IDs agree."""
+    ids = (a_id(args.get("physicstreamid", args.get("streamid"))), a_id(args.get("taskid")), a_id(args.get("modelid")))
+    key = kind, duration
+    task = lookup.get(("full", key + ids))
+    if task is not None:
+        return task, "full", ids
+    task = lookup.get(("base", key))
+    if task is not None and any(csv_id is not None and trace_id is not None and csv_id != trace_id
+                                for csv_id, trace_id in zip(residual_clock_task_ids(task), ids)):
+        return task, "id_conflict", ids
+    return task, "base", ids
 
 
 def residual_progress(progress, stage, count=None):
@@ -2414,9 +2430,10 @@ def residual_progress(progress, stage, count=None):
 
 
 def residual_trace_scan(path, tasks, progress):
-    candidates, lookup = residual_anchor_candidates(tasks)
+    lookup = residual_anchor_candidates(tasks)
     matches, processes, scan = {}, {}, {}
-    counts = {"events": 0, "x_events": 0, "be_events_unsupported": 0, "invalid_timed_events": 0}
+    counts = {"events": 0, "x_events": 0, "be_events_unsupported": 0, "invalid_timed_events": 0,
+              "rejected_id_conflicts": 0}
     last = time.monotonic()
     for event in residual_iter_trace_events(path, stats=scan):
         counts["events"] += 1
@@ -2435,27 +2452,25 @@ def residual_trace_scan(path, tasks, progress):
                     counts["invalid_timed_events"] += 1
                     continue
                 args = residual_args(event)
-                ids = (residual_id(args.get("physicstreamid", args.get("streamid"))),
-                       residual_id(args.get("taskid")), residual_id(args.get("modelid")))
-                source = lookup.get(("full", (kind, duration) + ids))
-                if source is None:
-                    source = lookup.get(("base", (kind, duration)))
-                if source is not None:
-                    hits = matches.setdefault(source, [])
+                task, match_key, _ = residual_find_clock_anchor(lookup, kind, duration, args)
+                if match_key == "id_conflict":
+                    counts["rejected_id_conflicts"] += 1
+                elif task is not None:
+                    hits = matches.setdefault(task.start_ns, [])
                     if len(hits) < 9:
-                        hits.append((start, residual_id(event.get("pid")), residual_device_hint(event, args)))
+                        hits.append((task, start, residual_id(event.get("pid")), residual_device_hint(event, args)))
         now = time.monotonic()
         if counts["events"] % 50000 == 0 or now - last >= 5:
             residual_progress(progress, "trace元数据与设备时钟锚点", counts["events"])
             last = now
     offsets, anchors = [], []
     for source, hits in matches.items():
-        selected = [hit for hit in hits if hit[2] or residual_device_process(processes.get(hit[1], ""))]
+        selected = [hit for hit in hits if hit[3] or residual_device_process(processes.get(hit[2], ""))]
         if len(selected) != 1 or len(hits) >= 9:
             continue
-        start, pid, _ = selected[0]
+        task, start, pid, _ = selected[0]
         offsets.append(source - start)
-        anchors.append({"csv_row_index": getattr(candidates[source], "row_index", None),
+        anchors.append({"csv_row_index": getattr(task, "row_index", None),
                         "csv_start_ns": str(source), "trace_start_ns": str(start), "trace_pid": pid})
     result = {**scan, **counts, "process_names": processes, "anchor_count": len(offsets),
               "required_anchor_count": RESIDUAL_MIN_ANCHORS, "clock_tolerance_ns": RESIDUAL_CLOCK_TOLERANCE_NS,
