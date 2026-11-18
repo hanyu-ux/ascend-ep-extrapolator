@@ -40,7 +40,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-主脚本、Excel生成器、XLSX写入器和Attention准备识别模块应放在同一目录。统计脚本版本为 `20261118.1.fixed_rank_u_overlap`，Excel 生成器版本为 `20261113.1.exclusive_hcpre`，写入器版本为 `20261111.1.internal_links`。
+主脚本、Excel生成器、XLSX写入器和Attention准备识别模块应放在同一目录。统计脚本版本为 `20261118.2.clock_anchor_identity`，Excel 生成器版本为 `20261113.1.exclusive_hcpre`，写入器版本为 `20261111.1.internal_links`。
 
 ## 快速运行
 

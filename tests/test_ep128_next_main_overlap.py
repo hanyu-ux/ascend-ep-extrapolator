@@ -275,24 +275,31 @@ class FixedRankCLITests(unittest.TestCase):
             self.assertTrue((out / "u_next_main_overlap_summary.csv").is_file())
             self.assertFalse((out / "model_architecture_report.json").exists())
 
-    def test_s15_probe_attributes_graph_gate_and_fallback_clock_outlier(self):
+    def test_s15_probe_attributes_graph_gate_and_rejects_conflicting_clock_anchors(self):
         with tempfile.TemporaryDirectory(prefix="ep128-s15 probe-") as temporary:
             base = Path(temporary)
             graph_csv = self.native_capture(base, 16, 15, with_trace=False, draft_start_stream="77")
             clock_csv, trace = base / "clock.csv", base / "explicit trace.json"
             name = "MoeDistributeDispatchV2"
             events = []
+            compatible_ids = [("49", {})] * 3 + [("49", {"Model Id": None}), ("", {})]
+            conflicting_ids = [
+                ("49", {"Physic Stream Id": "99"}),
+                ("49", {"Task Id": "999", "Model Id": None}),
+                ("49", {"Model Id": "99"}),
+            ]
             with clock_csv.open("w", encoding="utf-8", newline="") as stream:
                 writer = csv.writer(stream)
                 writer.writerow(("Name", "Start Time(us)", "Duration(us)", "Model ID", "Stream ID", "Task ID"))
-                for index in range(4):
+                for index, (csv_model, overrides) in enumerate(compatible_ids + conflicting_ids):
                     start, duration = 200_000_000 + index * 100_000, 4000 + index
-                    writer.writerow((name, us(EPOCH + start), us(duration), "49", "1", str(index)))
-                    bad_match = index == 3
-                    events.append(event(name, start, start + duration, 900, 1,
-                                        105_937_310 if bad_match else 0,
-                                        args={"Task Type": "AI_CORE", "Physic Stream Id": "1",
-                                              "Model Id": "49", "Task Id": "999" if bad_match else str(index)}))
+                    writer.writerow((name, us(EPOCH + start), us(duration), csv_model, "1", str(index)))
+                    trace_args = {"Task Type": "AI_CORE", "Physic Stream Id": "1",
+                                  "Model Id": "49", "Task Id": str(index), **overrides}
+                    offset = 105_937_310 if index >= len(compatible_ids) else 0
+                    events.append(event(name, start, start + duration, 900, 1, offset, args=trace_args))
+                # Another task starts with the first fallback anchor but has a different duration.
+                writer.writerow((name, us(EPOCH + 200_300_000), us(4100), "66", "2", "900"))
             trace.write_text(json.dumps({"traceEvents": events}), encoding="utf-8")
             config = json.loads((ROOT / "profile_ep128_cases.example.json").read_text(encoding="utf-8"))
             config.update(sample_model=fixtures.MODEL, cases=[
@@ -319,13 +326,19 @@ class FixedRankCLITests(unittest.TestCase):
             self.assertEqual(graph["failed_check_counts"], {"one_task_zero_on_embedding_stream": graph["rounds"]})
             self.assertEqual(graph["examples"][0]["task_zero_same_model_other_stream"][0]["stream"], "77")
             clock = report["clock"]
-            expected, _ = core.residual_trace_scan(trace, core.read_capture(clock_csv, "dp4")["tasks"], None)
+            expected, offset = core.residual_trace_scan(trace, core.read_capture(clock_csv, "dp4")["tasks"], None)
             for key in ("status", "anchor_count", "clock_offset_ns", "max_clock_residual_ns"):
                 self.assertEqual(clock[key], expected[key], key)
-            self.assertEqual(clock["max_clock_residual_ns"], 105_937_310)
-            worst = clock["worst_anchors"][0]
-            self.assertEqual(worst["matched_key"], "kind+duration")
-            self.assertEqual(worst["id_disagreements"], ["task_id"])
+            self.assertEqual(offset, 0)
+            self.assertEqual(clock["status"], "ALIGNED_X_EVENTS")
+            self.assertEqual(clock["anchor_count"], len(compatible_ids))
+            self.assertEqual(clock["max_clock_residual_ns"], 0)
+            self.assertEqual(clock["accepted_by_key"], {"full": 3, "base": 2})
+            self.assertEqual([anchor["csv_row_index"] for anchor in expected["anchors"]], [1, 2, 3, 4, 5])
+            self.assertEqual(expected["rejected_id_conflicts"], len(conflicting_ids))
+            self.assertEqual(clock["counts"]["rejected_id_conflicts"], len(conflicting_ids))
+            rejected = clock["rejected_conflict_examples"][1]
+            self.assertEqual((rejected["csv_ids"]["task_id"], rejected["trace_ids"]["task_id"]), ("6", "999"))
 
 
 if __name__ == "__main__":

@@ -420,6 +420,9 @@ class StepResidualTests(unittest.TestCase):
                 result = self.analyze()
                 self.assertEqual(result["status"], "DEVICE_ONLY")
                 self.assertEqual(result["trace"]["status"], "CLOCK_MISMATCH" if mode == "drift" else "CLOCK_UNCONFIRMED")
+                if mode == "drift":
+                    self.assertEqual(result["trace"]["anchor_count"], 3)
+                    self.assertEqual(result["trace"]["max_clock_residual_ns"], 10000)
                 self.assertIsNone(result["host_events_csv"])
                 self.assertIsNone(result["windows"][0]["host_span_union_ms"])
                 self.assertAlmostEqual(result["windows"][0]["recorded_busy_ms"], .009)
