@@ -40,7 +40,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-主脚本、Excel生成器、XLSX写入器和Attention准备识别模块应放在同一目录。当前版本：统计／Excel生成器 `20261113.1.exclusive_hcpre`、写入器 `20261111.1.internal_links`。
+主脚本、Excel生成器、XLSX写入器和Attention准备识别模块应放在同一目录。统计脚本版本为 `20261118.1.fixed_rank_u_overlap`，Excel 生成器版本为 `20261113.1.exclusive_hcpre`，写入器版本为 `20261111.1.internal_links`。
 
 ## 快速运行
 
@@ -294,6 +294,8 @@ TPOT（ms/token） = R / Neff
 例如 `R=52 ms`、`Neff=5.2`，则 `TPOT=10 ms/token`。**TPOT 不再除 BS 或 DP**；它是周期与有效输出长度折算值，不是 HTTP 客户端逐 token 时间戳直接测量值。只有目标 DP 等于目标物理卡数时，单卡公式才可简化为 `1000×BS×Neff/R`。
 
 ## U 的15阶段与外推边界
+
+用已有 S7、S15 等采样按同一 rank 比较不同 BS，可以运行 `python profile_ep128.py cases.local.json --u-overlap-rank dp4 --out u_overlap_dp4`。此模式导出第13、14阶段的逐轮数据、按 case 汇总和 trace 证据清单。需要同次同 rank 的 `kernel_details.csv` 和 `trace_view.json`，直接复用已有采样。完整命令及列说明见[固定 rank 的第13／14阶段覆盖分析](docs/usage.md#固定-rank-的第1314阶段覆盖分析)。
 
 脚本默认尝试对源 U1、U2 识别连续的 8+7 个父阶段，并对 Markov 逐位置选 token 保留子阶段。15阶段仅用于解释 U，**不额外加到周期上，也不改变外推结果**。
 

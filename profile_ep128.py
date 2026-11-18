@@ -33,7 +33,7 @@ import time
 from ep128_attention_prepare import analyze_attention_prepare
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261113.1.exclusive_hcpre"
+PROFILE_VERSION = "20261118.1.fixed_rank_u_overlap"
 ACCEPTANCE_SEMANTICS = "mean_output_fraction_including_bonus"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
@@ -1860,6 +1860,14 @@ def _case_analysis_plan(case, model, target, base):
             'source_errors': source_errors}
 
 
+def _case_trace_path(case, rank, base):
+    value = next((item.get('trace_path') for item in case.get('inputs', []) if item.get('rank') == rank), None)
+    if value is None:
+        return None
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else Path(base) / path
+
+
 def _analyze_case_rank(plan, rank_index, *, capture_hashes=None, prepare_source=True, context=None):
     """Analyze a rank using the complete case context, without changing rank coverage."""
     case, model, base = plan['case'], plan['model'], plan['base']
@@ -1889,12 +1897,7 @@ def _analyze_case_rank(plan, rank_index, *, capture_hashes=None, prepare_source=
     measured = measure_capture(capture, model, case, base)
     print(f'  {rank} HC周期识别完成：{len(measured["rounds"])}轮，'
           f'{time.perf_counter() - stage_started:.2f}s；开始整层统计', flush=True)
-    trace_path = next((item.get('trace_path') for item in case.get('inputs', [])
-                       if item.get('rank') == rank), None)
-    if trace_path is not None:
-        trace_path = Path(trace_path).expanduser()
-        if not trace_path.is_absolute():
-            trace_path = Path(base) / trace_path
+    trace_path = _case_trace_path(case, rank, base)
     try:
         # The CLI always supplies its output directory. Direct API callers
         # still receive base measurements without writing beside inputs or
@@ -3834,7 +3837,8 @@ def swa_analyze_capture(capture, measured, detail_dir):
     return swa
 
 
-def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, progress=None, case=None):
+def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, progress=None, case=None,
+                             *, include_next_main_overlap=False):
     """Measure ordered execution-stage spans inside the original HC residuals.
 
     Invalid HC boundaries raise ValueError. Missing, malformed or unaligned
@@ -3913,6 +3917,18 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
         for row in windows + stages:
             row.update(dict.fromkeys(RESIDUAL_DMA_NUMBERS), trace_dma_status="UNAVAILABLE")
     stage_path = directory / (prefix + "-stages.csv")
+    next_main = {}
+    if include_next_main_overlap:
+        from ep128_next_main_overlap import analyze_next_main_overlap
+
+        source_csv = sources.get("source_links_csv")
+        if source_csv and trace["status"] == "ALIGNED_X_EVENTS":
+            with _io_path(source_csv).open(encoding="utf-8-sig", newline="") as stream:
+                rows = analyze_next_main_overlap(measured, stages, index, csv.DictReader(stream),
+                                                 trace_status=trace["status"])
+        else:
+            rows = analyze_next_main_overlap(measured, stages, index, (), trace_status=trace["status"])
+        next_main["next_main_overlap"] = rows
     focus = residual_focus_diagnostics(stages, windows, index, rank, directory, prefix)
     residual_progress(progress, "按有序执行阶段导出过渡耗时，核对逐窗口闭合")
     fields = tuple(key for key in stages[0] if not key.startswith("_"))
@@ -3937,6 +3953,7 @@ def residual_analyze_capture(capture, measured, detail_dir, trace_path=None, pro
             "substage_summary": residual_stage_summary(stages, windows, 1), "stage_basis": RESIDUAL_STAGE_BASIS,
             "focus_diagnostics": focus,
             **sources,
+            **next_main,
             "trace": trace, "residual_ms_mean": statistics.fmean(windows[index]["cycle_residual_ms"] for index in range(0, len(windows), 2))}
 
 
@@ -6184,6 +6201,95 @@ def _cli_positive_workers(value):
     return number
 
 
+def _fixed_overlap_input(case, rank, base):
+    # Explicit manifests can be reused even if the other ranks' files are
+    # unavailable on this machine. Resolve only the requested rank's input.
+    if case.get('inputs') is not None:
+        if not isinstance(case['inputs'], list):
+            raise ValueError('inputs must be a list of explicit rank inputs')
+        selected = [item for item in case['inputs'] if isinstance(item, dict) and item.get('rank') == rank]
+        if len(selected) != 1:
+            raise ValueError(f'Expected one explicit input for rank {rank}, found {len(selected)}')
+        files, _ = case_inputs({'inputs': selected}, base)
+        return files[0]
+    files, ranks = case_inputs(case, base)
+    if rank not in ranks:
+        raise ValueError(f'Rank {rank} absent from discovered inputs')
+    path = files[ranks.index(rank)]
+    if rank_name(path, 0) == 'trace0':
+        raise ValueError('Specify an explicit input rank when the capture path has no rank marker')
+    return path
+
+
+def _run_fixed_rank_u_overlap(config, base, rank, out):
+    from ep128_next_main_overlap import ROUND_FIELDS, summarize_next_main_overlap
+
+    model = referenced_object(config['sample_model'], base, 'sample_model')
+    validate_models(model, None)
+    seen, summaries, rounds, captures = set(), [], [], []
+    for item in config['cases']:
+        name = item.get('name', 'unnamed') if isinstance(item, dict) else 'invalid'
+        identity = {'case': str(name), 'rank': rank, 'bs': None, 'S': None}
+        evidence = {**identity, 'error': None}
+        phase_rows = []
+        try:
+            case = normalize_case(config.get('defaults', {}), item, base)
+            identity.update(case=case['name'], bs=case['bs'], S=case['draft_tokens'])
+            evidence.update(identity)
+            if case['name'] in seen:
+                raise ValueError('Duplicate case name: ' + case['name'])
+            seen.add(case['name'])
+            path = _fixed_overlap_input(case, rank, base)
+            print(f'固定 rank 统计 {case["name"]} / {rank}: {path}', flush=True)
+            capture = read_capture(path, rank)
+            evidence.update(kernel_path=capture['path'], kernel_sha256=capture['sha256'])
+            measured = measure_capture(capture, model, case, base)
+            slug = re.sub(r'[^\w.-]+', '_', case['name'])[:48] or 'case'
+            suffix = hashlib.sha256(case['name'].encode()).hexdigest()[:8]
+            detail_dir = out / 'step_residual_details' / (slug + '-' + suffix)
+            diagnostic = residual_analyze_capture(
+                capture, measured, detail_dir, trace_path=_case_trace_path(case, rank, base), case=case,
+                progress=lambda message: print('    ' + message, flush=True), include_next_main_overlap=True)
+            phase_rows = diagnostic['next_main_overlap']
+            evidence.update(trace=diagnostic['trace'], stage_details_csv=diagnostic['stages_csv'],
+                            source_links_csv=diagnostic['source_links_csv'])
+            if not any(row['stage_status'] == 'MATCHED' for row in phase_rows):
+                evidence['error'] = 'No recognized stage 13/14 anchors'
+        except (ValueError, KeyError, OSError, ArithmeticError, TypeError, csv.Error, sqlite3.Error, re.error) as error:
+            evidence['error'] = str(error)
+        if evidence['error']:
+            print(f'  {name} / {rank}: {evidence["error"]}', flush=True)
+        summaries.extend(summarize_next_main_overlap(phase_rows, identity, case_error=evidence['error']))
+        rounds.extend({**identity, **row} for row in phase_rows)
+        captures.append(evidence)
+
+    def order(row):
+        return (row['S'] is None, row['S'] or 0, row['bs'] or 0, row['case'])
+
+    summaries.sort(key=order)
+    rounds.sort(key=order)
+    captures.sort(key=order)
+    for name, fields, rows in (
+        ('u_next_main_overlap_rounds.csv', ROUND_FIELDS, rounds),
+        ('u_next_main_overlap_summary.csv', tuple(summaries[0]), summaries),
+    ):
+        with residual_csv(out / name, fields) as writer:
+            writer.writerows(rows)
+    atomic_json(out / 'u_next_main_overlap.json', {
+        'profile_version': PROFILE_VERSION, 'rank': rank, 'cases': captures, 'summary': summaries,
+        'scope': {
+            'rank': 'exact rank label across cases; no source-rank selection or extrapolation',
+            'device': 'stage wall is CSV task union plus uncovered; only aligned trace DMA in CSV gaps adds to the union',
+            'host': 'wall spans of uniquely attributed CPU source events; deduplicated and unioned separately per phase',
+            'draft_graph': 'recorded Task ID 0 to last same-Model-ID draft task; task metric intersects recorded draft-ID CSV execution union',
+            'interpretation': 'temporal overlap of linked calls, without critical-path attribution; uncovered time has no assigned wait cause',
+            'missing': 'null/blank when unavailable; each metric reports its own contributing round count',
+        },
+    })
+    print('固定 rank U13/14 对比: ' + str((out / 'u_next_main_overlap_summary.csv').resolve()), flush=True)
+    return int(any(row['error'] for row in captures))
+
+
 def main():
     parser = argparse.ArgumentParser(description='按HC层均值外推目标周期与单卡吞吐；标准库离线统计')
     parser.add_argument('cases', nargs='?', type=Path, help='原采样cases配置')
@@ -6194,11 +6300,16 @@ def main():
     parser.add_argument('--bound-profile', type=Path, help='显式源逻辑NPU硬件及有效工作量依据；可在已有JSON上离线补充')
     parser.add_argument('--list-inputs', action='store_true', help='只核对输入文件，不读取CSV')
     parser.add_argument('--inventory', type=Path, help='查看少量CSV的字段和设备任务数量')
+    parser.add_argument('--u-overlap-rank', metavar='RANK',
+                        help='离线仅分析此 rank 的 U 第13/14阶段及草稿执行期间的 Host 重叠')
     parser.add_argument('--workers', type=_cli_positive_workers, default=None,
                         help='总分析进程数；默认最多2，低内存自动用1；--workers 1串行')
     parser.add_argument('--parallel', choices=('case', 'rank'), default='case',
                         help='并行任务粒度；case按case并行（默认），rank用一个全局池处理各case的rank')
     args = parser.parse_args()
+    if args.u_overlap_rank and (args.inventory or args.list_inputs or args.excel or args.bound_profile
+                                or args.comm_reference or args.workers not in (None, 1) or args.parallel != 'case'):
+        parser.error('--u-overlap-rank 为单 rank 离线诊断模式，请单独运行')
     print('统计脚本：' + str(Path(__file__).resolve()) + '（' + PROFILE_VERSION + '）', flush=True)
     if args.inventory:
         if args.cases or args.list_inputs or args.excel:
@@ -6228,6 +6339,8 @@ def main():
     base = _source_path(args.cases).parent
     if args.list_inputs:
         return list_inputs(config, base)
+    if args.u_overlap_rank:
+        return _run_fixed_rank_u_overlap(config, base, args.u_overlap_rank, args.out)
     model = referenced_object(config['sample_model'], base, 'sample_model')
     target = referenced_object(config['target_model'], base, 'target_model') if config.get('target_model') is not None else None
     validate_models(model, target)
