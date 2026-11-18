@@ -289,6 +289,28 @@ python build_ep128_leadership_excel.py --report ep128_report/model_architecture_
 
 `step_residual_focus_steps.csv` 导出所有已采集 rank 的父段逐步数据；`step_residual_focus_summary.csv` 导出细项均值和函数证据。每 rank 的关注区间明细 CSV 保留精确起止和源任务行。旧报告没有该结构时显示“未采集”，需要重新处理原 CSV；不要求为了软件更新重新采样。
 
+### 固定 rank 的第13／14阶段覆盖分析
+
+将待比较的 S7、S15 和各 BS 组合放在同一份已有 cases JSON 中。以 `dp4` 为例，在仓库根目录运行以下命令。
+
+```bash
+python -u profile_ep128.py cases.local.json --u-overlap-rank dp4 --out u_overlap_dp4
+```
+
+Windows 可用 `py -3`，Linux 可用 `python3`。此模式需要仓库根目录的 `ep128_next_main_overlap.py`。每个 case 读取同一 rank 的 `kernel_details.csv`。优先用 `inputs` 显式声明 rank，或者沿用带 rank 标识的采样目录。`trace_view.json` 放在 CSV 旁边，也可以在该 input 指定 `trace_path`。trace 需与该 CSV 属于同一次采样。脚本复用原有分段、时钟对齐和 Host 来源分析。
+
+| 输出 | 内容 |
+| --- | --- |
+| `u_next_main_overlap_summary.csv` | 每 case 每阶段的均值、P50、P90、各指标有效轮数，按 S、BS 排序 |
+| `u_next_main_overlap_rounds.csv` | 每轮第13、14阶段的设备边界、草稿边界、时长和证据状态 |
+| `u_next_main_overlap.json` | 汇总、源文件身份、trace 时钟校验和明细路径 |
+
+设备端先看 `stage_wall_ms`、`device_busy_csv_ms` 和 `device_uncovered_csv_ms`。trace 可对齐且设备归属明确时，`dma_additional_ms` 只补计落在 CSV 空隙里的 DMA，对应 `device_busy_with_dma_ms` 和 `device_uncovered_after_dma_ms`。余额是未覆盖时间，等待原因保留未知。
+
+Host 端先看 `host_linked_ms` 和 `host_in_draft_graph_ms`。脚本对第13或14阶段任务的唯一可关联 CPU 调用按事件去重并取并集，即使调用发生在本轮 U 开始前也能统计。前者是这些 Host 调用的经过时间，后者是其中落在草稿图首末设备任务跨度内的部分。`host_on_draft_tasks_ms` 进一步只与同草稿 Model ID 的已记录设备执行并集求交。`host_in_draft_hc_ms` 单列 HC 边界内的交集。两个阶段各自汇总，跨阶段合计时需再按 Host 事件去重。时间交集描述实测并发，整轮收益需从整轮时长单独评价。
+
+缺少 trace、Host 来源或可验证图边界时，相应列留空，并记录状态及有效样本数。已有可关联来源且交集为空时才填 `0`。`host_complete_rounds`、`host_partial_rounds` 和 `linked_device_tasks` 反映来源覆盖度，比较均值时也要检查各指标对应的 `_n`。缺少指定 rank 的 case 会在汇总中保留错误，该 case 不会改读其他 rank。此模式单独运行，输出源采样诊断，常规外推和 Excel 用原命令生成。
+
 ### Top8 热点的 PMU 与 bound
 
 每类层的源实测Top8按核心保存的完整层热点排序；旧JSON则保留原阶段内统计口径及排序，在各方法页追加对应的 PMU 表、方向判断和高级指标详情。PMU 仅描述源采样中的完整原生 kernel 调用，不是目标 10T 估算的硬件指标。

@@ -1991,14 +1991,15 @@ class TraceStreamTests(unittest.TestCase):
                            json.dumps(events, ensure_ascii=False) + padding + "," + padding + '"after":' +
                            json.dumps([{"skip": "quoted ] } \\\" 中文🙂" * 20}], ensure_ascii=False) +
                            padding + "}" + padding)
-                path.write_text(content, encoding="utf-8")
+                # Preserve the explicit CRLF bytes on Windows as well.
+                path.write_bytes(content.encode("utf-8"))
                 for chunk in (1, 2, 3, 7, 64, 2048):
                     with self.subTest(whitespace=repr(whitespace), chunk=chunk):
                         stats = {}
                         self.assertEqual(list(residual.residual_iter_trace_events(path, chunk_size=chunk, stats=stats)), expected)
                         self.assertEqual(stats["bytes_read"], len(content.encode("utf-8")))
                         self.assertEqual(stats["sha256"], hashlib.sha256(content.encode("utf-8")).hexdigest())
-                path.write_text(content + "{}", encoding="utf-8")
+                path.write_bytes((content + "{}").encode("utf-8"))
                 with self.subTest(trailing=repr(whitespace)), self.assertRaisesRegex(ValueError, "trailing data"):
                     list(residual.residual_iter_trace_events(path, chunk_size=1))
 
