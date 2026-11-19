@@ -321,6 +321,14 @@ python -B -u .\tools\u_overlap_dp4_s15_probe.py --cases .\cases.local.json
 
 输出 `u_overlap_dp4_s15_probe.json`（最多 64 KiB）。`graph.failed_check_counts` 统计 `bs16-s15` 草稿图边界的各项失败条件。`clock.worst_anchors` 给出 `bs8-s15` 残差最大的 8 条已接受锚点，`clock.rejected_conflict_examples` 保留因 ID 冲突被拒绝的样本。
 
+要追查第13／14阶段长空档的提交时序，可以从已有常规报表目录导出小文件。
+
+```powershell
+python -B -u .\tools\u_gap_submission_probe.py .\ep128_report_11_fixed --rank dp4 --out .\u_gap_dp4.json
+```
+
+工具读取已导出的空档分段、设备任务和 Host 来源明细，逐段核对后继算子的 CANN Node 起止时间，统计空档在该调用开始前、调用期间及返回后的时长。唯一的 `API_ONLY` 来源也可参与核对。样本包含前后算子、CPU 叶调用、队列时间和设备标识，保留来源缺失的空档。Node 返回时间只能说明记录到的调用顺序，具体设备依赖仍需对应的事件证据。输出最多64 KiB，聚合统计覆盖所有已读分段，样本省略数量单列。
+
 ### Top8 热点的 PMU 与 bound
 
 每类层的源实测Top8按核心保存的完整层热点排序；旧JSON则保留原阶段内统计口径及排序，在各方法页追加对应的 PMU 表、方向判断和高级指标详情。PMU 仅描述源采样中的完整原生 kernel 调用，不是目标 10T 估算的硬件指标。
