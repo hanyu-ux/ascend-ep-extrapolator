@@ -329,6 +329,16 @@ python -B -u .\tools\u_gap_submission_probe.py .\ep128_report_11_fixed --rank dp
 
 工具读取已导出的空档分段、设备任务和 Host 来源明细，逐段核对后继算子的 CANN Node 起止时间，统计空档在该调用开始前、调用期间及返回后的时长。唯一的 `API_ONLY` 来源也可参与核对。样本包含前后算子、CPU 叶调用、队列时间和设备标识，保留来源缺失的空档。整轮 U 和所有父阶段的均值一并导出，可核对阶段之间的时间转移。Node 返回时间只能说明记录到的调用顺序，具体设备依赖仍需对应的事件证据。输出最多64 KiB，聚合统计覆盖所有已读分段，样本省略数量单列。
 
+进一步定位输入准备和 metadata 入队前的 Host 函数，可以扫描同次原 trace。
+
+```powershell
+python -B -u .\tools\u_host_function_probe.py .\ep128_report_11_fixed --case bs8-s7 --case bs16-s15 --rank dp4 --out .\u_host_functions_dp4.json
+```
+
+工具按每种区间选取最长的两个可关联样本，检查 expand 前的设备空档、前一个输入写入 Host 调用到 expand 调用之间，以及 metadata Host 调用到 Enqueue 之间的函数。后者也包含设备端没有空档的任务，便于比较提前准备的情况。`--case` 可重复指定，`--samples` 可设为1至4。
+
+输出最多64 KiB，包含具体函数的 `exclusive_functions`、未记录的 `unrecorded_ns` 和嵌套歧义时间。同一物理 Host 线程的 Python／CPU 与 CANN 进程轨道会一起核对，原事件索引、名称、时间及 trace SHA256 与旧报告校验。排他时间表示该已记录调用中没有更细事件覆盖的经过时间。Python 函数缺少记录时，对应区间保留未细分状态。`inclusive_functions` 用于查看包含子调用的范围。B/E 事件数量单列，当前只分析 X 事件。
+
 ### Top8 热点的 PMU 与 bound
 
 每类层的源实测Top8按核心保存的完整层热点排序；旧JSON则保留原阶段内统计口径及排序，在各方法页追加对应的 PMU 表、方向判断和高级指标详情。PMU 仅描述源采样中的完整原生 kernel 调用，不是目标 10T 估算的硬件指标。
