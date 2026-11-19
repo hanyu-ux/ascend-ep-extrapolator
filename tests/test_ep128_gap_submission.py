@@ -98,6 +98,9 @@ class GapSubmissionTests(unittest.TestCase):
                     writer.writeheader()
                     writer.writerows(content)
             diagnostic = {
+                "residual_ms_mean": 0.001,
+                "stage_summary": [{"stage_key": "main_metadata", "window_key": "draft_to_nextmain",
+                                   "rounds": 1, "status": "MATCHED", "duration_ms_mean": 0.0001}],
                 "trace": {"status": "ALIGNED_X_EVENTS"},
                 "source_links_csv": "links.csv", "device_tasks_csv": "device.csv",
                 "focus_diagnostics": {
@@ -126,6 +129,8 @@ class GapSubmissionTests(unittest.TestCase):
             self.assertLessEqual(len(payload), 65536)
             report = json.loads(payload)
             self.assertEqual(report["rank"], "dp4")
+            self.assertEqual(report["cases"][0]["cycle_residual_ms_mean"], 0.001)
+            self.assertEqual(report["cases"][0]["all_stage_wall_means"], diagnostic["stage_summary"])
             stages = {row["stage_key"]: row for row in report["cases"][0]["stages"]}
             metadata = stages["main_metadata"]
             self.assertEqual(metadata["gap_count"], 1)

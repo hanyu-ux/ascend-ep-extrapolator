@@ -210,7 +210,12 @@ def main():
         try:
             if len(captures) != 1:
                 raise ValueError("Expected exactly one selected-rank measurement")
-            row["stages"] = analyze_capture(core, captures[0].get("step_residuals") or {}, args.rank, args.report_dir)
+            diagnostic = captures[0].get("step_residuals") or {}
+            row["cycle_residual_ms_mean"] = diagnostic.get("residual_ms_mean")
+            row["all_stage_wall_means"] = [{key: stage.get(key) for key in
+                ("window_key", "stage_key", "rounds", "status", "duration_ms_mean")}
+                for stage in diagnostic.get("stage_summary", [])]
+            row["stages"] = analyze_capture(core, diagnostic, args.rank, args.report_dir)
             failed |= any("error" in stage for stage in row["stages"])
         except (OSError, ValueError, KeyError, TypeError) as error:
             row["error"] = type(error).__name__ + ": " + str(error)
