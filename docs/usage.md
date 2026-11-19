@@ -339,6 +339,16 @@ python -B -u .\tools\u_host_function_probe.py .\ep128_report_11_fixed --case bs8
 
 输出最多64 KiB，包含具体函数的 `exclusive_functions`、未记录的 `unrecorded_ns` 和嵌套歧义时间。同一物理 Host 线程的 Python／CPU 与 CANN 进程轨道会一起核对，原事件索引、名称、时间及 trace SHA256 与旧报告校验。排他时间表示该已记录调用中没有更细事件覆盖的经过时间。Python 函数缺少记录时，对应区间保留未细分状态。`inclusive_functions` 用于查看包含子调用的范围。B/E 事件数量单列，当前只分析 X 事件。
 
+原 trace 的未记录时间若占主要部分，可在下一次函数定位采样中加上 Host 范围标记。在实际生成 NPU trace 的服务环境中，将原服务或采样命令放到启动器的 `--` 后面。
+
+```text
+python tools/u_host_ranges.py -- <原服务或采样命令及其全部参数>
+```
+
+启动器在真实非空 `execute_model` 调用期间，为输入准备、CPU 长度更新、图 padding、输入拷贝、attention 状态准备和 DP 协调等已有 Host 函数记录 `U_HOST/` 范围。启动日志会报告已安装的入口。范围标记会增加 Host 观测开销，该次采样用于函数定位。范围开关在 dummy、profile 和 capture 调用期间关闭。
+
+采样后，将新文件按现有流程生成独立报表目录，再用 `u_host_function_probe.py` 扫描该目录。`U_HOST/` 范围可以参与相同的嵌套时间分解。新 trace 仍依靠原采样工具收集，启动器通过现有 `torch.profiler.record_function` 提供范围。
+
 ### Top8 热点的 PMU 与 bound
 
 每类层的源实测Top8按核心保存的完整层热点排序；旧JSON则保留原阶段内统计口径及排序，在各方法页追加对应的 PMU 表、方向判断和高级指标详情。PMU 仅描述源采样中的完整原生 kernel 调用，不是目标 10T 估算的硬件指标。
