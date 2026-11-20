@@ -59,6 +59,13 @@ def read_evidence(core, diagnostic, report_dir, rank):
 
 
 def select_windows(core, diagnostic, report_dir, rank, samples):
+    """Select longest examples, or all attributable windows when samples=None.
+
+    Counts retain the historical ``sampled`` spelling even when all candidates
+    are selected for an explicitly separate aggregate diagnostic.
+    """
+    if samples is not None and (type(samples) is not int or samples < 1):
+        raise ValueError("samples must be a positive integer or None")
     devices, sources, members, gaps = read_evidence(core, diagnostic, report_dir, rank)
     candidates, unavailable, counts = defaultdict(dict), defaultdict(list), Counter()
     by_round = defaultdict(list)
@@ -127,9 +134,10 @@ def select_windows(core, diagnostic, report_dir, rank, samples):
     selected = []
     for kind in ("prepare_gap_before_expand", "prepare_between_host_calls", "metadata_before_enqueue"):
         group = sorted(candidates[kind].values(), key=lambda row: (-(row["end_ns"] - row["start_ns"]), row["round_id"]))
+        chosen = group if samples is None else group[:samples]
         counts[kind + ":candidates"] = len(group)
-        counts[kind + ":sampled"] = min(samples, len(group))
-        for window in group[:samples]:
+        counts[kind + ":sampled"] = len(chosen)
+        for window in chosen:
             window["id"] = kind + ":" + str(len(selected) + 1)
             selected.append(window)
     return selected, dict(counts), {phase: sorted(rows, key=lambda row: -row["gap_ns"])[:2]

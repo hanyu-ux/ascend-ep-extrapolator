@@ -959,7 +959,16 @@ def referenced_object(value, base, name):
     return value
 
 
-def normalize_case(defaults, item, base):
+def normalize_case(defaults, item, base, *, capture_purpose='timing'):
+    """Normalize real capture declarations for the explicitly selected use.
+
+    Stack-enabled captures remain excluded from the default timing pipeline.
+    The separate Host-stack diagnostic keeps the declaration unchanged while
+    reusing the source-model and HC segmentation contract.
+    """
+    if capture_purpose not in ('timing', 'host_stack_diagnostic'):
+        raise ValueError('Unsupported capture_purpose: ' + str(capture_purpose))
+
     def token_layer(values, label):
         if not isinstance(values, dict):
             raise ValueError(label + ' must be an object')
@@ -1013,8 +1022,10 @@ def normalize_case(defaults, item, base):
         raise ValueError('Each case needs a nonempty name')
     for key in ('bs', 'draft_tokens'):
         positive_int(case.get(key), key, zero=key == 'draft_tokens')
-    if case.get('with_stack') is not False:
+    if capture_purpose == 'timing' and case.get('with_stack') is not False:
         raise ValueError('Declare with_stack=false for the timing capture; do not mix enabled-stack captures')
+    if capture_purpose == 'host_stack_diagnostic' and type(case.get('with_stack')) is not bool:
+        raise ValueError('Declare the actual boolean with_stack setting for the Host-stack diagnostic')
     excluded = case.get('exclude_target_layers', [0])
     if excluded != [0] or any(type(value) is not int for value in excluded):
         raise ValueError('层均值外推固定使用exclude_target_layers=[0]；只排除参考样本，不减少目标层数')
