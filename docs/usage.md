@@ -349,6 +349,25 @@ python tools/u_host_ranges.py -- <原服务或采样命令及其全部参数>
 
 采样后，将新文件按现有流程生成独立报表目录，再用 `u_host_function_probe.py` 扫描该目录。`U_HOST/` 范围可以参与相同的嵌套时间分解。新 trace 仍依靠原采样工具收集，启动器通过现有 `torch.profiler.record_function` 提供范围。
 
+如果已有 `with_stack=true` 的新采样，使用独立堆栈诊断入口，无需重新采样或先生成外推报表。cases JSON 应指向这次新采样的 CSV 和同次 trace。优先运行 S7 的 BS8、BS16 对照：
+
+```powershell
+$env:PYTHONUTF8 = '1'
+python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.withstack.json --rank dp4 --case bs8-s7 --case bs16-s7 --samples 1 --out .\u_stack_s7_dp4
+```
+
+再跑配置中的全部 case：
+
+```powershell
+python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.withstack.json --rank dp4 --samples 1 --out .\u_stack_all_dp4
+```
+
+每完成一个 case 都会写入检查点：`u_host_stack_full.json` 保存本地全量证据，`u_host_stack_share.json` 不超过64 KiB，用于分享。个别 case 失败会保留错误并继续其他 case，最后返回非零退出码；检查 JSON 中的状态，不要删除错误记录。
+
+该入口读取真实 `profiler_info*.json` 栈配置，并为每个 case 重建自己的时钟、来源关联和函数锚点，不借用旧报表的索引或 SHA。旧 manifest 中的 `with_stack=false` 可以在这个明确的诊断模式中复用，工具会保留申明值与实际采样值的差异。缺失 metadata、缺 Python 事件或未能关联的窗口都会明确标记；不会当成0耗时。原有普通性能报表继续拒绝带栈采样。
+
+`window_summary` 的均值使用每类的全部可关联窗口；`--samples` 只控制最长窗口例子数，不参与均值筛选。函数时间裁剪到所选窗口内，不代表整次函数调用时长。不同 kind 的窗口不能相加；同 kind 窗口若相交，对应聚合留为不可用，避免重复累加。带栈耗时包含 profiler 开销，本诊断不输出吞吐或目标性能外推，时间重叠也不直接等于关键路径收益。
+
 ### Top8 热点的 PMU 与 bound
 
 每类层的源实测Top8按核心保存的完整层热点排序；旧JSON则保留原阶段内统计口径及排序，在各方法页追加对应的 PMU 表、方向判断和高级指标详情。PMU 仅描述源采样中的完整原生 kernel 调用，不是目标 10T 估算的硬件指标。

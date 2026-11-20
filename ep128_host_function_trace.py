@@ -13,16 +13,17 @@ def _anchor_matches(event, request):
 
 def _function_rows(core, values, limit=5):
     ordered = sorted(values.items(), key=lambda item: (-item[1]["ns"], item[0]))
+    chosen = ordered if limit is None else ordered[:limit]
     rows = []
-    for (name, lane), value in ordered[:limit]:
+    for (name, lane), value in chosen:
         sync, copy, graph = core.residual_flags(name)
-        rows.append({"name": name[:180], "lane": lane, "ns": value["ns"],
+        rows.append({"name": name if limit is None else name[:180], "lane": lane, "ns": value["ns"],
                      "event_indexes": sorted(value["event_indexes"])[:3],
                      "sync": sync, "copy": copy, "graph": graph})
-    return rows, max(0, len(ordered) - limit)
+    return rows, len(ordered) - len(chosen)
 
 
-def _partition(core, events, left, right):
+def _partition(core, events, left, right, *, function_limit=5):
     points, selected = defaultdict(list), {}
     inclusive = defaultdict(lambda: {"spans": [], "event_indexes": set()})
     for event in events:
@@ -76,8 +77,8 @@ def _partition(core, events, left, right):
     inclusive_values = {key: {"ns": sum(end - start for start, end in core.a_union(value["spans"])),
                               "event_indexes": value["event_indexes"]}
                         for key, value in inclusive.items()}
-    exclusive_rows, exclusive_omitted = _function_rows(core, exclusive)
-    inclusive_rows, inclusive_omitted = _function_rows(core, inclusive_values)
+    exclusive_rows, exclusive_omitted = _function_rows(core, exclusive, function_limit)
+    inclusive_rows, inclusive_omitted = _function_rows(core, inclusive_values, function_limit)
     return {"window_ns": right - left, "attributed_ns": attributed, "ambiguous_ns": ambiguous,
             "unrecorded_ns": unrecorded, "overlapping_event_count": len(selected),
             "exclusive_functions": exclusive_rows, "exclusive_functions_omitted": exclusive_omitted,
@@ -87,14 +88,18 @@ def _partition(core, events, left, right):
                                    for start, end in sorted(gaps, key=lambda span: -(span[1] - span[0]))[:4]]}
 
 
-def analyze_trace(core, path, trace_info, windows):
+def analyze_trace(core, path, trace_info, windows, *, function_limit=5):
     """Inspect existing X events without inferring unrecorded Python calls.
 
     Source event indexes follow the core's one-based enumeration. The same
     physical Host thread can have Python and synthetic CANN process lanes.
     Self time is elapsed time in a recorded scope, including unrecorded work
     and scheduling delays inside it. It is not a measurement of CPU busy time.
+    function_limit=None retains all full function names for caller aggregation;
+    the default still returns five bounded examples per window.
     """
+    if function_limit is not None and (type(function_limit) is not int or function_limit < 1):
+        raise ValueError("function_limit must be a positive integer or None")
     if trace_info.get("status") != "ALIGNED_X_EVENTS":
         raise ValueError("Function attribution requires an aligned source trace")
     offset = int(trace_info["clock_offset_ns"])
@@ -188,8 +193,16 @@ def analyze_trace(core, path, trace_info, windows):
             else:
                 continue
             selected.append({**event, "lane": lane})
+        left, right = int(window["start_ns"]), int(window["end_ns"])
+        python_events = [event for event in selected
+                         if "python_function" in re.split(r"[,; ]+", event["category"].lower())
+                         and max(left, event["start"]) < min(right, event["end"])]
+        python_intervals = core.a_union(
+            [(max(left, event["start"]), min(right, event["end"])) for event in python_events])
         row.update(status="MATCHED", anchor={key: anchor[key] for key in ("event_index", "name", "pid", "tid")},
-                   **_partition(core, selected, int(window["start_ns"]), int(window["end_ns"])))
+                   python_function_events=len(python_events),
+                   python_function_covered_ns=sum(end - start for start, end in python_intervals),
+                   **_partition(core, selected, left, right, function_limit=function_limit))
         output.append(row)
     return {"trace_sha256": scan.get("sha256"), "sha256_matches_report": bool(expected),
             "counts": dict(counts), "windows": output,
