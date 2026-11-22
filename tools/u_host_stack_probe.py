@@ -8,15 +8,21 @@ captures are read only. Full local evidence and a bounded share file are saved.
 
 import argparse
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import redirect_stdout
 import copy
 import csv
 import hashlib
 import json
+import multiprocessing
+import os
 from pathlib import Path
+import pickle
 import re
 import sqlite3
 from statistics import fmean
 import sys
+import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import profile_ep128 as core
@@ -249,6 +255,71 @@ def analyze_case(item, config, base, rank, out, samples):
         return entry
 
 
+def _worker_failure(item, rank, error, stage):
+    return {"case": item["name"], "rank": rank, "status": "ERROR",
+            "error": "CASE_WORKER_ERROR (" + stage + "): " + type(error).__name__ + ": " + str(error),
+            "warnings": [], "phase_summary": [], "window_summary": [], "windows": []}
+
+
+def _case_worker(index, item, config, base, rank, out, samples, spool):
+    """Keep large results on local disk; only result identity crosses IPC."""
+    with redirect_stdout(core._CaseProgressStream(sys.stdout, item["name"] + " / " + rank)):
+        print("Starting Host-stack analysis; worker=" + str(os.getpid()), flush=True)
+        try:
+            entry = analyze_case(item, config, base, rank, out, samples)
+        except Exception as error:
+            entry = _worker_failure(item, rank, error, "analysis")
+        destination = Path(spool) / ("case-" + str(index) + ".pickle")
+        with destination.open("wb") as stream:
+            pickle.dump({"index": index, "entry": entry}, stream, protocol=pickle.HIGHEST_PROTOCOL)
+    return index, str(destination)
+
+
+def run_cases(selected, config, base, rank, out, samples, workers):
+    """Yield completed cases; caller alone updates ordered aggregate files.
+
+    Spawn is explicit on every platform. Per-case detail directories already
+    include a case-name hash. Temporary IPC files are created by this run, not
+    chosen by the capture manifest, and are removed after collection.
+    """
+    if workers <= 1 or len(selected) <= 1:
+        for index, item in enumerate(selected):
+            print(f"[{index + 1}/{len(selected)}] {item['name']} / {rank}", flush=True)
+            try:
+                entry = analyze_case(item, config, base, rank, out, samples)
+            except Exception as error:
+                entry = _worker_failure(item, rank, error, "analysis")
+            yield index, entry
+        return
+    with tempfile.TemporaryDirectory(prefix="u-stack-workers-") as spool:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as executor:
+            pending = {}
+            for index, item in enumerate(selected):
+                try:
+                    future = executor.submit(_case_worker, index, item, config, base, rank, out, samples, spool)
+                except Exception as error:
+                    yield index, _worker_failure(item, rank, error, "submit")
+                else:
+                    pending[future] = index, item
+            for future in as_completed(pending):
+                index, item = pending[future]
+                expected = Path(spool) / ("case-" + str(index) + ".pickle")
+                try:
+                    outcome = future.result()
+                    if outcome != (index, str(expected)):
+                        raise ValueError("Worker result file identity differs from submitted case")
+                    with expected.open("rb") as stream:
+                        result = pickle.load(stream)
+                    entry = result["entry"]
+                    if result["index"] != index or entry["case"] != item["name"] or entry["rank"] != rank:
+                        raise ValueError("Worker result case/rank identity mismatch")
+                except Exception as error:
+                    entry = _worker_failure(item, rank, error, "collect")
+                finally:
+                    expected.unlink(missing_ok=True)
+                yield index, entry
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cases", type=Path)
@@ -256,6 +327,8 @@ def main(argv=None):
     parser.add_argument("--case", dest="names", action="append")
     parser.add_argument("--out", type=Path, default=Path("u_host_stack_dp4"))
     parser.add_argument("--samples", type=int, choices=range(1, 5), default=2)
+    parser.add_argument("--workers", type=core._cli_positive_workers, default=None,
+                        help="Case analysis processes; automatic 1-2 by default, --workers 1 for serial")
     args = parser.parse_args(argv)
     manifest = core._source_path(args.cases)
     config = json.loads(core._io_path(manifest).read_text(encoding="utf-8-sig"))
@@ -270,6 +343,7 @@ def main(argv=None):
     # Prioritize the root-cause comparison so useful evidence is saved first.
     priority = {name: i for i, name in enumerate(("bs8-s7", "bs16-s7", "bs8-s15", "bs16-s15"))}
     selected.sort(key=lambda item: priority.get(item["name"], 99))
+    workers = core._cli_case_workers(args.workers, len(selected), "case (fixed " + args.rank + ")")
     out = core._source_path(args.out)
     full_path, share_path = out / "u_host_stack_full.json", out / "u_host_stack_share.json"
     protected = {manifest}
@@ -298,18 +372,20 @@ def main(argv=None):
     core._io_path(out).mkdir(parents=True, exist_ok=True)
     payload = {"schema": SCHEMA, "profile_version": core.PROFILE_VERSION, "diagnostic_only": True,
                "rank": args.rank, "planned_cases": len(selected), "completed_cases": 0, "cases": [],
+               "execution": {"parallelism": "case", "requested_workers": args.workers, "workers": workers},
                "scope": "Stack-enabled diagnostic capture; no throughput/extrapolation; timings include profiler overhead. "
                         "Function means use all attributable windows of each kind, not longest samples; "
                         "self wall time includes uninstrumented work and descheduling. "
                         "Temporal overlap does not establish critical-path causality."}
-    for item in selected:
-        print(f"[{len(payload['cases']) + 1}/{len(selected)}] {item['name']} / {args.rank}", flush=True)
-        entry = analyze_case(item, config, manifest.parent, args.rank, out, args.samples)
-        payload["cases"].append(entry)
+    completed = {}
+    for index, entry in run_cases(selected, config, manifest.parent, args.rank, out, args.samples, workers):
+        completed[index] = entry
+        payload["cases"] = [completed[position] for position in sorted(completed)]
         payload["completed_cases"] = len(payload["cases"])
         core.atomic_json(full_path, payload)
         core._io_path(share_path).write_bytes(bounded_share(payload))
-        print("  " + entry["status"] + (": " + entry["error"] if entry["error"] else ""), flush=True)
+        print(f"Completed [{len(completed)}/{len(selected)}] {entry['case']} / {args.rank}: "
+              + entry["status"] + (": " + entry["error"] if entry["error"] else ""), flush=True)
         print("  Checkpoint: " + str(share_path), flush=True)
     print("Share: " + str(share_path) + " (" + str(core._io_path(share_path).stat().st_size) + " bytes)")
     return int(any(c["error"] or c["status"] != "MATCHED" for c in payload["cases"]))

@@ -353,14 +353,18 @@ python tools/u_host_ranges.py -- <原服务或采样命令及其全部参数>
 
 ```powershell
 $env:PYTHONUTF8 = '1'
-python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.withstack.json --rank dp4 --case bs8-s7 --case bs16-s7 --samples 1 --out .\u_stack_s7_dp4
+python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.withstack.json --rank dp4 --case bs8-s7 --case bs16-s7 --samples 1 --workers 2 --out .\u_stack_s7_dp4
 ```
 
 再跑配置中的全部 case：
 
 ```powershell
-python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.withstack.json --rank dp4 --samples 1 --out .\u_stack_all_dp4
+python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.withstack.json --rank dp4 --samples 1 --workers 4 --out .\u_stack_all_dp4
 ```
+
+堆栈诊断按 case 并行，每个 case 仍只分析指定的同一 rank。`--workers 4` 表示最多同时4个 case 进程，`--workers 1` 为串行。省略时根据 CPU 和可用内存自动选择1至2个进程，显式指定的数量最多为选中的 case 数。启动日志会显示实际进程数，并为子进程日志加 case/rank 前缀。带栈 trace 可能很大，提高并发数会增加内存和磁盘读取需求。
+
+子进程各自写入独立的 case 明细目录，大结果通过属于本次运行的临时文件交给主进程，不通过进程管道传输整份函数证据。只有主进程更新公共检查点，按完成情况及时保存，文件中的 case 顺序仍按选中顺序保持稳定，不随进程结束顺序改变。子进程错误会保留为对应 case 的失败记录，不自动重跑。
 
 每完成一个 case 都会写入检查点：`u_host_stack_full.json` 保存本地全量证据，`u_host_stack_share.json` 不超过64 KiB，用于分享。个别 case 失败会保留错误并继续其他 case，最后返回非零退出码；检查 JSON 中的状态，不要删除错误记录。
 
