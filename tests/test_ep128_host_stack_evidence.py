@@ -274,10 +274,119 @@ class ExistingStackEvidenceTests(unittest.TestCase):
         self.assertEqual(payload, before)
         pathological = {"cases": [deepcopy(cases[0])]}
         pathological["cases"][0]["windows"] = [{"huge_display": "x" * 10000}]
+        # Reproducible window displays are now sacrificed before primary
+        # evidence. Make the primary event itself impossible to fit instead.
+        pathological["cases"][0]["trace_evidence"]["events"][0]["name"] = "x" * 10000
         output = json.loads(evidence.bounded_evidence(pathological, limit=1800))["cases"][0]
         self.assertEqual(output["status"], "ERROR")
         self.assertEqual(output["primary_waits_missing"], [1])
         self.assertEqual(output["trace_evidence"]["status"], "PRIMARY_WAIT_EVIDENCE_MISSING")
+
+    def test_many_focus_calls_cannot_evict_three_primary_waits(self):
+        cases = []
+        for name, primary_ids in (("first", (1, 20)), ("second", (1,))):
+            chains, events = [], []
+            for identity in primary_ids:
+                numbers = [identity + i for i in range(9)]
+                chains.append({"target_event_index": identity, "target_is_wait": True,
+                               "primary_windows": [{"window_kind": "prepare", "round_id": "hc-2"}],
+                               "parents": [{"event_index": i, "relation": "python_parent_id"} for i in numbers[1:]]})
+                events.extend({"event_index": i, "name": "wait" if i == identity else "dispatch_parent_" + str(i)}
+                              for i in numbers)
+            for number in range(50):
+                identity = 1000 + number * 10
+                chains.append({"target_event_index": identity, "target_is_wait": False,
+                               "focus_calls": [{"round_id": "hc-2", "kind": "propose"}],
+                               "parents": [{"event_index": identity + 1, "relation": "python_parent_id"}]})
+                events.extend({"event_index": i, "name": "large_auxiliary_context/" * 70}
+                              for i in (identity, identity + 1))
+            cases.append({"case": name, "status": "EXPORTED", "windows": [], "window_summary": [],
+                          "phase_summary": [{"display": "reproducible " * 4000}],
+                          "trace_evidence": {"status": "VERIFIED", "primary_waits_expected": list(primary_ids),
+                                             "wait_parent_chains": chains, "events": events}})
+        result = json.loads(evidence.bounded_evidence({"cases": cases}))
+        self.assertLessEqual(len(json.dumps(result).encode()), 65536)
+        for case, expected in zip(result["cases"], ((1, 20), (1,))):
+            self.assertEqual(case["status"], "EXPORTED")
+            self.assertEqual(case["primary_waits_missing"], [])
+            self.assertEqual(case["primary_waits_retained"], list(expected))
+            chains = case["trace_evidence"]["wait_parent_chains"]
+            for identity in expected:
+                chain = next(c for c in chains if c["target_event_index"] == identity)
+                self.assertGreaterEqual(len(chain["parents"]), 4)
+
+    def test_full_checkpoint_survives_packaging_failure_and_repacks_without_scans(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            full, _ = self.fixture(base)
+            out = base / "export"
+            with patch.object(evidence, "bounded_evidence", side_effect=ValueError("simulated budget failure")):
+                with self.assertRaisesRegex(ValueError, "simulated budget failure"):
+                    evidence.export_existing(core, full, out)
+            checkpoint = out / "u_host_stack_evidence_full.json"
+            original = checkpoint.read_bytes()
+            saved = json.loads(original)
+            self.assertIs(saved["evidence_checkpoint"], True)
+            self.assertTrue(all(c["trace_evidence"]["status"] == "VERIFIED" for c in saved["cases"]))
+            with patch.object(core, "residual_iter_trace_events", side_effect=AssertionError("trace rescan")), \
+                    patch.object(evidence, "_rows", side_effect=AssertionError("CSV rescan")):
+                result, destination = evidence.export_existing(core, checkpoint, base / "repack", max_bytes=262144)
+            self.assertEqual(checkpoint.read_bytes(), original)
+            self.assertNotIn("evidence_checkpoint", result)
+            self.assertNotIn("checkpoint_sources", result)
+            self.assertEqual(result["export_max_bytes"], 262144)
+            self.assertTrue(all(c["status"] == "EXPORTED" for c in result["cases"]))
+            self.assertLessEqual(destination.stat().st_size, 262144)
+            self.assertEqual(result["repacked_from_checkpoint_sha256"], hashlib.sha256(original).hexdigest())
+            with self.assertRaisesRegex(ValueError, "full evidence checkpoint"):
+                evidence.export_existing(core, destination, base / "invalid-repack")
+            # A checkpoint can hold only one originally selected case. Its
+            # default selection is its contents, not the normal two-case pair.
+            saved["cases"] = saved["cases"][:1]
+            single = base / "single-checkpoint.json"
+            single.write_text(json.dumps(saved), encoding="utf-8")
+            with patch.object(core, "residual_iter_trace_events", side_effect=AssertionError("trace rescan")), \
+                    patch.object(evidence, "_rows", side_effect=AssertionError("CSV rescan")):
+                repacked, _ = evidence.export_existing(core, single, base / "single-repack")
+            self.assertEqual([c["case"] for c in repacked["cases"]], ["bs8-s7"])
+
+    def test_cli_larger_budget_preserves_context_and_writes_full_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            full, _ = self.fixture(base)
+            saved = json.loads(full.read_text(encoding="utf-8"))
+            saved["cases"][0]["phase_summary"] = [{"context": "x" * 100000}]
+            full.write_text(json.dumps(saved), encoding="utf-8")
+            out = base / "export"
+            run = subprocess.run([sys.executable, "-B", "-S", str(ROOT / "tools/u_host_stack_probe.py"),
+                                  "--export-existing", str(full), "--max-bytes", "262144", "--out", str(out)],
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            small = out / "u_host_stack_evidence.json"
+            self.assertGreater(small.stat().st_size, 65536)
+            self.assertLessEqual(small.stat().st_size, 262144)
+            self.assertEqual(json.loads(small.read_text())["cases"][0]["phase_summary"][0]["context"], "x" * 100000)
+            checkpoint = json.loads((out / "u_host_stack_evidence_full.json").read_text())
+            self.assertIs(checkpoint["evidence_checkpoint"], True)
+
+    def test_checkpoint_output_collision_and_invalid_cli_budgets_are_rejected_early(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            full, _ = self.fixture(base)
+            collision = base / "u_host_stack_evidence_full.json"
+            collision.write_bytes(full.read_bytes())
+            original = collision.read_bytes()
+            with patch.object(core, "residual_iter_trace_events", side_effect=AssertionError("must reject before scanning")):
+                with self.assertRaisesRegex(ValueError, "overlaps"):
+                    evidence.export_existing(core, collision, base)
+            self.assertEqual(collision.read_bytes(), original)
+            for arguments in (("--export-existing", str(full), "--max-bytes", "65535"),
+                              (str(full), "--max-bytes", "262144")):
+                out = base / "must-not-exist"
+                run = subprocess.run([sys.executable, "-B", "-S", str(ROOT / "tools/u_host_stack_probe.py"),
+                                      *arguments, "--out", str(out)], capture_output=True, text=True, timeout=30)
+                self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                self.assertFalse(out.exists())
 
     def test_cli_reports_missing_primary_wait_as_nonzero_and_saves_error(self):
         with tempfile.TemporaryDirectory() as temporary:
