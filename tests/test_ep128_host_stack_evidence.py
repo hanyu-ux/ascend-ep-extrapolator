@@ -189,6 +189,118 @@ class ExistingStackEvidenceTests(unittest.TestCase):
             self.assertTrue(all(c["status"] == "ERROR" and "SHA256" in c["error"] for c in result["cases"]))
             self.assertTrue(all("trace_evidence" not in c for c in result["cases"]))
 
+    def test_generic_wait_gap_and_same_round_preparation_overlaps_are_retained(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            full, trace = self.fixture(base)
+            raw = json.loads(trace.read_text(encoding="utf-8"))
+            raw.extend([
+                event("dispatch_and_sync", 180, 275, **{"Python id": 9, "Python parent id": 0}),
+                event("<built-in method wait of pybind11 object>", 20, 85, **{"Python id": 10, "Python parent id": 1}),
+                event("<built-in method wait of pybind11 object>", 210, 255, **{"Python id": 11, "Python parent id": 9}),
+                event("_npu_getCurrentRawStreamNoWait", 205, 259, **{"Python id": 12, "Python parent id": 9}),
+                event("draft.py(10): run_fullgraph", 390, 530, **{"Python id": 13, "Python parent id": 0}),
+                event("metadata.py(20): mixed_quant_sparse_flash_mla_metadata_fp8", 350, 420,
+                      **{"Python id": 14, "Python parent id": 0}),
+                event("AscendCL@aclnnMixedQuantSparseFlashMlaMetadataGetWorkspaceSize", 355, 395,
+                      pid=20, cat="cann_api", thread_id=7),
+            ])
+            trace.write_text(json.dumps(raw), encoding="utf-8")
+            saved = json.loads(full.read_text(encoding="utf-8"))
+            for case in saved["cases"]:
+                case["trace"]["sha256"] = hashlib.sha256(trace.read_bytes()).hexdigest()
+            longest = {"name": "<built-in method wait of pybind11 object>", "ns": 65,
+                       "sync": False, "event_indexes": [10]}
+            for key in ("exclusive_functions", "inclusive_functions"):
+                saved["cases"][0]["windows"][0][key].insert(0, deepcopy(longest))
+                saved["cases"][1]["windows"][0][key] = []
+            saved["cases"][1]["windows"][0]["kind"] = "metadata_before_enqueue"
+            full.write_text(json.dumps(saved), encoding="utf-8")
+            result, _ = evidence.export_existing(core, full, base / "export")
+            for case in result["cases"]:
+                self.assertEqual(case["status"], "EXPORTED", case)
+                traced = case["trace_evidence"]
+                events = {e["event_index"]: e for e in traced["events"]}
+                chains = {c["target_event_index"]: c for c in traced["wait_parent_chains"]}
+                self.assertIn(11, traced["primary_waits_retained"])
+                self.assertEqual(traced["primary_waits_missing"], [])
+                self.assertEqual(chains[11]["parents"][0], {"event_index": 9, "relation": "python_parent_id"})
+                self.assertNotIn(12, chains)
+                self.assertTrue(chains[11]["target_is_wait"])
+                workspace_overlap = events[15]["round_overlaps"]
+                self.assertIn({"round_id": "hc-2", "region": "main_hc", "overlap_ns": 40}, workspace_overlap)
+                call_overlaps = events[13]["round_overlaps"]
+                self.assertIn({"round_id": "hc-2", "region": "main_hc", "overlap_ns": 10}, call_overlaps)
+                self.assertIn({"round_id": "hc-2", "region": "draft_metadata", "overlap_ns": 90}, call_overlaps)
+                paired = case["stage7"]["paired_rounds"]
+                self.assertEqual(paired["n"], 1)
+                self.assertEqual(paired["closure_max_abs_ns"], 0)
+                self.assertEqual(paired["cycle_ms_mean"], 400 / 1e6)
+            first = result["cases"][0]["trace_evidence"]
+            self.assertIn(10, first["primary_waits_retained"])
+            self.assertFalse(evidence._is_wait("_npu_getCurrentRawStreamNoWait"))
+
+    def test_budget_protects_primary_generic_wait_and_reports_primary_omission(self):
+        cases = []
+        for name in ("first", "second"):
+            primary = {"target_event_index": 1, "target_is_wait": True, "target_duration_ns": 9000000,
+                       "primary_windows": [{"window_kind": "prepare_gap_before_expand", "round_id": "hc-2"}],
+                       "parents": [{"event_index": i, "relation": "python_parent_id"} for i in range(2, 10)]}
+            events = [{"event_index": i, "name": "dispatch_and_sync" if i == 2 else "generic wait or parent " + str(i),
+                       "duration_ns": 9000000} for i in range(1, 10)]
+            chains = [primary]
+            for j in range(30):
+                numbers = [100 + 20 * j + i for i in range(13)]
+                chains.append({"target_event_index": numbers[0], "target_is_wait": True, "target_duration_ns": 1000,
+                               "parents": [{"event_index": i, "relation": "python_parent_id"} for i in numbers[1:]]})
+                events.extend({"event_index": i, "name": "Event::synchronize " + "long_wrapper_path/" * 30,
+                               "duration_ns": 1000} for i in numbers)
+            cases.append({"case": name, "status": "EXPORTED", "windows": [], "window_summary": [],
+                          "trace_evidence": {"status": "VERIFIED", "primary_waits_expected": [1],
+                                             "events": events, "wait_parent_chains": chains}})
+        payload = {"cases": cases}
+        before = deepcopy(payload)
+        data = evidence.bounded_evidence(payload)
+        self.assertLessEqual(len(data), 65536)
+        for case in json.loads(data)["cases"]:
+            self.assertEqual(case["primary_waits_retained"], [1])
+            self.assertEqual(case["primary_waits_missing"], [])
+            traced = case["trace_evidence"]
+            primary = next(c for c in traced["wait_parent_chains"] if c["target_event_index"] == 1)
+            self.assertGreaterEqual(len(primary["parents"]), 4)
+            self.assertEqual(primary["parents"][0], {"event_index": 2, "relation": "python_parent_id"})
+            available = {e["event_index"] for e in traced["events"]}
+            self.assertTrue(all(p["event_index"] in available for c in traced["wait_parent_chains"] for p in c["parents"]))
+        self.assertEqual(payload, before)
+        pathological = {"cases": [deepcopy(cases[0])]}
+        pathological["cases"][0]["windows"] = [{"huge_display": "x" * 10000}]
+        output = json.loads(evidence.bounded_evidence(pathological, limit=1800))["cases"][0]
+        self.assertEqual(output["status"], "ERROR")
+        self.assertEqual(output["primary_waits_missing"], [1])
+        self.assertEqual(output["trace_evidence"]["status"], "PRIMARY_WAIT_EVIDENCE_MISSING")
+
+    def test_cli_reports_missing_primary_wait_as_nonzero_and_saves_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            full, _ = self.fixture(base)
+            saved = json.loads(full.read_text(encoding="utf-8"))
+            missing = {"name": "<built-in method wait of pybind11 object>", "ns": 80,
+                       "sync": False, "event_indexes": [999999]}
+            for key in ("exclusive_functions", "inclusive_functions"):
+                saved["cases"][0]["windows"][0][key].insert(0, deepcopy(missing))
+            full.write_text(json.dumps(saved), encoding="utf-8")
+            out = base / "export"
+            run = subprocess.run([sys.executable, "-B", "-S", str(ROOT / "tools/u_host_stack_probe.py"),
+                                  "--export-existing", str(full), "--out", str(out)],
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+            result = json.loads((out / "u_host_stack_evidence.json").read_text(encoding="utf-8"))
+            first, second = result["cases"]
+            self.assertEqual(first["status"], "ERROR")
+            self.assertEqual(first["primary_waits_missing"], [999999])
+            self.assertEqual(first["trace_evidence"]["status"], "PRIMARY_WAIT_EVIDENCE_MISSING")
+            self.assertEqual(second["status"], "EXPORTED")
+
     def test_source_output_collision_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
