@@ -190,8 +190,10 @@ def _event(core, number, raw, offset):
     if duration <= 0:
         return None
     args = core.residual_args(raw)
+    # The streaming reader retains JSON fractional times as Decimal. Export
+    # their exact microsecond text; float conversion can lose epoch-scale ns.
     return {"event_index": number, "name": str(raw.get("name", "")), "pid": core.residual_id(raw.get("pid")),
-            "tid": core.residual_id(raw.get("tid")), "cat": str(raw.get("cat", "")), "ts": raw["ts"], "dur": raw["dur"],
+            "tid": core.residual_id(raw.get("tid")), "cat": str(raw.get("cat", "")), "ts": str(raw["ts"]), "dur": str(raw["dur"]),
             "start_ns": start, "end_ns": start + duration, "duration_ns": duration,
             "thread_id": core.residual_id(args.get("threadid")),
             "python_id": core.residual_id(args.get("pythonid")),
@@ -323,6 +325,7 @@ def _trace_evidence(core, entry, windows, stage7, sources, base):
                        "candidate_limit": 64})
     return {"status": "VERIFIED", "sha256": expected, "clock_alignment_status": trace.get("status"),
             "timestamp_scope": "Saved trace timestamps plus saved constant offset; graph causality not inferred",
+            "raw_time_encoding": "ts/dur are exact decimal microsecond strings; start_ns/end_ns/duration_ns are integer nanoseconds",
             "missing_target_event_indexes": sorted(targets - set(target_events)),
             "events": [events[k] for k in sorted(events)], "wait_parent_chains": chains,
             "passes": 2}

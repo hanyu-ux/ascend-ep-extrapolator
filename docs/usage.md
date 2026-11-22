@@ -381,6 +381,8 @@ python -B -u .\tools\u_host_stack_probe.py --export-existing .\u_stack_all_dp4\u
 
 输出 `u_stack_s7_evidence\u_host_stack_evidence.json` 不超过64 KiB，包含已有窗口的函数明细、等待函数的 Python 父调用链、来源关联失败原因，以及第7阶段和第13阶段最长设备空档附近同一 Host 线程的活动。Python 显式父ID与仅靠时间包含推断的祖先分开标记；空档内的 Host 活动只表示时间重叠，不认定为阻塞该任务的原因。HC 包络由已有阶段边界重建，单独注明样本数，不代表完整图执行时间。只读取所选 case 的原 trace 和已生成 CSV，并核对原 trace 的 SHA；源文件保持原位，不会重新采样或进行性能外推。
 
+导出事件中的原始 `ts`、`dur` 以精确十进制字符串保留，单位为微秒；`start_ns`、`end_ns`、`duration_ns` 为计算得到的整数纳秒。原 trace 的 JSON 小数经过精确解析后不会转换成二进制浮点数，避免大时间戳丢失纳秒精度。
+
 `20261122.1.host_source_scope` 修正了带 Python 事件时 Host 来源范围过宽的问题：来源优先使用明确的 `cpu_op`，Python 父帧仅用于诊断，不再把跨多轮的父调用当作一次提交的耗时，也不再用共同 Python 父帧确认两条 flow 相同。旧版本带 Python 采样报表中由此产生的整轮 `host_linked` 和覆盖数值应作废；定向补导出会保留旧版本号与原始来源证据，不会把旧数值伪装成已修正。U及15阶段的设备边界计算不受本次来源修复影响。两类数据应分别判断，不把来源未知当成0。
 
 ### Top8 热点的 PMU 与 bound
