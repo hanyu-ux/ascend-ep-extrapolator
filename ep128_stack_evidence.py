@@ -435,7 +435,9 @@ def _trace_evidence(core, entry, windows, stage7, sources, base):
                     and ((e["pid"], e["tid"]) in lanes or re.search(r"cann|runtime", processes.get(e["pid"], ""), re.I)
                          and any(e["tid"] == tid and e["thread_id"] in (None, tid) for pid, tid in lanes))]
         eligible = list({e["event_index"]: e for e in eligible}.values())
-        for e in eligible[:2]:
+        # A cycle can include main preparation and both early/padded draft
+        # metadata calls with the same path. Retain their distinct candidates.
+        for e in eligible[:4]:
             events[e["event_index"]] = e
             targets.add(e["event_index"])
             focus_calls[e["event_index"]].append({"round_id": round_id, "kind": kind})
