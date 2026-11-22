@@ -273,7 +273,10 @@ class ExistingStackEvidenceTests(unittest.TestCase):
             self.assertEqual(traced["status"], "VERIFIED")
             self.assertEqual(traced["host_lane_selection"]["status"], "UNIQUE_RUNNER_LANE")
             self.assertEqual(traced["passes"], 3)
-            self.assertEqual(scans, [trace] * 3)
+            # Windows runner temporary roots may use an 8.3 path alias.
+            # Require three reads of the same file, not identical spellings.
+            self.assertEqual(len(scans), 3)
+            self.assertTrue(all(path.samefile(trace) for path in scans))
             events = {e["event_index"]: e for e in traced["events"]}
             primary = traced["primary_waits_retained"]
             self.assertTrue(primary)
