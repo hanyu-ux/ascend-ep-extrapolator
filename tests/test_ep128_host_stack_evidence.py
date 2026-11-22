@@ -6,6 +6,7 @@ from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -126,6 +127,56 @@ class ExistingStackEvidenceTests(unittest.TestCase):
             self.assertEqual(chain["parents"][0]["event_index"], 4)
             self.assertEqual(chain["parents"][1], {"event_index": 3, "relation": "python_parent_id"})
             self.assertNotIn(7, [p.get("event_index") for p in chain["parents"]])
+            self.assertEqual({p: p.read_bytes() for p in original}, original)
+
+    def test_cli_exports_native_decimal_trace_times_without_epoch_precision_loss(self):
+        with tempfile.TemporaryDirectory(prefix="ep128 numeric trace ") as temporary:
+            base = Path(temporary)
+            full, trace = self.fixture(base)
+            raw_events = json.loads(trace.read_text(encoding="utf-8"))
+            # Real profiler traces use JSON numbers, not the timestamp strings
+            # used by the older fixture. Keep the original decimal lexemes:
+            # binary floats cannot represent these epoch + nanosecond values.
+            raw_events[2]["ts"] = str(EPOCH // 1000) + ".001"
+            raw_events[2]["dur"] = "0.200"
+            raw_events[3]["dur"] = "0.123"
+            numeric_json = re.sub(r'"(ts|dur)": "(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"',
+                                  r'"\1": \2', json.dumps(raw_events))
+            trace.write_text(numeric_json, encoding="utf-8")
+            saved = json.loads(full.read_text(encoding="utf-8"))
+            for case in saved["cases"]:
+                case["trace"]["sha256"] = hashlib.sha256(trace.read_bytes()).hexdigest()
+            full.write_text(json.dumps(saved), encoding="utf-8")
+            parsed = list(core.residual_iter_trace_events(trace))
+            self.assertIs(type(parsed[2]["ts"]), Decimal)
+            self.assertIs(type(parsed[3]["dur"]), Decimal)
+            self.assertEqual(parsed[2]["ts"], Decimal("1790000000000000.001"))
+            original = {p: p.read_bytes() for p in base.iterdir() if p.is_file()}
+            out = base / "export"
+            run = subprocess.run([sys.executable, "-B", "-S", str(ROOT / "tools/u_host_stack_probe.py"),
+                                  "--export-existing", str(full), "--rank", "dp4", "--case", "bs8-s7",
+                                  "--case", "bs16-s7", "--out", str(out)],
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            destination = out / "u_host_stack_evidence.json"
+            self.assertLessEqual(destination.stat().st_size, 65536)
+            result = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(result["schema"], "u_host_stack_evidence_v1")
+            self.assertEqual([c["case"] for c in result["cases"]], ["bs8-s7", "bs16-s7"])
+            for case in result["cases"]:
+                self.assertEqual(case["status"], "EXPORTED", case)
+                traced = case["trace_evidence"]
+                self.assertEqual(traced["status"], "VERIFIED")
+                events = {e["event_index"]: e for e in traced["events"]}
+                self.assertEqual(events[3]["ts"], "1790000000000000.001")
+                self.assertEqual(events[3]["dur"], "0.200")
+                self.assertEqual(events[3]["start_ns"], EPOCH + 1)
+                self.assertEqual(events[3]["end_ns"], EPOCH + 201)
+                self.assertIs(type(events[3]["start_ns"]), int)
+                self.assertEqual(events[4]["dur"], "0.123")
+                self.assertEqual(events[4]["duration_ns"], 123)
+                self.assertEqual(events[4]["end_ns"], EPOCH + 133)
+                self.assertEqual(traced["sha256"], hashlib.sha256(trace.read_bytes()).hexdigest())
             self.assertEqual({p: p.read_bytes() for p in original}, original)
 
     def test_changed_trace_is_reported_and_does_not_supply_parent_evidence(self):
