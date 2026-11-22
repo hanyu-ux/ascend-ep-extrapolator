@@ -379,7 +379,15 @@ $env:PYTHONUTF8 = '1'
 python -B -u .\tools\u_host_stack_probe.py --export-existing .\u_stack_all_dp4\u_host_stack_full.json --rank dp4 --case bs8-s7 --case bs16-s7 --out .\u_stack_s7_evidence
 ```
 
-输出 `u_stack_s7_evidence\u_host_stack_evidence.json` 不超过64 KiB，包含已有窗口的函数明细、等待函数的 Python 父调用链、来源关联失败原因，以及第7阶段和第13阶段最长设备空档附近同一 Host 线程的活动。Python 显式父ID与仅靠时间包含推断的祖先分开标记；空档内的 Host 活动只表示时间重叠，不认定为阻塞该任务的原因。HC 包络由已有阶段边界重建，单独注明样本数，不代表完整图执行时间。只读取所选 case 的原 trace 和已生成 CSV，并核对原 trace 的 SHA；源文件保持原位，不会重新采样或进行性能外推。
+输出 `u_stack_s7_evidence\u_host_stack_evidence.json` 默认不超过64 KiB；需要保留更多父链和准备函数样本时，显式加 `--max-bytes 262144` 可将分享文件预算提高到256 KiB。该参数只适用于 `--export-existing`，最小值为65536。文件包含已有窗口的函数明细、等待函数的 Python 父调用链、来源关联失败原因，以及第7阶段和第13阶段最长设备空档附近同一 Host 线程的活动。Python 显式父ID与仅靠时间包含推断的祖先分开标记；空档内的 Host 活动只表示时间重叠，不认定为阻塞该任务的原因。HC 包络由已有阶段边界重建，单独注明样本数，不代表完整图执行时间。只读取所选 case 的原 trace 和已生成 CSV，并核对原 trace 的 SHA；源文件保持原位，不会重新采样或进行性能外推。
+
+扫描结果会先原子保存到同一输出目录的 `u_host_stack_evidence_full.json`，再生成有界分享文件。该完整检查点留在内网，即使小文件预算不足也不丢失已收集事件。后续可直接重新打包检查点，不再次读取trace或CSV：
+
+```powershell
+python -B -u .\tools\u_host_stack_probe.py --export-existing .\u_stack_s7_evidence\u_host_stack_evidence_full.json --rank dp4 --case bs8-s7 --case bs16-s7 --max-bytes 262144 --out .\u_stack_s7_evidence_share
+```
+
+重新打包只接受带明确检查点标记的完整文件；已经裁剪的分享小文件不能恢复被省略的事件。原始扫描的SHA验证状态会保留，并注明本次未重扫原trace。预算裁剪始终先让出辅助函数和来源样本，为主等待及其最近父链保留空间。
 
 导出事件中的原始 `ts`、`dur` 以精确十进制字符串保留，单位为微秒；`start_ns`、`end_ns`、`duration_ns` 为计算得到的整数纳秒。原 trace 的 JSON 小数经过精确解析后不会转换成二进制浮点数，避免大时间戳丢失纳秒精度。
 

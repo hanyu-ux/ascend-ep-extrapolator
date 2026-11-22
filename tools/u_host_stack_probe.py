@@ -328,6 +328,8 @@ def main(argv=None):
     parser.add_argument("cases", type=Path, nargs="?")
     parser.add_argument("--export-existing", type=Path,
                         help="Read an existing u_host_stack_full.json and export selected wait/parent evidence only")
+    parser.add_argument("--max-bytes", type=int, default=65536,
+                        help="Small evidence export byte limit (at least 65536); use 262144 for more context")
     parser.add_argument("--rank", default="dp4")
     parser.add_argument("--case", dest="names", action="append")
     parser.add_argument("--out", type=Path, default=Path("u_host_stack_dp4"))
@@ -335,11 +337,16 @@ def main(argv=None):
     parser.add_argument("--workers", type=core._cli_positive_workers, default=None,
                         help="Case analysis processes; automatic 1-2 by default, --workers 1 for serial")
     args = parser.parse_args(argv)
+    if args.max_bytes < 65536:
+        parser.error("--max-bytes must be at least 65536")
+    if args.export_existing is None and args.max_bytes != 65536:
+        parser.error("--max-bytes is only supported with --export-existing")
     if args.export_existing is not None:
         if args.cases is not None:
             parser.error("Use either cases JSON or --export-existing, not both")
         from ep128_stack_evidence import export_existing
-        result, path = export_existing(core, args.export_existing, args.out, args.names, rank=args.rank)
+        result, path = export_existing(core, args.export_existing, args.out, args.names, rank=args.rank,
+                                       max_bytes=args.max_bytes)
         print("Evidence: " + str(path) + " (" + str(core._io_path(path).stat().st_size) + " bytes)")
         return int(any(c["status"] == "ERROR" for c in result["cases"]))
     if args.cases is None:

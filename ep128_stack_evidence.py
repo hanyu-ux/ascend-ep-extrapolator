@@ -491,6 +491,9 @@ def _validate_primary(case):
 
 def bounded_evidence(payload, limit=LIMIT):
     result = copy.deepcopy(payload)
+    result.pop("evidence_checkpoint", None)
+    result.pop("checkpoint_sources", None)
+    result["export_max_bytes"] = limit
     result["export_omissions"] = Counter()
     for case in result["cases"]:
         case["primary_waits_expected"] = list((case.get("trace_evidence") or {}).get("primary_waits_expected", []))
@@ -551,11 +554,25 @@ def bounded_evidence(payload, limit=LIMIT):
         for case in reversed(result["cases"]):
             trace = case.get("trace_evidence") or {}
             chains = trace.get("wait_parent_chains", [])
-            protected = [c for c in chains if c.get("primary_windows") or c.get("focus_calls")]
+            # Focus calls are useful context, but can be numerous. Only the
+            # requested primary waits are mandatory under the byte budget.
+            protected = [c for c in chains if c.get("primary_windows")]
             optional = [c for c in chains if c not in protected]
             selected = sorted(protected, key=_chain_priority) + sorted(optional, key=_chain_priority)[:cap]
             trace["wait_parent_chains"] = selected
             result["export_omissions"]["target_parent_chains"] += len(chains) - len(selected)
+            _prune_trace(case, result["export_omissions"])
+    if len(encoded()) > limit and any(c.get("primary_waits_expected") for c in result["cases"]):
+        # Discard reproducible summaries before losing the purpose of this
+        # export. The complete collected result is saved in the checkpoint.
+        for case in result["cases"]:
+            for key in ("windows", "window_summary", "phase_summary", "all_stage_wall_means", "source_links"):
+                if key in case:
+                    case.pop(key)
+                    result["export_omissions"][key] += 1
+            for gap in (case.get("stage7") or {}).get("gaps", []) + (case.get("stage7") or {}).get("main_inputs_gaps", []):
+                if gap.pop("following_source_links", None) is not None:
+                    result["export_omissions"]["gap_source_links"] += 1
             _prune_trace(case, result["export_omissions"])
     if len(encoded()) > limit:
         # Keep actual primary waits and concrete Host calls ahead of source
@@ -591,15 +608,18 @@ def bounded_evidence(payload, limit=LIMIT):
     return data
 
 
-def export_existing(core, full_path, out_dir, names=None, rank=None):
+def export_existing(core, full_path, out_dir, names=None, rank=None, max_bytes=LIMIT):
+    if type(max_bytes) is not int or max_bytes < LIMIT:
+        raise ValueError("max_bytes must be an integer of at least 65536")
     full_path = core._source_path(full_path)
     access = core._io_path(full_path)
     stamp = _stamp(access)
     raw = access.read_bytes()
     saved = json.loads(raw.decode("utf-8-sig"))
-    if saved.get("schema") != "u_host_stack_v1":
-        raise ValueError("--export-existing expects u_host_stack_full.json")
-    wanted = names or ["bs8-s7", "bs16-s7"]
+    checkpoint_input = saved.get("schema") == SCHEMA and saved.get("evidence_checkpoint") is True
+    if saved.get("schema") != "u_host_stack_v1" and not checkpoint_input:
+        raise ValueError("--export-existing expects u_host_stack_full.json or a full evidence checkpoint")
+    wanted = names or ([c["case"] for c in saved["cases"]] if checkpoint_input else ["bs8-s7", "bs16-s7"])
     if len(wanted) != len(set(wanted)):
         raise ValueError("--case selections must be unique")
     chosen = []
@@ -609,15 +629,33 @@ def export_existing(core, full_path, out_dir, names=None, rank=None):
             raise ValueError("Expected exactly one saved case: " + name)
         chosen.append(found[0])
     out = core._source_path(out_dir) / "u_host_stack_evidence.json"
+    checkpoint = out.parent / "u_host_stack_evidence_full.json"
     protected = {full_path}
+    for value in saved.get("checkpoint_sources", []):
+        protected.add(_path(core, value, full_path.parent))
     for entry in saved["cases"]:
         for value in [entry.get("kernel_path"), (entry.get("trace") or {}).get("path"),
                       *((entry.get("stage_details") or {}).values()),
                       *(m.get("path") for m in entry.get("profiler_metadata", []))]:
             if value:
                 protected.add(_path(core, value, full_path.parent))
-    if out in protected:
+    if out in protected or not checkpoint_input and checkpoint in protected:
         raise ValueError("Evidence output overlaps an existing source input")
+    if checkpoint_input:
+        print("Repacking saved evidence checkpoint; no trace or CSV scans", flush=True)
+        result = copy.deepcopy(saved)
+        result["cases"] = copy.deepcopy(chosen)
+        result["repacked_from_checkpoint_sha256"] = hashlib.sha256(raw).hexdigest()
+        result["repack_scope"] = "Saved collection and trace verification retained; source trace and CSV files are not rescanned"
+        for case in result["cases"]:
+            if rank is not None and case.get("rank") != rank:
+                raise ValueError("Saved case rank differs from --rank")
+        data = bounded_evidence(result, limit=max_bytes)
+        if _stamp(access) != stamp:
+            raise ValueError("Source checkpoint changed during repacking")
+        core._io_path(out.parent).mkdir(parents=True, exist_ok=True)
+        core._io_path(out).write_bytes(data)
+        return json.loads(data), out
     result = {"schema": SCHEMA, "profile_version": saved.get("profile_version"), "diagnostic_only": True,
               "exporter_profile_version": core.PROFILE_VERSION,
               "full_report_sha256": hashlib.sha256(raw).hexdigest(), "rank": saved.get("rank"), "cases": [],
@@ -653,7 +691,13 @@ def export_existing(core, full_path, out_dir, names=None, rank=None):
         result["cases"].append(case)
     if _stamp(access) != stamp:
         raise ValueError("Source full report changed during evidence export")
-    data = bounded_evidence(result)
     core._io_path(out.parent).mkdir(parents=True, exist_ok=True)
+    # Save the complete collection first. A budget error or later export issue
+    # can then be retried without reading million-event traces again.
+    result["evidence_checkpoint"] = True
+    result["checkpoint_sources"] = sorted(str(p) for p in protected if p is not None)
+    core.atomic_json(checkpoint, result)
+    print("Full evidence checkpoint: " + str(checkpoint), flush=True)
+    data = bounded_evidence(result, limit=max_bytes)
     core._io_path(out).write_bytes(data)
     return json.loads(data), out
