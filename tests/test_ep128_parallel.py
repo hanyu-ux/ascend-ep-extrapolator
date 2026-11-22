@@ -33,6 +33,14 @@ class ParallelCaseTests(unittest.TestCase):
             # Windows temporary paths can use RUNNER~1 while runtime detail
             # paths resolve to the long directory name, e.g. runneradmin.
             prefixes.update((str(resolved), resolved.as_posix()))
+        # Source CSV paths can retain the Win32 I/O namespace while other
+        # report paths are ordinary. Both identify the same output root.
+        for prefix in tuple(prefixes):
+            windows = PureWindowsPath(prefix)
+            if windows.is_absolute() and not str(windows).startswith('\\\\?\\'):
+                name = str(windows)
+                extended = PureWindowsPath('\\\\?\\UNC\\' + name[2:] if name.startswith('\\\\') else '\\\\?\\' + name)
+                prefixes.update((str(extended), extended.as_posix()))
         for _ in range(2):
             prefixes.update(json.dumps(prefix, ensure_ascii=ascii_only)[1:-1]
                             for prefix in tuple(prefixes) for ascii_only in (False, True))
@@ -82,15 +90,17 @@ class ParallelCaseTests(unittest.TestCase):
         return self.normalize_text(value, output) if isinstance(value, str) else value
 
     def test_output_normalization_handles_windows_and_embedded_json_paths(self):
-        output = PureWindowsPath('C:/用户/run/serial')
-        for path in (str(output), output.as_posix()):
-            with self.subTest(path=path):
-                self.assertEqual(self.normalize_text(path, output), '<OUTPUT>')
-                for ascii_only in (False, True):
-                    encoded = json.dumps(path, ensure_ascii=ascii_only)[1:-1]
-                    self.assertEqual(self.normalize_text(encoded, output), '<OUTPUT>')
-                    encoded_twice = json.dumps(encoded, ensure_ascii=ascii_only)[1:-1]
-                    self.assertEqual(self.normalize_text(encoded_twice, output), '<OUTPUT>')
+        for output in (PureWindowsPath('C:/用户/run/serial'), PureWindowsPath('//server/share/用户/serial')):
+            name = str(output)
+            extended = PureWindowsPath('\\\\?\\UNC\\' + name[2:] if name.startswith('\\\\') else '\\\\?\\' + name)
+            for path in (name, output.as_posix(), str(extended), extended.as_posix()):
+                with self.subTest(path=path):
+                    self.assertEqual(self.normalize_text(path, output), '<OUTPUT>')
+                    for ascii_only in (False, True):
+                        encoded = json.dumps(path, ensure_ascii=ascii_only)[1:-1]
+                        self.assertEqual(self.normalize_text(encoded, output), '<OUTPUT>')
+                        encoded_twice = json.dumps(encoded, ensure_ascii=ascii_only)[1:-1]
+                        self.assertEqual(self.normalize_text(encoded_twice, output), '<OUTPUT>')
 
     def test_spawn_and_serial_reports_and_all_csvs_are_identical_in_input_order(self):
         with tempfile.TemporaryDirectory() as temporary:
