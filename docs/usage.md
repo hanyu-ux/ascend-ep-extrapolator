@@ -349,17 +349,17 @@ python tools/u_host_ranges.py -- <原服务或采样命令及其全部参数>
 
 采样后，将新文件按现有流程生成独立报表目录，再用 `u_host_function_probe.py` 扫描该目录。`U_HOST/` 范围可以参与相同的嵌套时间分解。新 trace 仍依靠原采样工具收集，启动器通过现有 `torch.profiler.record_function` 提供范围。
 
-如果已有 `with_stack=true` 的新采样，使用独立堆栈诊断入口，无需重新采样或先生成外推报表。cases JSON 应指向这次新采样的 CSV 和同次 trace。优先运行 S7 的 BS8、BS16 对照：
+如果已有包含 Python 函数事件的诊断采样，使用独立堆栈诊断入口，无需重新采样或先生成外推报表。采样元数据中的 `with_stack` 和 `with_modules` 分别保留；`with_modules=true` 也可能提供 Python 函数事件，不能据此声称采样开启了 `with_stack`。cases JSON 应指向这次新采样的 CSV 和同次 trace。优先运行 S7 的 BS8、BS16 对照：
 
 ```powershell
 $env:PYTHONUTF8 = '1'
-python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.withstack.json --rank dp4 --case bs8-s7 --case bs16-s7 --samples 1 --workers 2 --out .\u_stack_s7_dp4
+python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.11.19.json --rank dp4 --case bs8-s7 --case bs16-s7 --samples 1 --workers 2 --out .\u_stack_s7_dp4
 ```
 
 再跑配置中的全部 case：
 
 ```powershell
-python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.withstack.json --rank dp4 --samples 1 --workers 4 --out .\u_stack_all_dp4
+python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.11.19.json --rank dp4 --samples 1 --workers 4 --out .\u_stack_all_dp4
 ```
 
 堆栈诊断按 case 并行，每个 case 仍只分析指定的同一 rank。`--workers 4` 表示最多同时4个 case 进程，`--workers 1` 为串行。省略时根据 CPU 和可用内存自动选择1至2个进程，显式指定的数量最多为选中的 case 数。启动日志会显示实际进程数，并为子进程日志加 case/rank 前缀。带栈 trace 可能很大，提高并发数会增加内存和磁盘读取需求。
@@ -371,6 +371,17 @@ python -B -u .\tools\u_host_stack_probe.py .\profile_ep128_cases.withstack.json 
 该入口读取真实 `profiler_info*.json` 栈配置，并为每个 case 重建自己的时钟、来源关联和函数锚点，不借用旧报表的索引或 SHA。旧 manifest 中的 `with_stack=false` 可以在这个明确的诊断模式中复用，工具会保留申明值与实际采样值的差异。缺失 metadata、缺 Python 事件或未能关联的窗口都会明确标记；不会当成0耗时。原有普通性能报表继续拒绝带栈采样。
 
 `window_summary` 的均值使用每类的全部可关联窗口；`--samples` 只控制最长窗口例子数，不参与均值筛选。函数时间裁剪到所选窗口内，不代表整次函数调用时长。不同 kind 的窗口不能相加；同 kind 窗口若相交，对应聚合留为不可用，避免重复累加。带栈耗时包含 profiler 开销，本诊断不输出吞吐或目标性能外推，时间重叠也不直接等于关键路径收益。
+
+已经生成 `u_host_stack_full.json` 时，可在同一入口定向补导出证据，无需再次分析全部 case：
+
+```powershell
+$env:PYTHONUTF8 = '1'
+python -B -u .\tools\u_host_stack_probe.py --export-existing .\u_stack_all_dp4\u_host_stack_full.json --rank dp4 --case bs8-s7 --case bs16-s7 --out .\u_stack_s7_evidence
+```
+
+输出 `u_stack_s7_evidence\u_host_stack_evidence.json` 不超过64 KiB，包含已有窗口的函数明细、等待函数的 Python 父调用链、来源关联失败原因，以及第7阶段和第13阶段最长设备空档附近同一 Host 线程的活动。Python 显式父ID与仅靠时间包含推断的祖先分开标记；空档内的 Host 活动只表示时间重叠，不认定为阻塞该任务的原因。HC 包络由已有阶段边界重建，单独注明样本数，不代表完整图执行时间。只读取所选 case 的原 trace 和已生成 CSV，并核对原 trace 的 SHA；源文件保持原位，不会重新采样或进行性能外推。
+
+`20261122.1.host_source_scope` 修正了带 Python 事件时 Host 来源范围过宽的问题：来源优先使用明确的 `cpu_op`，Python 父帧仅用于诊断，不再把跨多轮的父调用当作一次提交的耗时，也不再用共同 Python 父帧确认两条 flow 相同。旧版本带 Python 采样报表中由此产生的整轮 `host_linked` 和覆盖数值应作废；定向补导出会保留旧版本号与原始来源证据，不会把旧数值伪装成已修正。U及15阶段的设备边界计算不受本次来源修复影响。两类数据应分别判断，不把来源未知当成0。
 
 ### Top8 热点的 PMU 与 bound
 
