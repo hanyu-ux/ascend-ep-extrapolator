@@ -22,12 +22,16 @@ def _is_wait(name):
 
 
 def _focus_kind(name):
-    match = re.search(r"(?:^|[ :])(run_fullgraph|prepare_inputs|_graph_replay|propose|mixed_quant_sparse_flash_mla_metadata_fp8)$", name)
+    match = re.search(r"(?:^|[ :])(run_fullgraph|prepare_inputs|prepare_attn|_graph_replay|propose|build_attn_metadata|build_req_metadata|_build_sas_metadata|_update_seq_lens_cpu|build_draft_attn_metadatas|_build_uniform_attn_metadata|mixed_quant_sparse_flash_mla_metadata_fp8)$", name)
     if match:
         return match[1]
     if "MixedQuantSparseFlashMlaMetadataGetWorkspaceSize" in name:
         return "metadata_workspace"
     return None
+
+
+def _all_gaps(stage):
+    return [gap for key in ("gaps", "main_inputs_gaps", "main_metadata_gaps") for gap in stage.get(key, [])]
 
 
 def _round_boundaries(stages, windows, round_ids):
@@ -50,6 +54,10 @@ def _round_boundaries(stages, windows, round_ids):
         add("draft_metadata", metadata[0] if len(metadata) == 1 else None)
         add("draft_hc", (head[1], tail[0]) if head and tail else None)
         add("draft_to_nextmain", tail)
+        for key in ("main_inputs", "main_metadata"):
+            matches = [(int(r["start_ns"]), int(r["end_ns"])) for r in stages
+                       if r["round_id"] == round_id and r["stage_key"] == key]
+            add(key, matches[0] if len(matches) == 1 else None)
         result.append({"round_id": round_id, "regions": regions, "missing_regions": missing,
                        "scope": "Same-round saved CSV stage boundaries; HC envelopes are not full graph ranges"})
     return result
@@ -143,7 +151,7 @@ def _stage_evidence(core, entry, base):
            for key in ("main_hc", "draft_hc", "u", "cycle")},
         "closure_max_abs_ns": max((abs(r["cycle"] - r["main_hc"] - r["draft_hc"] - r["u"]) for r in paired), default=None),
         "scope": "Only same rounds with head, tail and consecutive prior tail; CSV HC envelopes, not full graph"}
-    selected = [r for r in stages if r["stage_key"] in ("draft_metadata", "main_inputs")]
+    selected = [r for r in stages if r["stage_key"] in ("draft_metadata", "main_inputs", "main_metadata")]
     result["stage7_rounds"] = sum(r["stage_key"] == "draft_metadata" for r in selected)
     if device_path is None:
         result["gap_status"] = "NO_SAVED_DEVICE_TASKS"
@@ -172,8 +180,9 @@ def _stage_evidence(core, entry, base):
                          "scope": "during_device_gap; CSV complement only, not causal Host attribution"})
     result["gaps"] = sorted([r for r in gaps if r["stage_key"] == "draft_metadata"], key=lambda r: -r["duration_ns"])[:2]
     result["main_inputs_gaps"] = sorted([r for r in gaps if r["stage_key"] == "main_inputs"], key=lambda r: -r["duration_ns"])[:1]
+    result["main_metadata_gaps"] = sorted([r for r in gaps if r["stage_key"] == "main_metadata"], key=lambda r: -r["duration_ns"])[:2]
     result["gap_count"] = len(gaps)
-    round_ids = {r["round_id"] for r in result["gaps"] + result["main_inputs_gaps"]}
+    round_ids = {r["round_id"] for r in _all_gaps(result)}
     round_ids.update(w["round_id"] for w in entry.get("windows", []) if w.get("round_id"))
     result["round_boundaries"] = _round_boundaries(stages, windows, round_ids)
     return result
@@ -252,6 +261,40 @@ def _event(core, number, raw, offset):
             "device_hint": core.residual_device_hint(raw, args)}
 
 
+def _discover_runner_lane(core, path, offset, expected, stamp, label):
+    """Identify one worker thread from this trace, without causal source links."""
+    observed, processes, scan = {}, {}, {}
+    pattern = re.compile(r"(?:^|/)(vllm/v1/worker/gpu|vllm_ascend/worker/v2)/model_runner\.py\(\d+\): execute_model$")
+    print(f"  {label}: discovering worker thread from recorded runner calls", flush=True)
+    for number, raw in enumerate(core.residual_iter_trace_events(path, stats=scan), 1):
+        if number % 100000 == 0:
+            print(f"  {label}: worker-thread discovery, {number:,} events", flush=True)
+        if raw.get("ph") == "M" and raw.get("name") == "process_name":
+            processes[core.residual_id(raw.get("pid"))] = str(core.residual_args(raw).get("name", ""))
+        if "python_function" not in re.split(r"[,; ]+", str(raw.get("cat", ""))):
+            continue
+        match = pattern.search(str(raw.get("name", "")).replace("\\", "/"))
+        if not match:
+            continue
+        e = _event(core, number, raw, offset)
+        if e is None or e["device_hint"] or e["pid"] is None or e["tid"] is None:
+            continue
+        lane = e["pid"], e["tid"]
+        kind = "gpu" if match[1].startswith("vllm/") else "ascend"
+        observed.setdefault(lane, {}).setdefault(kind, set()).add((e["start_ns"], e["end_ns"]))
+    if _stamp(core._io_path(path)) != stamp or scan.get("sha256") != expected:
+        raise ValueError("Trace changed or SHA256 differs during worker-thread discovery")
+    candidates = [{"pid": pid, "tid": tid, "runner_calls": {kind: len(calls) for kind, calls in kinds.items()}}
+                  for (pid, tid), kinds in sorted(observed.items())
+                  if not core.residual_device_process(processes.get(pid, ""))]
+    status = ("HOST_LANE_AMBIGUOUS" if len(candidates) > 1 else
+              "UNIQUE_RUNNER_LANE" if candidates and max(candidates[0]["runner_calls"].values()) >= 2 else
+              "HOST_LANE_UNCONFIRMED")
+    lanes = {(candidates[0]["pid"], candidates[0]["tid"])} if status == "UNIQUE_RUNNER_LANE" else set()
+    return lanes, {"status": status, "candidates": candidates, "sha256": expected,
+                   "scope": "Unique repeated execute_model thread in this case's SHA-matched trace; not a causal task-source link"}
+
+
 def _trace_evidence(core, entry, windows, stage7, sources, base):
     trace = entry.get("trace") or {}
     if trace.get("status") != "ALIGNED_X_EVENTS":
@@ -282,7 +325,7 @@ def _trace_evidence(core, entry, windows, stage7, sources, base):
             primary_specs.append({"window_id": w["id"], "window_kind": w["kind"], "round_id": w.get("round_id"),
                                   "function_clipped_ns": longest["ns"],
                                   "candidate_event_indexes": sorted(set(int(i) for i in longest["event_indexes"]))})
-    gaps = stage7.get("gaps", []) + stage7.get("main_inputs_gaps", [])
+    gaps = _all_gaps(stage7)
     for gap in gaps:
         for row in gap.get("following_source_links", []):
             if row.get("cpu_event_index"):
@@ -291,19 +334,38 @@ def _trace_evidence(core, entry, windows, stage7, sources, base):
         return {"status": "NO_TARGET_EVENT_INDEXES", "expected_sha256": expected}
     access = core._io_path(path)
     stamp = _stamp(access)
+    label = str(entry.get("case", "unknown"))
+    lane_selection = {"status": "WINDOW_ANCHORS", "lanes": [{"pid": pid, "tid": tid} for pid, tid in sorted(lanes)],
+                      "scope": "Recorded sample anchor threads; source links retain their original status"}
+    discovery_passes = 0
+    if not lanes:
+        lanes, lane_selection = _discover_runner_lane(core, path, offset, expected, stamp, label)
+        discovery_passes = 1
+        if not lanes:
+            return {"status": lane_selection["status"], "host_lane_selection": lane_selection,
+                    "sha256": expected, "clock_alignment_status": trace.get("status"), "passes": 1,
+                    "reason": "Cannot select a unique repeated worker thread; no Host time is attributed"}
     processes, events, scan = {}, {}, {}
     gap_candidates, gap_waits, focus_candidates = defaultdict(list), defaultdict(list), defaultdict(list)
     focus_ranges = []
     stage7_rounds = {g["round_id"] for g in stage7.get("gaps", [])}
+    tail_rounds = {g["round_id"] for key in ("main_inputs_gaps", "main_metadata_gaps") for g in stage7.get(key, [])}
+    tail_rounds.update(w["round_id"] for w in windows if w.get("round_id") and
+                       (str(w.get("kind", "")).startswith("prepare_") or w.get("kind") == "metadata_before_enqueue"))
     for boundary in stage7.get("round_boundaries", []):
-        if boundary["round_id"] not in stage7_rounds:
-            continue
         regions = {r["name"]: r for r in boundary["regions"]}
         head = regions.get("main_to_draft")
-        if head:
+        if head and boundary["round_id"] in stage7_rounds:
             focus_ranges.append({"round_id": boundary["round_id"],
                                  "start_ns": regions.get("main_hc", head)["start_ns"], "end_ns": head["end_ns"]})
-    label = str(entry.get("case", "unknown"))
+        tail, draft = regions.get("draft_to_nextmain"), regions.get("draft_hc")
+        if tail and boundary["round_id"] in tail_rounds:
+            # Preparation may finish before the draft HC even starts. Keep
+            # candidate calls from this cycle's main HC too; parent chains,
+            # not temporal position alone, distinguish their model roles.
+            start_region = regions.get("main_hc") or head or draft or tail
+            focus_ranges.append({"round_id": boundary["round_id"],
+                                 "start_ns": start_region["start_ns"], "end_ns": tail["end_ns"]})
     print(f"  {label}: scanning selected trace for wait events (pass 1/2)", flush=True)
     for number, raw in enumerate(core.residual_iter_trace_events(path, stats=scan), 1):
         if number % 100000 == 0:
@@ -320,7 +382,7 @@ def _trace_evidence(core, entry, windows, stage7, sources, base):
             for region in focus_ranges:
                 overlap = min(e["end_ns"], region["end_ns"]) - max(e["start_ns"], region["start_ns"])
                 if overlap > 0:
-                    key = region["round_id"], kind
+                    key = region["round_id"], kind, e["name"]
                     focus_candidates[key].append(e)
                     focus_candidates[key].sort(key=lambda r: (-min(r["end_ns"], region["end_ns"]) + max(r["start_ns"], region["start_ns"]), r["event_index"]))
                     del focus_candidates[key][8:]
@@ -347,12 +409,13 @@ def _trace_evidence(core, entry, windows, stage7, sources, base):
         chosen = candidates[:20]
         waits = [e for e in candidates if _is_wait(e["name"]) or _focus_kind(e["name"])]
         chosen.extend(e for e in waits[:12] if e not in chosen)
-        if gap["stage_key"] == "main_inputs":
+        if gap["stage_key"] in ("main_inputs", "main_metadata"):
             actual_waits = [e for e in candidates if _is_wait(e["name"])]
             if actual_waits:
                 longest = max(actual_waits, key=lambda e: (min(e["end_ns"], gap["end_ns"]) - max(e["start_ns"], gap["start_ns"]),
                                                           e["duration_ns"], -e["event_index"]))
-                primary_specs.append({"window_id": "device-gap:" + gap["round_id"], "window_kind": "main_inputs_device_gap",
+                primary_specs.append({"window_id": "device-gap:" + gap["stage_key"] + ":" + gap["round_id"],
+                                      "window_kind": gap["stage_key"] + "_device_gap",
                                       "round_id": gap["round_id"],
                                       "function_clipped_ns": min(longest["end_ns"], gap["end_ns"]) - max(longest["start_ns"], gap["start_ns"]),
                                       "candidate_event_indexes": [longest["event_index"]]})
@@ -365,14 +428,16 @@ def _trace_evidence(core, entry, windows, stage7, sources, base):
             events[e["event_index"]] = e
             if _is_wait(e["name"]) or _focus_kind(e["name"]):
                 targets.add(e["event_index"])
-            if _focus_kind(e["name"]) in ("run_fullgraph", "prepare_inputs"):
+            if _focus_kind(e["name"]) in ("run_fullgraph", "prepare_inputs", "prepare_attn", "build_attn_metadata"):
                 focus_calls[e["event_index"]].append({"round_id": gap["round_id"], "kind": _focus_kind(e["name"])})
-    for (round_id, kind), values in sorted(focus_candidates.items()):
+    for (round_id, kind, _name), values in sorted(focus_candidates.items()):
         eligible = [e for e in values if not e["device_hint"] and not core.residual_device_process(processes.get(e["pid"], ""))
                     and ((e["pid"], e["tid"]) in lanes or re.search(r"cann|runtime", processes.get(e["pid"], ""), re.I)
                          and any(e["tid"] == tid and e["thread_id"] in (None, tid) for pid, tid in lanes))]
-        if eligible:
-            e = eligible[0]
+        eligible = list({e["event_index"]: e for e in eligible}.values())
+        # A cycle can include main preparation and both early/padded draft
+        # metadata calls with the same path. Retain their distinct candidates.
+        for e in eligible[:4]:
             events[e["event_index"]] = e
             targets.add(e["event_index"])
             focus_calls[e["event_index"]].append({"round_id": round_id, "kind": kind})
@@ -446,6 +511,7 @@ def _trace_evidence(core, entry, windows, stage7, sources, base):
                     overlaps.append({"round_id": boundary["round_id"], "region": region["name"], "overlap_ns": amount})
         e["round_overlaps"] = overlaps
     return {"status": "VERIFIED", "sha256": expected, "clock_alignment_status": trace.get("status"),
+            "host_lane_selection": lane_selection,
             "timestamp_scope": "Saved trace timestamps plus saved constant offset; graph causality not inferred",
             "raw_time_encoding": "ts/dur are exact decimal microsecond strings; start_ns/end_ns/duration_ns are integer nanoseconds",
             "missing_target_event_indexes": sorted(targets - set(target_events)),
@@ -453,7 +519,7 @@ def _trace_evidence(core, entry, windows, stage7, sources, base):
             "primary_waits_missing": sorted(set(primary) - set(target_events)),
             "overlap_scope": "Per-event intersections with same-round CSV regions; samples only, temporal overlap is not causal proof",
             "events": [events[k] for k in sorted(events)], "wait_parent_chains": chains,
-            "passes": 2}
+            "passes": 2 + discovery_passes}
 
 
 def _chain_priority(chain):
@@ -469,7 +535,7 @@ def _prune_trace(case, omissions):
     events = trace.get("events", [])
     trace["events"] = [e for e in events if e["event_index"] in required]
     omissions["trace_events"] += len(events) - len(trace["events"])
-    for gap in (case.get("stage7") or {}).get("gaps", []) + (case.get("stage7") or {}).get("main_inputs_gaps", []):
+    for gap in _all_gaps(case.get("stage7") or {}):
         gap["host_event_indexes"] = [i for i in gap.get("host_event_indexes", []) if i in required]
 
 
@@ -528,7 +594,7 @@ def bounded_evidence(payload, limit=LIMIT):
             break
         for case in reversed(result["cases"]):
             samples = [s for g in (case.get("source_links") or {}).get("groups", {}).values() for s in g.get("samples", [])]
-            for gap in (case.get("stage7") or {}).get("gaps", []) + (case.get("stage7") or {}).get("main_inputs_gaps", []):
+            for gap in _all_gaps(case.get("stage7") or {}):
                 samples.extend(gap.get("following_source_links", []))
             for sample in samples:
                 values = sample.get("cpu_ancestors", [])
@@ -570,7 +636,7 @@ def bounded_evidence(payload, limit=LIMIT):
                 if key in case:
                     case.pop(key)
                     result["export_omissions"][key] += 1
-            for gap in (case.get("stage7") or {}).get("gaps", []) + (case.get("stage7") or {}).get("main_inputs_gaps", []):
+            for gap in _all_gaps(case.get("stage7") or {}):
                 if gap.pop("following_source_links", None) is not None:
                     result["export_omissions"]["gap_source_links"] += 1
             _prune_trace(case, result["export_omissions"])
@@ -596,7 +662,7 @@ def bounded_evidence(payload, limit=LIMIT):
                 if key in case:
                     case[key] = {"status": "OMITTED_FOR_BYTE_LIMIT"}
                     result["export_omissions"][key] += 1
-            for gap in (case.get("stage7") or {}).get("gaps", []) + (case.get("stage7") or {}).get("main_inputs_gaps", []):
+            for gap in _all_gaps(case.get("stage7") or {}):
                 gap.pop("following_source_links", None)
                 result["export_omissions"]["gap_host_event_references"] += len(gap.get("host_event_indexes", []))
                 gap["host_event_indexes"] = []
@@ -683,9 +749,11 @@ def export_existing(core, full_path, out_dir, names=None, rank=None, max_bytes=L
                 raise ValueError("Saved case rank differs from --rank")
             case["windows"] = _select_windows(entry)
             case["stage7"] = _stage_evidence(core, entry, full_path.parent)
-            case["source_links"] = _sources(core, entry, full_path.parent,
-                                            case["stage7"]["gaps"] + case["stage7"].get("main_inputs_gaps", []))
+            case["source_links"] = _sources(core, entry, full_path.parent, _all_gaps(case["stage7"]))
             case["trace_evidence"] = _trace_evidence(core, entry, case["windows"], case["stage7"], case["source_links"], full_path.parent)
+            if case["trace_evidence"].get("status") in ("HOST_LANE_AMBIGUOUS", "HOST_LANE_UNCONFIRMED"):
+                case["status"] = "ERROR"
+                case["error"] = case["trace_evidence"]["status"] + ": " + case["trace_evidence"]["reason"]
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError, csv.Error) as error:
             case["status"], case["error"] = "ERROR", type(error).__name__ + ": " + str(error)
         result["cases"].append(case)

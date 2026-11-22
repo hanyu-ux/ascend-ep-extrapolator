@@ -395,6 +395,16 @@ python -B -u .\tools\u_host_stack_probe.py --export-existing .\u_stack_s7_eviden
 
 对应样本还包含同轮的主HC、主到草稿间隔、第7阶段、草稿HC和草稿到下一主间隔的CSV边界，以及实际Host调用与这些区间的相交纳秒。主模型和草稿模型的同名函数保留完整路径；调用时间包含等待和profiler开销，嵌套函数的交集不可直接相加。第7阶段位于草稿HC之前，不能把它的缩短称为被同轮草稿HC覆盖。配对的整轮统计只使用同时具备相邻边界的轮次，不能将不同样本数的均值直接相加；HC包络仍不等同完整图，时间相交仍不证明关键路径收益。
 
+S15固定dp4的BS8／BS16对照可直接使用已有全量诊断文件：
+
+```powershell
+python -B -u .\tools\u_host_stack_probe.py --export-existing .\u_stack_all_dp4\u_host_stack_full.json --rank dp4 --case bs8-s15 --case bs16-s15 --max-bytes 262144 --out .\u_stack_s15_evidence
+```
+
+补导出覆盖第13／14阶段的独立设备空档，并从所选轮次的主HC开始至下一主HC开始的区间定向收集 `prepare_inputs`、`prepare_attn`、metadata构建及workspace API等Host事件，以保留可能在草稿HC开始前已完成的准备调用。`main_inputs`／`main_metadata`边界和第14阶段局部事件引用随裁剪同步维护；同名方法保留完整路径和多个候选，由父链确认主／草稿角色，不能仅按时间位置判断批次归属。
+
+若已有窗口无法提供Host线程（例如旧BS8-S15记录为 `NO_ATTRIBUTABLE_WINDOWS`），工具增加一次只读扫描，从本case同一SHA的trace中识别唯一、重复出现的runner `execute_model`线程。只有唯一候选且同一种runner路径至少出现两次独立调用才使用；多候选、单次或无明确runner调用均报错，不按次数最多的线程猜测。process元数据可位于trace末尾，每次扫描仍核验SHA和文件状态。该回退只识别Host线程，不把旧 `AMBIGUOUS`／`NO_TRACE_DEVICE`来源升级成因果关联，也不放宽设备时钟校验。已有有效窗口继续用原两遍扫描；缺少窗口时总计三遍读取已有trace，不需要重新采样。
+
 `20261122.1.host_source_scope` 修正了带 Python 事件时 Host 来源范围过宽的问题：来源优先使用明确的 `cpu_op`，Python 父帧仅用于诊断，不再把跨多轮的父调用当作一次提交的耗时，也不再用共同 Python 父帧确认两条 flow 相同。旧版本带 Python 采样报表中由此产生的整轮 `host_linked` 和覆盖数值应作废；定向补导出会保留旧版本号与原始来源证据，不会把旧数值伪装成已修正。U及15阶段的设备边界计算不受本次来源修复影响。两类数据应分别判断，不把来源未知当成0。
 
 ### Top8 热点的 PMU 与 bound

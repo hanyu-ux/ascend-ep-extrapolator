@@ -189,6 +189,162 @@ class ExistingStackEvidenceTests(unittest.TestCase):
             self.assertTrue(all(c["status"] == "ERROR" and "SHA256" in c["error"] for c in result["cases"]))
             self.assertTrue(all("trace_evidence" not in c for c in result["cases"]))
 
+    def unattributed_s15_fixture(self, base):
+        """Saved CSV windows are unavailable, but original timed Python calls exist."""
+        full, trace = self.fixture(base)
+        events = []
+        for offset, first_id in ((0, 10), (400, 110)):
+            # The second Host prepares attention while the previous draft HC
+            # is still executing. Function ranges are sequential/nested on
+            # this thread; device execution is independently asynchronous.
+            wait_start, wait_end = ((180, 230) if offset == 0 else (130, 145))
+            inputs_start, inputs_end = ((235, 258) if offset == 0 else (150, 170))
+            attention_start = 258 if offset == 0 else 170
+            metadata_start = 260 if offset == 0 else 175
+            api_start, api_end = ((261, 271) if offset == 0 else (180, 210))
+            events.extend([
+                event("vllm_ascend/worker/v2/model_runner.py(599): execute_model", 120 + offset, 290 + offset,
+                      **{"Python id": first_id, "Python parent id": 0}),
+                event("vllm/v1/worker/gpu/model_runner.py(1630): execute_model", 125 + offset, 285 + offset,
+                      **{"Python id": first_id + 1, "Python parent id": first_id}),
+                event("coordinator.py(10): sync_dp", wait_start - 5 + offset, wait_end + 5 + offset,
+                      **{"Python id": first_id + 2, "Python parent id": first_id + 1}),
+                event("<built-in method wait of pybind11 object>", wait_start + offset, wait_end + offset,
+                      **{"Python id": first_id + 3, "Python parent id": first_id + 2}),
+                event("vllm_ascend/worker/v2/model_runner.py(789): prepare_inputs", inputs_start + offset, inputs_end + offset,
+                      **{"Python id": first_id + 4, "Python parent id": first_id + 1}),
+                event("vllm_ascend/worker/v2/model_states/default.py(178): prepare_attn", attention_start + offset, 278 + offset,
+                      **{"Python id": first_id + 5, "Python parent id": first_id + 1}),
+                event("vllm_ascend/worker/v2/attn_utils.py(370): build_attn_metadata", attention_start + 1 + offset, 277 + offset,
+                      **{"Python id": first_id + 6, "Python parent id": first_id + 5}),
+                event("vllm_ascend/attention/mixed_quant_sparse_flash_mla.py(156): mixed_quant_sparse_flash_mla_metadata_fp8",
+                      metadata_start + offset, 275 + offset,
+                      **{"Python id": first_id + 7, "Python parent id": first_id + 6}),
+                event("AscendCL@aclnnMixedQuantSparseFlashMlaMetadataGetWorkspaceSize", api_start + offset, api_end + offset,
+                      pid=20, cat="cann_api", thread_id=7),
+            ])
+        # Metadata order must not decide which process is a worker or CANN.
+        events.extend([
+            {"ph": "M", "name": "process_name", "pid": 20, "args": {"name": "CANN"}},
+            {"ph": "M", "name": "process_name", "pid": 10, "args": {"name": "Python"}},
+        ])
+        trace.write_text(json.dumps(events), encoding="utf-8")
+        saved = json.loads(full.read_text(encoding="utf-8"))
+        saved["cases"] = saved["cases"][:1]
+        case = saved["cases"][0]
+        case.update(case="bs8-s15", S=15, status="NO_ATTRIBUTABLE_WINDOWS", windows=[])
+        case["trace"]["sha256"] = hashlib.sha256(trace.read_bytes()).hexdigest()
+        source = Path(case["stage_details"]["source_links_csv"])
+        rows(source, [{"row_index": i, "name": name, "status": "AMBIGUOUS",
+                       "reason": "saved source is not uniquely linked", "cpu_ancestors_json": "[]"}
+                      for i, name in ((1, "MlaMetadata"), (2, "Fill"), (3, "_expand_idx_mapping_kernel"), (4, "MlaMetadata"))])
+        device = Path(case["stage_details"]["device_tasks_csv"])
+        with device.open(encoding="utf-8-sig", newline="") as stream:
+            tasks = list(csv.DictReader(stream))
+        # Select hc-2 as the longest stage-14 gap; hc-1 contains this device.
+        tasks.append({"rank": "dp4", "round_id": "hc-1", "row_index": 4,
+                      "name": "MlaMetadata", "start_ns": EPOCH + 270, "end_ns": EPOCH + 278,
+                      "stream_id": 4, "task_id": 4, "model_id": 49})
+        rows(device, tasks)
+        full.write_text(json.dumps(saved), encoding="utf-8")
+        return full, trace
+
+    def test_s15_without_saved_windows_discovers_unique_worker_and_tail_metadata(self):
+        with tempfile.TemporaryDirectory(prefix="ep128 s15 missing windows ") as temporary:
+            base = Path(temporary)
+            full, trace = self.unattributed_s15_fixture(base)
+            original = {p: p.read_bytes() for p in base.iterdir() if p.is_file()}
+            scans = []
+            real_scan = core.residual_iter_trace_events
+
+            def record_scan(path, **kwargs):
+                scans.append(Path(path))
+                yield from real_scan(path, **kwargs)
+
+            with patch.object(core, "residual_iter_trace_events", side_effect=record_scan), \
+                    patch.object(core, "read_capture", side_effect=AssertionError("must not remeasure")), \
+                    patch.object(core, "measure_capture", side_effect=AssertionError("must not remeasure")):
+                result, _ = evidence.export_existing(core, full, base / "out", ["bs8-s15"], rank="dp4", max_bytes=262144)
+            case = result["cases"][0]
+            self.assertEqual(case["status"], "EXPORTED", case)
+            self.assertEqual(case["source_status"], "NO_ATTRIBUTABLE_WINDOWS")
+            self.assertEqual(case["windows"], [])
+            traced = case["trace_evidence"]
+            self.assertEqual(traced["status"], "VERIFIED")
+            self.assertEqual(traced["host_lane_selection"]["status"], "UNIQUE_RUNNER_LANE")
+            self.assertEqual(traced["passes"], 3)
+            # Windows runner temporary roots may use an 8.3 path alias.
+            # Require three reads of the same file, not identical spellings.
+            self.assertEqual(len(scans), 3)
+            self.assertTrue(all(path.samefile(trace) for path in scans))
+            events = {e["event_index"]: e for e in traced["events"]}
+            primary = traced["primary_waits_retained"]
+            self.assertTrue(primary)
+            self.assertEqual(traced["primary_waits_missing"], [])
+            self.assertTrue(any("pybind11" in events[i]["name"] for i in primary))
+            self.assertTrue(case["stage7"]["main_metadata_gaps"])
+            second = next(b for b in case["stage7"]["round_boundaries"] if b["round_id"] == "hc-2")
+            self.assertTrue({"main_inputs", "main_metadata"}.issubset({r["name"] for r in second["regions"]}))
+            attention = next(e for e in events.values()
+                             if e["name"].endswith(": prepare_attn") and e["start_ns"] == EPOCH + 570)
+            intersects = {(r["round_id"], r["region"]): r["overlap_ns"] for r in attention["round_overlaps"]}
+            self.assertEqual(intersects["hc-2", "draft_hc"], 30)
+            self.assertEqual(intersects["hc-2", "main_metadata"], 18)
+            metadata = next(e for e in events.values()
+                            if e["name"].endswith(": mixed_quant_sparse_flash_mla_metadata_fp8")
+                            and e["start_ns"] == EPOCH + 575)
+            chain = next(ch for ch in traced["wait_parent_chains"] if ch["target_event_index"] == metadata["event_index"])
+            self.assertEqual(chain["parents"][0]["relation"], "python_parent_id")
+            self.assertTrue(events[chain["parents"][0]["event_index"]]["name"].endswith(": build_attn_metadata"))
+            groups = case["source_links"]["groups"]
+            self.assertTrue(all("LINKED" not in g["status_counts"] for g in groups.values()))
+            self.assertTrue(any(g["status_counts"].get("AMBIGUOUS") for g in groups.values()))
+            self.assertEqual({p: p.read_bytes() for p in original}, original)
+
+    def test_s15_worker_discovery_rejects_multiple_lanes_even_if_one_has_one_call(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            full, trace = self.unattributed_s15_fixture(base)
+            data = json.loads(trace.read_text(encoding="utf-8"))
+            data.append(event("vllm/v1/worker/gpu/model_runner.py(1630): execute_model", 130, 280, pid=11, tid=8,
+                              **{"Python id": 1000, "Python parent id": 0}))
+            data.append({"ph": "M", "name": "process_name", "pid": 11, "args": {"name": "Python"}})
+            trace.write_text(json.dumps(data), encoding="utf-8")
+            saved = json.loads(full.read_text(encoding="utf-8"))
+            saved["cases"][0]["trace"]["sha256"] = hashlib.sha256(trace.read_bytes()).hexdigest()
+            full.write_text(json.dumps(saved), encoding="utf-8")
+            result, _ = evidence.export_existing(core, full, base / "out", ["bs8-s15"])
+            case = result["cases"][0]
+            self.assertEqual(case["status"], "ERROR")
+            self.assertEqual(case["trace_evidence"]["status"], "HOST_LANE_AMBIGUOUS")
+            self.assertFalse(case["trace_evidence"].get("events"))
+
+    def test_s15_worker_discovery_requires_repeated_calls_and_matching_trace_sha(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            full, trace = self.unattributed_s15_fixture(base)
+            source_events = json.loads(trace.read_text(encoding="utf-8"))
+            for count in (0, 1):
+                with self.subTest(runner_calls=count):
+                    data = [e for e in source_events if not str(e.get("name", "")).endswith(": execute_model")]
+                    if count:
+                        data.append(event("vllm/v1/worker/gpu/model_runner.py(1630): execute_model", 125, 285,
+                                          **{"Python id": 999, "Python parent id": 0}))
+                    trace.write_text(json.dumps(data), encoding="utf-8")
+                    saved = json.loads(full.read_text(encoding="utf-8"))
+                    saved["cases"][0]["trace"]["sha256"] = hashlib.sha256(trace.read_bytes()).hexdigest()
+                    full.write_text(json.dumps(saved), encoding="utf-8")
+                    result, _ = evidence.export_existing(core, full, base / ("out-" + str(count)), ["bs8-s15"])
+                    case = result["cases"][0]
+                    self.assertEqual(case["status"], "ERROR")
+                    self.assertEqual(case["trace_evidence"]["status"], "HOST_LANE_UNCONFIRMED")
+                    self.assertFalse(case["trace_evidence"].get("events"))
+            full, trace = self.unattributed_s15_fixture(base)
+            trace.write_bytes(trace.read_bytes() + b"\n")
+            result, _ = evidence.export_existing(core, full, base / "changed-sha", ["bs8-s15"])
+            self.assertEqual(result["cases"][0]["status"], "ERROR")
+            self.assertIn("SHA256", result["cases"][0]["error"])
+
     def test_generic_wait_gap_and_same_round_preparation_overlaps_are_retained(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
