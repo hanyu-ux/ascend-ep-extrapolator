@@ -1710,7 +1710,7 @@ class ResidualSourceTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
 
-    def source_fixture(self, *, shared=False, graph=False, ambiguous=False, origin_mode="linked"):
+    def source_fixture(self, *, shared=False, graph=False, ambiguous=False, origin_mode="linked", python_mode=None):
         capture, measured = self.matched_capture()
         targets = [task for task in capture["tasks"]
                    if task.name == "aclnnMatmul_MatMulCommon_MatMulV2"
@@ -1808,6 +1808,28 @@ class ResidualSourceTests(unittest.TestCase):
         elif origin_mode == "api_only":
             events = [event for event in events if event.get("cat") not in ("cpu_op", "async_npu", "async_task_queue")
                       and not event.get("name", "").startswith(("Enqueue@", "Dequeue@"))]
+        if python_mode:
+            events.append(event("driver.py(1): run", -100000, 1000000, 399, 399, "python_function"))
+            events.append(event("runner.py(2): prepare", -60000, -30000, 399, 399, "python_function"))
+            # Python scopes may cross the operator bounds. They are useful
+            # ancestors but cannot invalidate the independently nested ops.
+            events.append(event("helper.py(3): submit", -49000, -35000, 399, 399, "python_function"))
+            if python_mode == "mixed_category":
+                next(item for item in events if item.get("name") == "aten::linear")["cat"] = "CPU_OP;python_function"
+            elif python_mode == "wrong_flow_same_root":
+                # Retain only the wrong async origin and put it under the same
+                # long Python root as the real enqueue. A common parent ID must
+                # never make these different CPU submission scopes agree.
+                events = [item for item in events if not (item.get("cat") == "async_npu"
+                          and item.get("ph") == "s" and item.get("tid") == 399)]
+                for item in events:
+                    if item.get("name") == "WRONG_REUSED_ASYNC_ORIGIN" or (
+                            item.get("cat") == "async_npu" and item.get("ph") == "s"):
+                        item["tid"] = 399
+            elif python_mode.startswith("python_only"):
+                events = [item for item in events if item.get("cat") != "cpu_op"]
+                if python_mode == "python_only_no_node":
+                    events = [item for item in events if item.get("name") not in ("Node@launch", "CANN_PARENT")]
         events += [{"ph": "M", "name": "process_name", "pid": pid, "args": {"name": name}}
                    for pid, name in ((399, "Python"), (408831, "CANN"))]
         (self.directory / "trace_view.json").write_text(json.dumps(events), encoding="utf-8")
@@ -1881,6 +1903,54 @@ class ResidualSourceTests(unittest.TestCase):
         self.assertLess(int(links[0]["cpu_end_ns"]), RESIDUAL_EPOCH + 10000)
         self.assertEqual(int(links[0]["queue_wait_ns"]), 1500)
         self.assertEqual(int(links[0]["submit_to_device_ns"]), 55200)
+
+    def test_long_python_ancestors_do_not_replace_or_expand_cpu_operator_source(self):
+        for mode in ("long_parent", "mixed_category"):
+            with self.subTest(mode=mode):
+                result, links, _, _, _ = self.source_fixture(shared=True, python_mode=mode)
+                self.assertTrue(all(row["status"] == "LINKED" for row in links), links)
+                self.assertEqual(links[0]["cpu_name"], "aten::linear")
+                self.assertEqual(int(links[0]["cpu_end_ns"]) - int(links[0]["cpu_start_ns"]), 10000)
+                self.assertEqual(int(links[0]["source_before_window_ns"]), 60000)
+                ancestors = json.loads(links[0]["cpu_ancestors_json"])
+                self.assertIn("driver.py(1): run", [row["name"] for row in ancestors])
+                self.assertTrue(all("category" in row for row in ancestors))
+                self.assertIn("cpu_op", links[0]["cpu_category"].lower())
+                stage = next(row for row in result["stage_summary"] if row["stage_key"] == "main_logits")
+                self.assertAlmostEqual(stage["source_cpu_union_ms_mean"], .01)
+
+    def test_shared_python_root_cannot_hide_conflicting_async_cpu_origins(self):
+        result, links, _, _, _ = self.source_fixture(python_mode="wrong_flow_same_root")
+        self.assertEqual(links[0]["status"], "AMBIGUOUS", links)
+        self.assertIn("CPU flow disagrees", links[0]["reason"])
+        self.assertFalse(links[0]["cpu_event_index"])
+        stage = next(row for row in result["stage_summary"] if row["stage_key"] == "main_logits")
+        self.assertIsNone(stage["source_cpu_union_ms_mean"])
+
+    def test_python_frames_alone_keep_cpu_source_unknown(self):
+        for mode, status in (("python_only", "API_ONLY"), ("python_only_no_node", "UNLINKED")):
+            with self.subTest(mode=mode):
+                result, links, _, _, _ = self.source_fixture(python_mode=mode)
+                self.assertEqual(links[0]["status"], status, links)
+                self.assertFalse(links[0]["cpu_event_index"])
+                if status == "API_ONLY":
+                    self.assertIn("driver.py(1): run", links[0]["cpu_ancestors_json"])
+                stage = next(row for row in result["stage_summary"] if row["stage_key"] == "main_logits")
+                self.assertIsNone(stage["source_cpu_union_ms_mean"])
+
+    def test_annotation_fallback_is_specific_only_with_python_ancestors(self):
+        def scope(identity, name, start, end, category):
+            return {"id": identity, "name": name, "start": start, "end": end, "category": category}
+        outer = scope(1, "prepare", 0, 100, "user_annotation")
+        inner = scope(2, "submit", 10, 30, "user_annotation")
+        root = scope(3, "driver.py(1): run", -100, 1000, "python_function")
+        self.assertEqual(residual.residual_cpu_origin([outer, inner], 20)["id"], 1)
+        self.assertEqual(residual.residual_cpu_origin([root, outer, inner], 20, 25)["id"], 2)
+        self.assertIsNone(residual.residual_cpu_origin([root, outer, inner], 20, 35))
+        crossing = scope(4, "other_submit", 15, 40, "user_annotation")
+        self.assertIsNone(residual.residual_cpu_origin([root, outer, inner, crossing], 20))
+        profiler = scope(5, "ProfilerStep#0", 0, 100, "user_annotation")
+        self.assertIsNone(residual.residual_cpu_origin([root, profiler], 20))
 
     def test_one_api_with_multiple_device_finishes_does_not_duplicate_cpu_or_api_time(self):
         _, single, _, _, _ = self.source_fixture()

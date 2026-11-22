@@ -33,7 +33,7 @@ import time
 from ep128_attention_prepare import analyze_attention_prepare
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261118.2.clock_anchor_identity"
+PROFILE_VERSION = "20261122.1.host_source_scope"
 ACCEPTANCE_SEMANTICS = "mean_output_fraction_including_bonus"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
@@ -2139,10 +2139,12 @@ RESIDUAL_SOURCE_COUNTS = ("source_device_tasks", "source_cpu_tasks", "source_api
 RESIDUAL_SOURCE_NUMBERS = ("source_cpu_union_ms", "source_cpu_span_ms", "source_api_union_ms",
                            "source_queue_wait_union_ms", "source_submit_to_device_ms")
 RESIDUAL_SOURCE_SCOPE = ("按同次trace显式flow、connection_id和correlation_id回查设备任务的Host来源，允许提交早于U；"
-    "CPU为可见调用区间union，非CPU忙时或完整Python模块；队列等待和提交至执行是延迟，"
+    "CPU优先取唯一嵌套cpu_op链的外层；无cpu_op时无Python祖先保留annotation外层口径，"
+    "有Python祖先仅取具体且唯一的annotation。Python帧只保留为祖先，不作为来源ID或整轮Host耗时；"
+    "CPU为可见提交调用区间union，非CPU忙时；队列等待和提交至执行是延迟，"
     "各列及跨阶段不可相加到U。共享图且无来源的任务不分摊Host时间。")
 RESIDUAL_SOURCE_FIELDS = ("row_index", "name", "device_start_ns", "device_end_ns", "connection_id", "status",
-    "cpu_event_index", "cpu_name", "cpu_start_ns", "cpu_end_ns", "cpu_leaf_event_index", "cpu_leaf_name",
+    "cpu_event_index", "cpu_name", "cpu_category", "cpu_start_ns", "cpu_end_ns", "cpu_leaf_event_index", "cpu_leaf_name",
     "cpu_ancestors_json", "enqueue_event_index", "enqueue_start_ns", "enqueue_end_ns", "dequeue_event_index",
     "dequeue_start_ns", "dequeue_end_ns", "correlation_id", "node_event_index", "node_start_ns", "node_end_ns",
     "queue_wait_ns", "submit_to_device_ns", "source_before_window_ns", "reason", "flow_ids_json")
@@ -2504,6 +2506,37 @@ def residual_flags(name):
             bool(re.search(r"graph.*(?:execute|launch|replay)|(?:execute|launch|replay).*graph|aclmdl(?:RI)?Execute|rtModelExecute", name, re.I)))
 
 
+def residual_cpu_origin(chain, point, end=None):
+    """Choose a recorded submission scope, never an enclosing Python lifetime.
+
+    Torch operator chains retain their historical outer-operator accounting.
+    Explicit annotations without Python tracing retain the old outer scope too;
+    with Python ancestors, only a unique specific annotation can be selected.
+    Python call ranges remain diagnostic ancestors, not causal submission IDs.
+    """
+    def categories(row):
+        return set(re.split(r"[,; ]+", str(row.get("category", "")).lower()))
+
+    operators = [row for row in chain if "cpu_op" in categories(row)]
+    annotations = [row for row in chain if "user_annotation" in categories(row)]
+    python = any("python_function" in categories(row) for row in chain)
+    candidates = operators or annotations
+    if not candidates or any(a["end"] < b["end"] for a, b in zip(candidates, candidates[1:])):
+        return None
+    if not operators and python:
+        candidates = [row for row in candidates
+                      if not re.match(r"^ProfilerStep(?:#|$)", row["name"], re.I)
+                      and not re.search(r"^U_HOST/.*\.(?:execute_model|capture_model|_dummy_run|profile_run)$", row["name"])]
+        if not candidates:
+            return None
+        origin = candidates[-1]
+    else:
+        origin = candidates[0]
+    if origin["start"] > point or origin["end"] <= point or end is not None and origin["end"] < end:
+        return None
+    return origin
+
+
 def residual_source_rows(connection, tasks, stages, destination, progress):
     """Join explicit trace links on disk; interval indexes keep exact int64 ns.
 
@@ -2542,9 +2575,9 @@ def residual_source_rows(connection, tasks, stages, destination, progress):
 
     @lru_cache(maxsize=4096)
     def event(identity):
-        row = connection.execute("SELECT event_index,kind,pid,tid,name,start,end,connection_id,correlation_id "
+        row = connection.execute("SELECT event_index,kind,pid,tid,name,start,end,connection_id,correlation_id,category "
                                  "FROM source_events WHERE event_index=?", (identity,)).fetchone()
-        return dict(zip(("id", "kind", "pid", "tid", "name", "start", "end", "conn", "corr"), row))
+        return dict(zip(("id", "kind", "pid", "tid", "name", "start", "end", "conn", "corr", "category"), row))
 
     def containing(kind, pid, tid, start, end=None):
         vectors = intervals.get((kind, pid if kind == "cpu" else None, tid))
@@ -2556,10 +2589,7 @@ def residual_source_rows(connection, tasks, stages, destination, progress):
                 if ends[i] > start and (end is None or ends[i] >= end)]
 
     def cpu_chain(pid, tid, point):
-        rows = sorted(containing("cpu", pid, tid, point), key=lambda row: (row["start"], -row["end"], row["id"]))
-        if not rows or any(a["end"] < b["end"] for a, b in zip(rows, rows[1:])):
-            return []
-        return rows
+        return sorted(containing("cpu", pid, tid, point), key=lambda row: (row["start"], -row["end"], row["id"]))
 
     @lru_cache(maxsize=8192)
     def flow_starts(key):
@@ -2622,10 +2652,13 @@ def residual_source_rows(connection, tasks, stages, destination, progress):
                         ambiguous = True
                         reasons.append("multiple dequeue intervals contain Node")
                 queue_chain = cpu_chain(enq["pid"], enq["tid"], enq["start"]) if enq else []
-                if queue_chain and queue_chain[0]["end"] < enq["end"]:
-                    queue_chain = []
+                chain = queue_chain
+                queue_cpu = residual_cpu_origin(queue_chain, enq["start"], enq["end"]) if enq else None
+                semantic_queue = any(set(re.split(r"[,; ]+", row["category"].lower())).intersection(
+                                     ("cpu_op", "user_annotation")) for row in queue_chain)
+                if semantic_queue and queue_cpu is None:
                     ambiguous = True
-                    reasons.append("CPU source does not contain the enqueue interval")
+                    reasons.append("CPU submission scopes are not uniquely nested or do not contain the enqueue interval")
                 if enq and deq:
                     queue_flows = connection.execute("SELECT flow_key FROM source_flows WHERE ph='f' AND cat='async_task_queue' "
                         "AND pid=? AND tid=? AND stamp>=? AND stamp<?", (deq["pid"], deq["tid"], deq["start"], deq["end"])).fetchall()
@@ -2638,23 +2671,24 @@ def residual_source_rows(connection, tasks, stages, destination, progress):
                     if cat == "async_npu":
                         for p, t, stamp in flow_starts(key):
                             candidate = cpu_chain(p, t, stamp)
-                            if candidate:
-                                candidates.append(candidate)
-                if queue_chain:
-                    matching = [candidate for candidate in candidates if candidate[0]["id"] == queue_chain[0]["id"]]
+                            origin = residual_cpu_origin(candidate, stamp)
+                            if origin:
+                                candidates.append((candidate, origin))
+                if queue_cpu:
+                    matching = [candidate for candidate in candidates if candidate[1]["id"] == queue_cpu["id"]]
                     if candidates and not matching:
                         ambiguous = True
                         reasons.append("CPU flow disagrees with explicit queue source")
                     else:
-                        chain = queue_chain
-                        if len({candidate[0]["id"] for candidate in candidates}) > 1:
+                        chain, cpu = queue_chain, queue_cpu
+                        if len({candidate[1]["id"] for candidate in candidates}) > 1:
                             reasons.append("reused async flow resolved by queue correlation")
-                elif len({candidate[0]["id"] for candidate in candidates}) == 1:
-                    chain = candidates[0]
+                elif len({candidate[1]["id"] for candidate in candidates}) == 1:
+                    chain, cpu = candidates[0]
                 elif candidates:
                     ambiguous = True
                     reasons.append("multiple CPU flow origins without queue corroboration")
-                if (node and node["start"] > start or chain and chain[0]["start"] > start
+                if (node and node["start"] > start or cpu and cpu["start"] > start
                         or enq and deq and enq["start"] > deq["start"]):
                     ambiguous = True
                     reasons.append("source starts after its linked execution; causal order is inconsistent")
@@ -2663,7 +2697,6 @@ def residual_source_rows(connection, tasks, stages, destination, progress):
                     reasons.append("source chain is not unique")
                     cpu, node, enq, deq, chain = None, None, None, None, []
                 else:
-                    cpu = chain[0] if chain else None
                     graph = not node and any(cat == "HostToDevice" and not flow_starts(key) and flow_finishes(key) > 1
                                              for cat, key in finishes)
                     record["status"] = ("LINKED" if cpu and node else "CPU_ONLY" if cpu else "API_ONLY" if node else
@@ -2677,9 +2710,12 @@ def residual_source_rows(connection, tasks, stages, destination, progress):
                         record.update({prefix + "_event_index": value["id"], prefix + "_start_ns": str(value["start"]),
                                        prefix + "_end_ns": str(value["end"])})
                 if cpu:
-                    record.update(cpu_name=cpu["name"], cpu_leaf_event_index=chain[-1]["id"], cpu_leaf_name=chain[-1]["name"],
-                        cpu_ancestors_json=json.dumps([{key: value[key] for key in ("id", "name", "start", "end")}
-                                                       for value in chain], ensure_ascii=False, separators=(",", ":")))
+                    record.update(cpu_name=cpu["name"], cpu_category=cpu["category"],
+                        cpu_leaf_event_index=chain[-1]["id"], cpu_leaf_name=chain[-1]["name"])
+                if chain:
+                    record["cpu_ancestors_json"] = json.dumps(
+                        [{key: value[key] for key in ("id", "name", "start", "end", "category")} for value in chain],
+                        ensure_ascii=False, separators=(",", ":"))
                 if enq and deq:
                     record["correlation_id"] = enq["corr"]
                     if deq["start"] >= enq["end"]:
@@ -2770,7 +2806,7 @@ def residual_host_rows(path, capture, windows, uncovered, trace, offset, destina
         connection.execute("CREATE TABLE clips (window INTEGER, start INTEGER, end INTEGER)")
         connection.execute("CREATE TABLE dma_clips (window INTEGER, start INTEGER, end INTEGER)")
         connection.execute("CREATE TABLE source_events(event_index INTEGER PRIMARY KEY,kind TEXT,pid TEXT,tid TEXT,name TEXT,"
-                           "start INTEGER,end INTEGER,connection_id TEXT,correlation_id TEXT)")
+                           "start INTEGER,end INTEGER,connection_id TEXT,correlation_id TEXT,category TEXT)")
         connection.execute("CREATE TABLE source_flows(cat TEXT,flow_key TEXT,ph TEXT,pid TEXT,tid TEXT,stamp INTEGER)")
         connection.execute("CREATE TABLE source_devices(row_index INTEGER,pid TEXT,tid TEXT,start INTEGER,end INTEGER,connection_id TEXT)")
         wanted_ids = {identity for row in stages for identity in row["_task_rows"]}
@@ -2781,7 +2817,7 @@ def residual_host_rows(path, capture, windows, uncovered, trace, offset, destina
         pending, source_events, source_flows, source_devices = [], [], [], []
 
         def persist_sources():
-            for table, values, placeholders in (("source_events", source_events, "?,?,?,?,?,?,?,?,?"),
+            for table, values, placeholders in (("source_events", source_events, "?,?,?,?,?,?,?,?,?,?"),
                     ("source_flows", source_flows, "?,?,?,?,?,?"), ("source_devices", source_devices, "?,?,?,?,?,?")):
                 connection.executemany("INSERT INTO " + table + " VALUES (" + placeholders + ")", values)
                 values.clear()
@@ -2837,11 +2873,11 @@ def residual_host_rows(path, capture, windows, uncovered, trace, offset, destina
                     continue
                 category = str(event.get("cat", ""))
                 kind = ("enqueue" if name.startswith("Enqueue@") else "dequeue" if name.startswith("Dequeue@") else
-                        "node" if name.startswith("Node@") else "cpu" if set(re.split(r"[,; ]+", category)).intersection(
+                        "node" if name.startswith("Node@") else "cpu" if set(re.split(r"[,; ]+", category.lower())).intersection(
                             ("cpu_op", "python_function", "user_annotation")) else None)
                 if kind:
                     source_events.append((number, kind, pid, tid, name, left, right,
-                                          residual_id(args.get("connectionid")), residual_id(args.get("correlationid"))))
+                                          residual_id(args.get("connectionid")), residual_id(args.get("correlationid")), category))
                 if len(source_events) >= 1000:
                     persist_sources()
                 first, final = bisect.bisect_right(ends, left), bisect.bisect_left(starts, right)

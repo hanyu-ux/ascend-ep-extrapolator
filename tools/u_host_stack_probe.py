@@ -201,7 +201,10 @@ def analyze_case(item, config, base, rank, out, samples):
         entry.update(profiler_metadata=metadata, stack_metadata_verified=verified)
         if not verified:
             entry["warnings"].append("PROFILER_METADATA_MISSING_OR_INCOMPLETE")
-        if verified and case["with_stack"] is not True:
+        if metadata and any(m.get("with_modules") is True for m in metadata) and not any(m.get("with_stack") is True for m in metadata):
+            entry["warnings"].append("PYTHON_TRACING_VIA_WITH_MODULES")
+        observed_stack = {m["with_stack"] for m in metadata if m.get("with_stack") is not None}
+        if observed_stack and observed_stack != {case["with_stack"]}:
             entry["warnings"].append("MANIFEST_STACK_FLAG_DIFFERS_FROM_CAPTURE; diagnostic mode preserves both")
         model = core.referenced_object(config["sample_model"], base, "sample_model")
         core.validate_models(model, None)
@@ -322,7 +325,9 @@ def run_cases(selected, config, base, rank, out, samples, workers):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("cases", type=Path)
+    parser.add_argument("cases", type=Path, nargs="?")
+    parser.add_argument("--export-existing", type=Path,
+                        help="Read an existing u_host_stack_full.json and export selected wait/parent evidence only")
     parser.add_argument("--rank", default="dp4")
     parser.add_argument("--case", dest="names", action="append")
     parser.add_argument("--out", type=Path, default=Path("u_host_stack_dp4"))
@@ -330,6 +335,15 @@ def main(argv=None):
     parser.add_argument("--workers", type=core._cli_positive_workers, default=None,
                         help="Case analysis processes; automatic 1-2 by default, --workers 1 for serial")
     args = parser.parse_args(argv)
+    if args.export_existing is not None:
+        if args.cases is not None:
+            parser.error("Use either cases JSON or --export-existing, not both")
+        from ep128_stack_evidence import export_existing
+        result, path = export_existing(core, args.export_existing, args.out, args.names, rank=args.rank)
+        print("Evidence: " + str(path) + " (" + str(core._io_path(path).stat().st_size) + " bytes)")
+        return int(any(c["status"] == "ERROR" for c in result["cases"]))
+    if args.cases is None:
+        parser.error("Provide cases JSON, or --export-existing FULL_JSON")
     manifest = core._source_path(args.cases)
     config = json.loads(core._io_path(manifest).read_text(encoding="utf-8-sig"))
     if config.get("schema_version") != core.SCHEMA_VERSION or not isinstance(config.get("cases"), list):
