@@ -51,6 +51,7 @@ jobs:
         run: |
           python -B -S -m unittest discover -s tests -p 'test_ep128_xlsx_combo.py' -v
           python -B -S -m unittest discover -s tests -p 'test_ep128_extra_charts.py' -v
+          python -B -S -m unittest discover -s tests -p 'test_ep128_u_hotspots.py' -v
       - name: Verify BS and speculation sweep charts on Windows
         if: ${{ !cancelled() }}
         run: python -B -S -m unittest discover -s tests -p 'test_ep128*sweep*.py' -v

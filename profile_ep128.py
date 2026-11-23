@@ -33,7 +33,7 @@ import time
 from ep128_attention_prepare import analyze_attention_prepare
 
 SCHEMA_VERSION = 2
-PROFILE_VERSION = "20261122.1.host_source_scope"
+PROFILE_VERSION = "20261123.1.u_hotspots"
 ACCEPTANCE_SEMANTICS = "mean_output_fraction_including_bonus"
 METHOD1_EXTRA_US = 14.0
 ESTIMATE_XLSX = "10T模型推理估算.xlsx"
@@ -5801,7 +5801,7 @@ def report_json_payload(report):
                                                      'compute_evidence': 'compute_evidence.csv'}}
 
 
-def export_report(report, out, reference_rows, progress=None):
+def export_report(report, out, reference_rows, progress=None, u_top=5, u_rank=None):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -5824,6 +5824,10 @@ def export_report(report, out, reference_rows, progress=None):
     write('最终结果.csv', lambda path: write_csv(path, final_rows, progress=progress))
     write('report.html', lambda path: render_html(path, report))
     write('model_architecture_report.json', lambda path: atomic_json(path, report_json_payload(report), progress=progress))
+    from ep128_u_hotspots import export_u_hotspots
+    if progress is not None:
+        progress('报告导出：U主要耗时简图（只读已保存阶段均值）')
+    export_u_hotspots(report, out, top=u_top, rank=u_rank)
     kinds = ['summary', 'per_rank', 'rounds', 'layers', 'components', 'time_ledger', 'projection_details', 'review']
     kinds += ['layer_means', 'rank_estimates', 'round_estimates', 'boundary_accounting', 'compute_evidence']
     if any('step_residuals' in capture for case in report['cases'] for capture in case.get('measurements', [])):
@@ -5866,7 +5870,7 @@ def render_html(path, report):
              '<table><thead><tr>' + ''.join('<th>' + esc(key) + '</th>' for key in fields) + '</tr></thead><tbody>']
     parts.extend('<tr>' + ''.join('<td>' + esc(row.get(key)) + '</td>' for key in fields) + '</tr>' for row in rows)
     parts += ['</tbody></table><p>Q_card＝1000×BS×目标DP×Neff/(目标周期ms×目标物理卡数)。</p>',
-              '<p><a href="最终结果.csv">目标结果</a> · <a href="per_rank.csv">源基线</a> · <a href="layers.csv">源层原值</a> · <a href="round_estimates.csv">逐轮估算</a> · <a href="review.csv">复核记录</a></p>',
+              '<p><a href="u_hotspots.html">U主要耗时简图（时间＋占比）</a> · <a href="最终结果.csv">目标结果</a> · <a href="per_rank.csv">源基线</a> · <a href="layers.csv">源层原值</a> · <a href="round_estimates.csv">逐轮估算</a> · <a href="review.csv">复核记录</a></p>',
               '<small>生成时间：' + esc(report.get('generated_at')) + '</small></html>']
     atomic_text(path, '\n'.join(parts))
 
@@ -6364,11 +6368,43 @@ def main():
     parser.add_argument('--inventory', type=Path, help='查看少量CSV的字段和设备任务数量')
     parser.add_argument('--u-overlap-rank', metavar='RANK',
                         help='离线仅分析此 rank 的 U 第13/14阶段及草稿执行期间的 Host 重叠')
+    parser.add_argument('--u-hotspots-report', type=Path, metavar='REPORT',
+                        help='仅从已有报告目录或model_architecture_report.json重绘U主要耗时；不读取采样/trace')
+    parser.add_argument('--u-top', type=int, default=5, metavar='N',
+                        help='U简图展示耗时前N个父阶段，其余合计；1..15，默认5')
+    parser.add_argument('--u-hotspots-rank', metavar='RANK',
+                        help='U简图固定使用此rank；默认沿用各case保存的源rank')
+    parser.add_argument('--u-hotspots-case', action='append', metavar='CASE',
+                        help='仅重绘模式下筛选case；可重复填写')
     parser.add_argument('--workers', type=_cli_positive_workers, default=None,
                         help='总分析进程数；默认最多2，低内存自动用1；--workers 1串行')
     parser.add_argument('--parallel', choices=('case', 'rank'), default='case',
                         help='并行任务粒度；case按case并行（默认），rank用一个全局池处理各case的rank')
     args = parser.parse_args()
+    if not 1 <= args.u_top <= 15:
+        parser.error('--u-top必须为1..15的整数')
+    if args.u_hotspots_report:
+        if (args.cases or args.inventory or args.list_inputs or args.excel or args.u_overlap_rank
+                or args.bound_profile or args.comm_reference or args.workers is not None or args.parallel != 'case'):
+            parser.error('--u-hotspots-report是只读已有报告的快速重绘模式，请单独运行')
+        from ep128_u_hotspots import export_u_hotspots
+        source = args.u_hotspots_report.expanduser()
+        if _io_path(source).is_dir():
+            source = source / 'model_architecture_report.json'
+        print('U简图：只读取已有报告 ' + str(source.resolve()) + '，不读取kernel CSV或trace。', flush=True)
+        report = json.loads(_io_path(source).read_text(encoding='utf-8-sig'))
+        paths = export_u_hotspots(report, args.out, top=args.u_top, rank=args.u_hotspots_rank, names=args.u_hotspots_case)
+        matched = sum(panel['status'] == 'MATCHED' for panel in paths['panels'])
+        print(f'U简图重绘完成：{matched}/{len(paths["panels"])}个case可绘图；版本 {PROFILE_VERSION}', flush=True)
+        for panel in paths['panels']:
+            if panel['status'] != 'MATCHED':
+                print(f'  {panel["case"]} / {panel["rank"]}：未绘图；{panel["reason"]}', flush=True)
+        print('U主要耗时横向图：' + str(paths['html'].resolve()), flush=True)
+        print('可编辑Excel：' + str(paths['xlsx'].resolve()), flush=True)
+        print('时间和占比CSV：' + str(paths['csv'].resolve()), flush=True)
+        return int(not paths['panels'] or any(panel['status'] != 'MATCHED' for panel in paths['panels']))
+    if args.u_hotspots_case:
+        parser.error('--u-hotspots-case仅用于--u-hotspots-report快速重绘')
     if args.u_overlap_rank and (args.inventory or args.list_inputs or args.excel or args.bound_profile
                                 or args.comm_reference or args.workers not in (None, 1) or args.parallel != 'case'):
         parser.error('--u-overlap-rank 为单 rank 离线诊断模式，请单独运行')
@@ -6461,7 +6497,8 @@ def main():
     report = refresh_report_operator_bounds(report, bound_profile)
     for result in report['cases']:
         print_case_result(result)
-    export_report(report, args.out, reference_rows, progress=lambda message: print(message, flush=True))
+    export_report(report, args.out, reference_rows, progress=lambda message: print(message, flush=True),
+                  u_top=args.u_top, u_rank=args.u_hotspots_rank)
     print('结果: ' + str((args.out / 'report.html').resolve()), flush=True)
     if args.excel:
         build_cli_excel(report, args.out, 'layer_mean_methods')

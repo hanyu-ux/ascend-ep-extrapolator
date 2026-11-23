@@ -304,7 +304,8 @@ class ExtraResidualWorkbookTests(unittest.TestCase):
                     linked = label.find("c:tx/c:strRef/c:f", NS)
                     self.assertIsNotNone(linked)
                     self.assertTrue(linked.text.startswith("'" + EXTRA_SHEET + "'!"))
-            lower = [chart for chart in charts if chart not in combos]
+            lower = [chart for chart in charts if chart not in combos
+                     and 'U主要耗时 ·' not in ''.join(chart.find('c:chart/c:title', NS).itertext())]
             self.assertEqual(len(lower), 12)
             for chart in lower:
                 series, = chart.findall(".//c:barChart/c:ser", NS)
