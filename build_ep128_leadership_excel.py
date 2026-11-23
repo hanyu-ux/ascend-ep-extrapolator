@@ -23,7 +23,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261116.1.extra_residual_charts"
+RENDERER_VERSION = "20261123.1.u_hotspots"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -1827,6 +1827,85 @@ def _extra_stage_table(sheet, row, point, col):
         categories_ref=reference(col), values_ref=reference(col + 4), labels_ref=reference(col + 5), contiguous=contiguous)
 
 
+U_HOTSPOT_SCOPE = ("源实测U主要耗时：每个case只列耗时最大的5个父阶段，其余父阶段合并为“其他”。"
+    "横轴为毫秒；每条同时标注毫秒数和占完整U的比例，不以Top5之和作分母。"
+    "默认沿用已存源rank，case之间可能不同；横向对比同一rank可用主脚本--u-hotspots-rank离线重绘。"
+    "各图独立刻度；阶段为设备锚点间跨度，不代表完整CPU函数耗时。")
+
+
+def _u_hotspots_excel_section(sheet, row, report):
+    """Compact source-only view; existing detailed and target charts stay intact."""
+    from ep128_u_hotspots import summarize_u_hotspots
+
+    row = _note(sheet, row, "U主要耗时 · 源实测 · Top5＋其他", columns=24)
+    row = _note(sheet, row, U_HOTSPOT_SCOPE, columns=24)
+    panels = summarize_u_hotspots(report)
+    for offset in range(0, len(panels), 2):
+        next_row = row
+        for position, panel in enumerate(panels[offset:offset + 2]):
+            col = 1 + position * 12
+            title = "U主要耗时 · 源实测 · " + _text(panel["case"]) + " · rank=" + _text(panel["rank"])
+            sheet.merge(row, col, row, col + 11, title, "header").row_height(row, 42)
+            if panel["status"] != "MATCHED":
+                sheet.merge(row + 1, col, row + 4, col + 11,
+                    "未绘图；" + _text(panel["reason"]) + "。缺失项未补0。", "warning")
+                next_row = max(next_row, row + 7)
+                continue
+            sheet.merge(row + 1, col, row + 1, col + 11,
+                "U=" + format(panel["u_ms"], ".3f") + " ms；Top5占U="
+                + format(panel["top_share"], ".1%") + "；BS=" + _text(panel["bs"])
+                + "，S=" + _text(panel["S"]), "note").row_height(row + 1, 34)
+            header = row + 2
+            for first, last, text in ((0, 6, "父阶段（按耗时降序）"), (7, 7, "ms"),
+                                      (8, 8, "占U"), (9, 11, "图上标签")):
+                sheet.merge(header, col + first, header, col + last, text, "header")
+            first_row = header + 1
+            for index, item in enumerate(panel["rows"]):
+                current = first_row + index
+                sheet.merge(current, col, current, col + 6, item["label"], "body")
+                sheet.write(current, col + 7, item["value_ms"], "number")
+                sheet.write(current, col + 8, item["share_u"], "percent")
+                sheet.merge(current, col + 9, current, col + 11, item["label_text"], "body")
+                sheet.row_height(current, 35)
+            last_row = first_row + len(panel["rows"]) - 1
+            reference = "'" + sheet.name.replace("'", "''") + "'!"
+            def source(column):
+                letter = cell_reference(1, column)[:-1]
+                return reference + "$" + letter + "$" + str(first_row) + ":$" + letter + "$" + str(last_row)
+            chart_row = last_row + 2
+            sheet.add_bar_chart(title, categories=[item["label"] for item in panel["rows"]],
+                categories_ref=source(col),
+                series=[dict(name="源U父阶段耗时(ms)", values=[item["value_ms"] for item in panel["rows"]],
+                    color="168B8D", values_ref=source(col + 7),
+                    data_labels=[item["label_text"] for item in panel["rows"]], data_labels_ref=source(col + 9))],
+                anchor=(chart_row, col, chart_row + 23, col + 12), stacked=False,
+                x_axis_title="源实测阶段跨度（ms）；标签占比的分母为完整U")
+            next_row = max(next_row, chart_row + 25)
+        row = next_row
+    return row + 2
+
+
+def _u_hotspots_html(report):
+    from ep128_u_hotspots import hotspot_svg, summarize_u_hotspots
+
+    esc = lambda value: html.escape(_text(value), quote=True)
+    parts = ['<style>.u-hotspots svg{display:block;width:100%;height:auto;max-width:1200px}'
+             '.u-hotspots article{margin:24px 0;padding:12px;border:1px solid #d2dde8}</style>'
+             '<section class="u-hotspots"><h3>U主要耗时 · 源实测 · Top5＋其他</h3><p>'
+             + esc(U_HOTSPOT_SCOPE) + '</p>']
+    for panel in summarize_u_hotspots(report):
+        parts.append('<article><h4>' + esc(panel["case"] + ' · rank=' + _text(panel["rank"])) + '</h4>')
+        if panel["status"] == "MATCHED":
+            parts.append('<p>U=' + format(panel["u_ms"], '.3f') + ' ms；Top5占U='
+                         + format(panel["top_share"], '.1%') + '</p>')
+            parts.append(hotspot_svg(panel))
+        else:
+            parts.append('<p>未绘图；' + esc(panel["reason"]) + '。缺失项未补0。</p>')
+        parts.append('</article>')
+    parts.append('</section>')
+    return ''.join(parts)
+
+
 def _extra_charts_sheet(book, report):
     sheet = book.add_sheet(SHEETS[10], widths=[12] * 24, paper_size=8)
     sheet.detail_rows, sheet.report_origin = book.detail_rows, book.report_origin
@@ -1836,6 +1915,7 @@ def _extra_charts_sheet(book, report):
     sheet.add_internal_link(row, 1, "返回估算总览", SHEETS[0], "A1")
     sheet.add_internal_link(row, 7, "查看源采样基线", SHEETS[1], "A1")
     row += 2
+    row = _u_hotspots_excel_section(sheet, row, report)
     groups = _extra_residual_groups(report)
     if not groups:
         _note(sheet, row, "当前报告没有采样组合；未构造性能数据。", warning=True, columns=24)
@@ -1943,6 +2023,7 @@ def _extra_combo_svg(title, points):
 def _extra_charts_html(report):
     esc = lambda value: html.escape(_text(value), quote=True)
     parts = ['<section class="extra-charts"><h2>额外图表统计 · 外推后轮次剩余区间占比</h2><p>' + esc(EXTRA_CHART_SCOPE) + '</p>']
+    parts.append(_u_hotspots_html(report))
     for group in _extra_residual_groups(report):
         method_label = _layer_mean_name(dict(id=group["identity"]))
         parts.append('<h3>' + esc(method_label + ' · ' + group["label"]) + '</h3>')

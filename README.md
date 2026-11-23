@@ -31,6 +31,7 @@ ascend-ep-extrapolator/
 | `build_ep128_leadership_excel.py` | 从核心报告生成 Excel 与配套 HTML，不重新估算 |
 | `ep128_xlsx_writer.py` | 标准库 XLSX 写入器，支持可编辑的原生条形图和折线图 |
 | `ep128_attention_prepare.py` | Attention准备业务分组、精确整数ns覆盖与保守归属 |
+| `ep128_u_hotspots.py` | 仅用已有报告重绘 U 主要耗时横向图、时间和占比 |
 | `profile_ep128_cases.example.json` | 源/目标模型、拓扑、BS、草稿长度和有效输出长度的配置模板 |
 | `data/communication-reference.csv` | 方法2使用的原始历史通信参考表，模板已默认指向此文件 |
 | `examples/communication-reference.synthetic.csv` | **合成通信参考表**，仅演示格式和计算流程，不是历史硬件实测 |
@@ -40,7 +41,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-主脚本、Excel生成器、XLSX写入器和Attention准备识别模块应放在同一目录。统计脚本版本为 `20261118.2.clock_anchor_identity`，Excel 生成器版本为 `20261113.1.exclusive_hcpre`，写入器版本为 `20261111.1.internal_links`。
+主脚本、Excel生成器、XLSX写入器、Attention准备识别模块及U主要耗时模块应放在同一目录。统计脚本与Excel生成器版本为 `20261123.1.u_hotspots`，写入器版本为 `20261116.1.combo_charts`。
 
 ## 快速运行
 
@@ -128,6 +129,29 @@ python -u build_ep128_leadership_excel.py --report ep128_report_11/model_archite
 ```
 
 同时生成同名 HTML。旧 JSON 缺少方法3时可另加 `--add-method3` 从已保存证据补算；缺少阶段统计不能通过重绘补出实测细分。
+
+### 只看 U 的主要耗时阶段：用已有报告快速重绘
+
+主脚本额外生成 **`u_hotspots.html`、`u_hotspots.xlsx`、`u_hotspots.csv`** 和 `u_hotspots_svg/` 中的矢量图。每个 case 默认展示耗时最大的 **前5个父阶段＋其余阶段合计**，每根横条同时标注 `耗时ms · 占整个U的比例`。比例的分母是此 case、此 rank 的完整 U，不是前5项合计；保留 U1–U15 原编号，细分子项不重复相加。横条按耗时降序，其他阶段合计单列；HTML/SVG 使用统一毫秒横轴，便于比较。
+
+已有完整报告时，在 Windows PowerShell 从仓库根目录执行：
+
+```powershell
+python -B -u .\profile_ep128.py --u-hotspots-report .\ep128_report_11 --u-hotspots-rank dp4 --u-top 5 --out .\u_top_dp4
+Start-Process .\u_top_dp4\u_hotspots.html
+```
+
+`--u-hotspots-report` 可以填原报告目录，也可以填其中的 `model_architecture_report.json`，**不填 cases JSON 或 trace_view.json**。此模式只读取已保存报告，不重新扫描 kernel CSV/trace、不重新采样、不重跑外推。固定 `dp4` 时，所有 case 都只取 dp4；缺失 dp4 不借用别的 rank。不加 `--u-hotspots-rank` 则沿用各 case 原先保存的源 rank，并在图上逐项标明，不能把它误认为固定 rank 比较。
+
+只重绘 BS8-S15 和 BS16-S15，并改看前3项：
+
+```powershell
+python -B -u .\profile_ep128.py --u-hotspots-report .\ep128_report_11 --u-hotspots-rank dp4 --u-top 3 --u-hotspots-case bs8-s15 --u-hotspots-case bs16-s15 --out .\u_top_s15_dp4
+```
+
+case 名须与已有报告一致。支持 `--u-top 1..15`；15 表示展示全部父阶段。HTML 可直接打开，SVG 可插入 PPT，独立 XLSX 是可编辑的原生横向条形图，CSV 保留毫秒、占比和“其余合计”所包含的阶段编号。完整 Excel 的“额外图表统计”页页首先展示同样的源 U 前5项简图，原15阶段明细仍保留。
+
+新视图使用保存的**源阶段均值**，不要求目标外推方法可用，也不把覆盖在主/草稿 HC 内的 Host 时间再加到 U。只有每个窗口的父阶段全部匹配、样本数一致、阶段与窗口及 U 合计闭合时才画图；缺失或未识别时保留原因、数值留空，命令返回非零。重绘不会修复旧报告中已有的采样识别问题。
 
 图例中的曲线仅合并可比条件；模型、硬件/拓扑、rank覆盖或采样契约不同的组分别作图。各曲线缺少某个横坐标时留空断线，重复坐标的原始行保留，歧义曲线不取平均。不同 S 的有效输出长度继续取各 case 配置，不假设接受率固定。
 
