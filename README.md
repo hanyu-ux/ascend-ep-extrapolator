@@ -321,6 +321,25 @@ TPOT（ms/token） = R / Neff
 
 用已有 S7、S15 等采样按同一 rank 比较不同 BS，可以运行 `python profile_ep128.py cases.local.json --u-overlap-rank dp4 --out u_overlap_dp4`。此模式导出第13、14阶段的逐轮数据、按 case 汇总和 trace 证据清单。需要同次同 rank 的 `kernel_details.csv` 和 `trace_view.json`，直接复用已有采样。完整命令及列说明见[固定 rank 的第13／14阶段覆盖分析](docs/usage.md#固定-rank-的第1314阶段覆盖分析)。
 
+**完整业务泳道导出（Windows，复用已有采样）**：需要逐轮核对主模型、草稿模型、下一主模型准备及 Host 提前提交时，使用独立工具 `tools/u_swimlane_probe.py`。它直接按 cases JSON 读取同次同 rank 的 kernel CSV 和 trace，重新进行离线时钟校验与 HC 分段，不依赖旧的有界分享文件，也不启动服务、压测或重新采样。配置中的路径须指向仍可访问的原始文件。
+
+在仓库根目录的 PowerShell 中执行：
+
+```powershell
+python -B -u .\tools\u_swimlane_probe.py .\cases.local.json --rank dp4 --workers 4 --expected-cases 12 --out .\u_swimlane_all12_dp4
+```
+
+`cases.local.json` 是采样清单，不是 `trace_view.json`。工具默认处理清单中的全部 case；`--expected-cases 12` 用于核对数量，不会自动补齐缺少的组合。若要比较 BS2/4/8/16 × S7/9/15，应在清单中列出对应的12个 case。所有 case 固定使用 dp4，缺失时不借用其他 rank。
+
+输出目录包含：
+
+- `u_swimlane_dp4.json`：完整导出，保留逐轮15阶段及全部目标 Host 函数的完整起止区间，不按分享文件大小裁剪关键时序；未识别的函数或阶段保留缺失状态。
+- `u_swimlane_dp4.zip`：上述 JSON 的压缩文件，可直接传递。
+- `u_swimlane_dp4_parts_<SHA前12位>/part001.txt` 等：同一 JSON 的 gzip + Base64 无损分片，每片不超过64KiB。每个完整 JSON 使用独立的摘要子目录，重复导出不混入旧包的多余分片。
+- `u_swimlane_dp4_package.json`：当前包的 SHA-256 和分片相对路径清单。
+
+发送 ZIP 或**最新 `u_swimlane_dp4_package.json` 列出的全部文本分片**即可，不能只取第一片，也不要把不同摘要目录的分片混在一起；原始 CSV/trace 留在原位置。case 的 `READY` 表示至少一轮同时具备四条已验证 Host 业务范围和15个匹配的 U 阶段，不代表所有保留轮次均完整；`complete_rounds`、`incomplete_rounds` 分别记录两类轮次数量。导出会保留各 case 的 `PARTIAL`/`ERROR` 及原因，并继续处理其他 case；存在这些 case 状态时以非零退出码结束。时钟不匹配不会强制对齐，函数缺失、父 ID 不足或 Host lane 不唯一也不会被补成有效泳道。重新离线处理已有文件不能保证12个 case 都匹配；CPU 函数壁钟与设备阶段的时间重叠也不等于纯 CPU 忙碌或已证明的设备提交因果。
+
 脚本默认尝试对源 U1、U2 识别连续的 8+7 个父阶段，并对 Markov 逐位置选 token 保留子阶段。15阶段仅用于解释 U，**不额外加到周期上，也不改变外推结果**。
 
 U 保留下一主模型 KV/输入准备、主/草稿 metadata 的子阶段；metadata 本体与前后的映射准备分开。原始 Task Type 保留 AI_CPU 等执行类型，busy 不等于 AICORE 有效算力。详见[结果读取说明](docs/usage.md#6-如何核对结果)。
