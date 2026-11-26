@@ -66,7 +66,7 @@ def input_fixture(directory):
     case = {"name": "synthetic", "bs": 4, "draft_tokens": 7, "draft_layers": 3,
             "with_stack": True, "trim_rounds": 2}
     clock = {"status": "ALIGNED_X_EVENTS", "sha256": hashlib.sha256(trace.read_bytes()).hexdigest(),
-             "clock_offset_ns": "0", "anchor_count": 3}
+             "clock_offset_ns": "0", "anchor_count": 3, "process_names": {"10": "Python"}}
     return case, capture, measured, kernel, trace, clock
 
 

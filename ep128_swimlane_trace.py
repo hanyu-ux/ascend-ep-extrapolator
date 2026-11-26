@@ -116,6 +116,13 @@ def _kind(name):
 
 _SOURCE_IDS = ("connectionid", "correlationid", "streamid", "physicstreamid", "taskid", "modelid",
                "deviceid", "contextid", "batchid", "subtaskid", "flowid", "externalid", "sequencenumber")
+_DEVICE_IDS = {
+    "device_id": ("deviceid",), "model_id": ("modelid",),
+    "stream_id": ("physicstreamid", "streamid"), "task_id": ("taskid",),
+    "context_id": ("contextid",), "batch_id": ("batchid",),
+    "subtask_id": ("subtaskid",), "task_type": ("tasktype",),
+    "connection_id": ("connectionid",), "correlation_id": ("correlationid",),
+}
 
 
 def _source_ids(args, raw):
@@ -140,12 +147,19 @@ def _stamp(path):
     return stat.st_size, stat.st_mtime_ns
 
 
-def collect_host_events(core, trace_path, offset, expected_sha256, progress=None):
+def collect_host_events(core, trace_path, offset, expected_sha256, progress=None, *,
+                        retain_device_events=False, device_trace_metadata=None):
     """Stream every record, retaining supported Python and CPU/native calls.
 
     Event indexes remain the original one-based trace indexes, including metadata
     and non-retained events.  The source must stay stable and match its expected
     hash.  Process metadata is applied after scanning, including late M records.
+
+    Optional device retention is an independent, unfiltered trace-device
+    catalog, not inferred Host ownership. It includes DMA and unknown task
+    names even when absent from kernel CSV. Clock-scan process names classify
+    late metadata without a second pass. Source IDs and complete original
+    intervals survive; zero duration is retained and never enlarged.
     """
     if not isinstance(expected_sha256, str) or not expected_sha256:
         raise ValueError("An expected trace SHA256 is required")
@@ -154,11 +168,45 @@ def collect_host_events(core, trace_path, offset, expected_sha256, progress=None
     before = _stamp(access)
     offset = int(offset)
     events, processes, counts, scan = [], {}, Counter(), {}
+    known_processes = ({core.residual_id(pid): str(name) for pid, name in
+                        ((device_trace_metadata or {}).get("process_names") or {}).items()}
+                       if retain_device_events else {})
+    if retain_device_events and (device_trace_metadata or {}).get("sha256") not in (None, expected_sha256):
+        raise ValueError("Device process metadata SHA256 differs from the verified trace")
+    device_candidates, device_counts, device_bad_intervals = [], Counter(), Counter()
     last = time.monotonic()
     for number, raw in enumerate(core.residual_iter_trace_events(path, stats=scan), 1):
         counts["trace_events"] += 1
         if raw.get("ph") == "M" and raw.get("name") == "process_name":
             processes[core.residual_id(raw.get("pid"))] = str(core.residual_args(raw).get("name", ""))
+        if retain_device_events and raw.get("ph") == "X":
+            device_counts["scanned_x_events"] += 1
+            args = core.residual_args(raw)
+            pid, tid = core.residual_id(raw.get("pid")), core.residual_id(raw.get("tid"))
+            hint = core.residual_device_hint(raw, args)
+            process = processes.get(pid, known_processes.get(pid))
+            # Unknown processes must survive until a possible late M record.
+            # The normal caller supplies the clock scan's complete names.
+            if hint or process is None or core.residual_device_process(process):
+                try:
+                    start = core.a_ns(raw["ts"]) + offset
+                    duration = core.a_ns(raw["dur"])
+                except (KeyError, TypeError, ValueError, ArithmeticError):
+                    device_bad_intervals[(pid, hint, "invalid")] += 1
+                else:
+                    if duration < 0:
+                        device_bad_intervals[(pid, hint, "negative")] += 1
+                    else:
+                        item = {"trace_event_index": number, "event_index": number,
+                                "name": str(raw.get("name", "")), "cat": str(raw.get("cat", "")),
+                                "pid": pid, "tid": tid, "ph": "X", "ts": str(raw["ts"]), "dur": str(raw["dur"]),
+                                "start_ns": start, "end_ns": start+duration, "duration_ns": duration,
+                                "device_hint": hint, "source_ids": _source_ids(args, raw),
+                                "source_kind": "trace_device_event", "op_type": str(args.get("optype", ""))}
+                        for key, choices in _DEVICE_IDS.items():
+                            item[key] = next((core.residual_id(args[name]) for name in choices
+                                              if isinstance(args.get(name), (str, int, float, bool, Decimal))), None)
+                        device_candidates.append(item)
         categories = re.split(r"[,; ]+", str(raw.get("cat", "")))
         kind = _kind(raw.get("name", ""))
         python = "python_function" in categories
@@ -201,8 +249,41 @@ def collect_host_events(core, trace_path, offset, expected_sha256, progress=None
         retained.append(event)
         counts[event["kind"]] += 1
     counts["retained_events"] = len(retained)
-    return {"events": retained, "sha256": scan["sha256"],
-            "process_names": processes, "counts": dict(counts)}
+    result = {"events": retained, "sha256": scan["sha256"],
+              "process_names": processes, "counts": dict(counts)}
+    if retain_device_events:
+        device_events = []
+        task_types, categories = Counter(), Counter()
+        for (pid, hint, reason), count in device_bad_intervals.items():
+            process = processes.get(pid, known_processes.get(pid, ""))
+            if hint or core.residual_device_process(process):
+                key = "negative_device_duration_events" if reason == "negative" else "invalid_device_timed_events"
+            else:
+                key = "rejected_nondevice_invalid_intervals"
+            device_counts[key] += count
+        for event in device_candidates:
+            process = processes.get(event["pid"], known_processes.get(event["pid"], ""))
+            verified_process = core.residual_device_process(process)
+            if not event["device_hint"] and not verified_process:
+                device_counts["nondevice_unknown_process_candidates_rejected"] += 1
+                continue
+            event.update(process_name=process, device_process_verified=verified_process,
+                         device_classification="NATIVE_HINT_AND_PROCESS" if event["device_hint"] and verified_process else
+                                               "NATIVE_HINT" if event["device_hint"] else "TRACE_PROCESS_METADATA")
+            device_events.append(event)
+            device_counts["retained_device_x_events"] += 1
+            device_counts["zero_duration_device_events"] += int(event["duration_ns"] == 0)
+            task_types[event.get("task_type") or "unspecified"] += 1
+            categories[event.get("cat") or "unspecified"] += 1
+        result.update(trace_device_events=device_events, device_event_scan={
+            "schema": "u_trace_device_event_scan_v1", "counts": dict(device_counts),
+            "task_type_counts": dict(task_types), "category_counts": dict(categories),
+            "supported_device_phase": "X; B/E durations are not reconstructed",
+            "intervals_clipped": False, "topn_filter": False,
+            "scope": "All nonnegative-duration trace X device events, independent of Host name whitelists or CSV membership. "
+                     "Device process/native hints identify catalog entries, not their Python submitter or round. "
+                     "Negative/invalid intervals are diagnostic counts, never fabricated tasks."})
+    return result
 
 
 def _lane(event):

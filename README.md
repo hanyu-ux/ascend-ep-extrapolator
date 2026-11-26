@@ -352,17 +352,21 @@ Get-Content -LiteralPath .\u_clock_dp4_s9.json -Raw -Encoding UTF8
 
 用已有 S7、S15 等采样按同一 rank 比较不同 BS，可以运行 `python profile_ep128.py cases.local.json --u-overlap-rank dp4 --out u_overlap_dp4`。此模式导出第13、14阶段的逐轮数据、按 case 汇总和 trace 证据清单。需要同次同 rank 的 `kernel_details.csv` 和 `trace_view.json`，直接复用已有采样。完整命令及列说明见[固定 rank 的第13／14阶段覆盖分析](docs/usage.md#固定-rank-的第1314阶段覆盖分析)。
 
-**完整业务泳道导出 v3（Windows，复用已有采样）**：需要逐轮核对主模型、草稿模型、下一主模型准备及 Host 提前提交时，使用独立工具 `tools/u_swimlane_probe.py`。它直接按 cases JSON 读取同次同 rank 的 kernel CSV 和 trace，重新进行离线时钟校验与 HC 分段，输出 `u_swimlane_v3` 数据。工具保留一级子函数、前处理/DP分计，以及设备锚点的 CPU/API/队列/flow 来源诊断；v3另将 Runner `prepare_attn`（块表/slot）列为独立 Host 主线及子调用归属。不依赖旧的有界分享文件，也不启动服务、压测或重新采样。配置中的路径须指向仍可访问的原始文件。
+**完整业务泳道与全设备任务导出（Windows，复用已有采样）**：需要逐轮核对主模型、草稿模型、下一主模型准备及 Host 提前提交时，使用独立工具 `tools/u_swimlane_probe.py`。它直接按 cases JSON 读取同次同 rank 的 kernel CSV 和 trace，重新进行离线时钟校验与 HC 分段，继续输出 `u_swimlane_v3` 数据。一级子函数、前处理/DP分计、Runner `prepare_attn`（块表/slot）独立主线及已有锚点诊断继续保留；本次新增完整设备任务目录和独立的逐任务下发来源证据，覆盖 metadata 及其他 Host 函数内部任务。不依赖旧的有界分享文件，也不启动服务、压测或重新采样。配置中的路径须指向仍可访问的原始文件。
 
 在仓库根目录的 PowerShell 中执行：
 
 ```powershell
-python -B -u .\tools\u_swimlane_probe.py .\cases.local.json --rank dp4 --workers 4 --expected-cases 12 --detail-rounds 1 --out .\u_swimlane_all12_dp4
+python -X utf8 -B -u .\tools\u_swimlane_probe.py .\profile_ep128_cases.11.19.json --rank dp4 --workers 4 --expected-cases 12 --detail-rounds 0 --no-package --out .\u_swimlane_all12_dp4
 ```
 
-`cases.local.json` 是采样清单，不是 `trace_view.json`。工具默认处理清单中的全部 case；`--expected-cases 12` 用于核对数量，不会自动补齐缺少的组合。若要比较 BS2/4/8/16 × S7/9/15，应在清单中列出对应的12个 case。所有 case 固定使用 dp4，缺失时不借用其他 rank。
+`profile_ep128_cases.11.19.json` 是已有采样清单，不是 `trace_view.json`；清单文件名不同时替换为实际文件。工具默认处理清单中的全部 case；`--expected-cases 12` 用于核对数量，不会自动补齐缺少的组合。若要比较 BS2/4/8/16 × S7/9/15，应在清单中列出对应的12个 case。所有 case 固定使用 dp4，缺失时不借用其他 rank。
 
-`--detail-rounds 1` 默认每个 case 选择1个完整代表轮解析锚点来源，优先从子函数较完整的候选中选取周期中位附近的轮次。需要更多例子时可改为 `--detail-rounds 3`；选中轮次内部不裁剪来源记录。该选项只限制深入回查来源的轮数，全部保留的 HC/U 轮次及目标 Host 函数完整区间仍会导出。具备完整代表轮的对齐 case 正常对完整 trace 分四次流式扫描：时钟锚点、Host及子调用、设备锚点来源的 SQL 关联、原始来源引用与 Python 父 ID 核验；无可用设备锚点或中途失败的 case 不会强行继续。`--workers 4` 按 case 并行处理，不是重新采样。
+`--detail-rounds 0` 现在是默认值，保留全部已导出轮次的任务关联；正值如 `--detail-rounds 3` 才显式限制深入关联的轮次，优先从子函数较完整的候选中选择周期中位附近的轮次。正值只限制轮次关联，不限制全采样设备目录，也不按所选轮次裁剪任务或 Host 函数起止时间。正常对齐 case 对完整 trace 分四次流式扫描：时钟锚点、Host/子调用及设备 X 事件、全设备任务来源的 SQL 关联、原始来源引用与 Python 父 ID 核验。即使某阶段没有可用分界锚点，仍保留整份采样中的设备任务和未解析状态。`--workers 4` 按 case 并行处理，不是重新采样。
+
+完整设备目录读取该 rank **整份 CSV 中已解析的全部任务**，并加入对齐 trace 中可由设备进程元数据或原生设备特征确认的 X 事件，包括 CSV 未列出的 `MEMCPY_ASYNC`/DMA。设备任务不经过 Host 函数白名单或 U 边界筛选，不按轮次、阶段或时间区间裁剪，不做 TopN 或字节预算截断；任务在 Host 返回或 HC 周期结束后才执行，也仍保留。CSV/trace 身份可以唯一核实时合并引用；有歧义的观察单独保留，不当成额外的独立任务重复计数。零时长设备事件保留原值，负时长/非法时间只计诊断，不补造执行区间；没有 X 区间的 B/E 事件不重建成设备任务。
+
+每个 case 的 `device_task_links` 保存逐任务目录、来源链、轮次关系和未解析原因，**独立于**原有只审计 U 分界的 `anchor_links`。`EXPLICIT_SOURCE_OWNER` 需要实际 CPU/API/队列/flow 来源及 Python 父链证据；`DEVICE_CYCLE_OVERLAP`、`HOST_SCOPE_TIME_OVERLAP` 仅表示时间重合，不能证明是该函数下发。图共享无 origin、原生 ID 冲突或父链缺失均保留原状态，不能靠区间包含补成确认箭头。时钟未对齐时保留 CSV 设备目录及设备周期关系，Host 来源和 trace-only 任务保持不可用。本次先完整保留证据供后续绘图使用，**不改变现有绘图、HC/U 分段和外推统计语义**，也不意味着新增任务已全部画到图中。
 
 一级子函数按 Host 父 ID 与同线程包含关系核对。下一主调用入口至 Runner `prepare_inputs` 入口之间，分别统计前处理、DP协调及其嵌套等待，按区间 union 做互斥分解；父子调用不能直接相加。DP总调用包含本地图选择和元数据整理，不能标成纯等待；函数及子函数的 wall time 也不等于纯 CPU busy。
 
@@ -370,21 +374,23 @@ Host主线共五条：`propose`、前处理/DP聚合范围、Runner `prepare_inp
 
 输出目录包含：
 
-- `u_swimlane_dp4.json`：完整导出，保留逐轮15阶段及全部目标 Host 函数的完整起止区间，不按分享文件大小裁剪关键时序；未识别的函数或阶段保留缺失状态。
-- `u_swimlane_dp4.zip`：上述 JSON 的压缩文件，可直接传递。
-- `u_swimlane_dp4_parts_<SHA前12位>/part001.txt` 等：同一 JSON 的 gzip + Base64 无损分片，每片不超过64KiB。每个完整 JSON 使用独立的摘要子目录，重复导出不混入旧包的多余分片。
-- `u_swimlane_dp4_package.json`：当前包的 SHA-256 和分片相对路径清单。
-- `u_swimlane_dp4_status.csv`：各 case 的主线 `status`、子函数 `detail_status` 和独立的 `anchor_link_status`。
+- `u_swimlane_dp4.json`：完整导出，保留逐轮15阶段、全部目标 Host 函数完整区间、`anchor_links` 及新增 `device_task_links`，不按分享文件大小裁剪关键时序；未识别/未解析项保留缺失状态。
+- `u_swimlane_dp4_device_tasks.csv`：设备任务目录，含完整起止/时长、任务标识和来源状态；用 `source_kind`、`csv_row_index`、`trace_event_index` 区分 CSV 与 trace-only 任务。
+- `u_swimlane_dp4_task_sources.csv`：逐任务来源索引，含 CPU/API、Node、enqueue/dequeue、connection/correlation/flow 标识及 Host 归属诊断；完整原始事件/父链仍在 JSON 中。
+- `u_swimlane_dp4_task_rounds.csv`：任务与轮次/Host 范围的关联索引，明确区分来源归属证明与设备周期/Host 时间重合；一项任务可以有多种关系，不强制一对一。
+- `u_swimlane_dp4_status.csv`：各 case 的主线 `status`、子函数 `detail_status`、独立的 `anchor_link_status`、`device_task_status` 及任务/来源计数。
+
+上述命令的 `--no-package` 适合在内网直接检查 JSON/CSV 和后续本地绘图，不生成 ZIP 或 Base64 碎片。只有省略该选项时才另生成 `u_swimlane_dp4.zip`、`u_swimlane_dp4_parts_<SHA前12位>/part001.txt` 等无损分片及 `u_swimlane_dp4_package.json` 清单；每片不超过64KiB，不同完整 JSON 使用不同摘要目录。
 
 上述文件是完整本地诊断存档。包含全部轮次时，文本分片可能达到数百片；只有复制文本能力的环境不要逐片传这个全历史包。原始CSV/trace和完整JSON保留内网。
 
-**已经完成完整导出，只需给PPT提供12个case的代表轮证据时**，运行下面的轻量分享工具。它只读现有`u_swimlane_dp4.json`，不重扫CSV/trace、不重新采样；每个case选原建议轮（优先已有来源解析的轮），保存完整HC/U边界、五条Host线、该轮全部已记录子调用和来源引用闭包。缩小体积依靠选轮、过滤其他轮事件及去除重复字段，不按字节预算删函数/父链或裁剪所选区间。错误case也保留原时钟诊断及设备侧一轮，Host保持未知；不把`PARTIAL`提升为已确认。
+**已经完成完整导出，只需给PPT提供12个case的代表轮证据时**，运行下面的轻量分享工具。它只读现有`u_swimlane_dp4.json`，不重扫CSV/trace、不重新采样；每个case选原建议轮（优先已有来源解析的轮），保存完整HC/U边界、五条Host线、该轮全部已记录子调用和来源引用闭包。新工具还保留 `device_task_links` 中已绑定到所选轮的全部任务、内部任务与逐任务来源，包括由该轮 Host 下发、但在其返回或周期结束后才执行的任务；按已有关系选取，不重新靠时间猜归属。缩小体积依靠选轮、过滤其他轮事件及去除重复字段，不按字节预算删函数/父链或裁剪所选区间；原目录规模、未选任务数及歧义上下文另有记录。错误case也保留原时钟诊断及设备侧一轮，Host保持未知；不把`PARTIAL`提升为已确认。
 
 ```powershell
 python -X utf8 -B -u .\tools\u_swimlane_share.py .\u_swimlane_all12_dp4\u_swimlane_dp4.json --rank dp4 --expected-cases 12 --out .\u_swimlane_ppt_dp4
 ```
 
-第一个参数是**已经导出的完整JSON**，不是cases清单或`part001.txt`。将示例路径替换为实际完整导出目录。v2导出的原始Host事件已保留runner attn，分享工具会用完整事件集合重新核对同轮父链，恢复第五条线，不需要重扫trace；歧义候选在过滤前判定，不因分享包变小而被误认为唯一。
+第一个参数是**已经导出的完整JSON**，不是cases清单或`part001.txt`。将示例路径替换为实际完整导出目录。v2导出的原始Host事件已保留runner attn，分享工具会用完整事件集合重新核对同轮父链，恢复第五条线，不需要重扫trace；歧义候选在过滤前判定，不因分享包变小而被误认为唯一。旧 JSON 若只有 `anchor_links`，分享工具不能凭空补出未导出的内部设备任务；要补齐需先用上面的新导出命令离线重读已有 CSV/trace，仍不需要重新采样。
 
 新分享包为`u_swimlane_ppt_evidence_v1`，明确不是全历史；每case标明源轮数及未选轮数。`host_children`不再与`host_pairing.child_layer`存两份，子调用名称/起止等相同字段从`host_events`事件表引用恢复，归属和父链证据仍保存。`u_swimlane_ppt_dp4_package.json`列出本次**代表轮分享包**的实际文本片数和全部路径。每片最多64KiB，片数取决于保留证据，不承诺固定一片。重新包装成功退出码为0只表示分享包已写出，原case的`CLOCK_MISMATCH`等状态不会被改变。
 
@@ -398,7 +404,7 @@ Get-Content -LiteralPath (Join-Path .\u_swimlane_ppt_dp4 $uShareParts[0]) -Raw -
 
 按环境已有的文本传递方式发送完整`{"schema":...}`内容，并按清单依次显示其余片；不传ZIP，不混用不同摘要目录的分片。
 
-三个状态应分开读取：主线 `status=READY` 表示至少一轮同时具备四个已验证Host函数、前处理/DP聚合范围（共五条主线）和15个匹配的U阶段，不代表所有保留轮次均完整；`complete_rounds`、`incomplete_rounds` 分别记录两类轮次数量。`detail_status=READY` 另要求前处理/DP区间可互斥拆分，且 `propose`、Runner `prepare_inputs`、Runner `prepare_attn`、model-state `prepare_attn` 四条主函数均有可用的一级子调用。`anchor_link_status` 单独说明设备来源的完整程度，缺少来源不改变主线READY，也不等于设备箭头已被确认。
+状态应分开读取：主线 `status=READY` 表示至少一轮同时具备四个已验证Host函数、前处理/DP聚合范围（共五条主线）和15个匹配的U阶段，不代表所有保留轮次均完整；`complete_rounds`、`incomplete_rounds` 分别记录两类轮次数量。`detail_status=READY` 另要求前处理/DP区间可互斥拆分，且 `propose`、Runner `prepare_inputs`、Runner `prepare_attn`、model-state `prepare_attn` 四条主函数均有可用的一级子调用。`anchor_link_status` 说明 U 分界锚点来源，`device_task_status` 和逐任务 `source_status` 说明全任务目录及来源解析状态；缺少来源不改变主线READY，也不等于设备箭头已被确认。
 
 导出会保留各 case 的主线 `PARTIAL`/`ERROR` 及原因，并继续处理其他 case；存在这些主线状态时以非零退出码结束。时钟不匹配不会强制对齐，函数缺失、父 ID 不足或 Host lane 不唯一也不会被补成有效泳道。来源诊断有错误或缺失时仍保留有效的 Host/HC 坐标，单独查看其来源状态，不能只凭退出码判断因果链完整。重新离线处理已有文件不能保证12个 case 都匹配。
 

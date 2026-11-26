@@ -1,17 +1,18 @@
-"""Conservative submission evidence for saved swimlane device anchors.
+"""Conservative submission evidence for saved swimlane tasks and anchors.
 
-The core owns all flow/connection/queue resolution.  This module requests only
-device anchors, preserves the core's status, and separately checks whether an
-exported Python function has an explicit parent-ID path to the recorded source.
+The core owns all flow/connection/queue resolution.  The full exporter requests
+every device task and projects legacy anchor evidence from the same resolution.
+Python ownership still requires an explicit parent-ID path to the source.
 An interval containing an API is useful context, never a verified caller.
 """
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from copy import deepcopy
 import csv
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 
 _IDENTITY_FIELDS = (
@@ -126,11 +127,29 @@ def _parse_source(row):
     return result
 
 
-def _read_evidence_events(core, trace_path, trace_meta, wanted, progress):
+def _read_evidence_events(core, trace_path, trace_meta, wanted, progress, *, source_links=()):
     """Enrich only original source/ancestor references; never invent flow edges."""
     access = core._io_path(trace_path)
     before, scan, found = _stamp(access), {}, {}
+    flow_keys = {key for link in source_links for key in link.get("flow_ids", [])}
+    flow_events = []
     for number, raw in enumerate(core.residual_iter_trace_events(trace_path, stats=scan), 1):
+        if source_links and raw.get("ph") in ("s", "f"):
+            identity = raw.get("id", raw.get("id2"))
+            category = str(raw.get("cat", ""))
+            key = json.dumps([category, raw.get("name"), raw.get("scope"), identity],
+                             ensure_ascii=False, default=str, separators=(",", ":"))
+            if identity is not None and (key in flow_keys or category == "async_task_queue"):
+                try:
+                    stamp = core.a_ns(raw["ts"]) + int(trace_meta["clock_offset_ns"])
+                except (KeyError, TypeError, ValueError, ArithmeticError):
+                    continue
+                flow_events.append({"event_index": number, "name": str(raw.get("name", "")),
+                    "cat": category, "ph": raw["ph"], "flow_key": key,
+                    "flow_id": json.loads(json.dumps(identity, default=str)),
+                    "pid": core.residual_id(raw.get("pid")), "tid": core.residual_id(raw.get("tid")),
+                    "start_ns": stamp, "end_ns": stamp, "duration_ns": 0,
+                    "scope": "Original trace flow endpoint; retention does not upgrade the core source status"})
         if number in wanted and raw.get("ph") == "X":
             args = core.residual_args(raw)
             try:
@@ -152,6 +171,18 @@ def _read_evidence_events(core, trace_path, trace_meta, wanted, progress):
             progress("Anchor source references: " + format(number, ",") + " events")
     if _stamp(access) != before or scan.get("sha256") != trace_meta["sha256"]:
         raise ValueError("Trace changed or SHA256 differs during anchor-source enrichment")
+    if source_links:
+        queues = {link.get(key) for link in source_links for key in ("enqueue_event_index", "dequeue_event_index")}
+        intervals = _HostIntervals([{**found[i], "cat": "python_function"} for i in queues if i in found])
+        # A flow point can be recorded exactly at the API/queue scope end.
+        # Retain such points as audit candidates; core causal checks remain
+        # unchanged, so keeping endpoints does not prove a submission chain.
+        queue_keys = {e["flow_key"] for e in flow_events if e["cat"] == "async_task_queue"
+                      and intervals.containing(e, include_end=True)}
+        selected_flow_keys = flow_keys | queue_keys
+        # Retain every endpoint of a selected/shared ID, rather than one nearby
+        # pair that could falsely turn reused graph flow IDs into unique proof.
+        found.update({e["event_index"]: e for e in flow_events if e["flow_key"] in selected_flow_keys})
     return found
 
 
@@ -170,10 +201,11 @@ class _HostIntervals:
                 prefix.append(maximum)
             self.lanes[lane] = group, [int(e["start_ns"]) for e in group], prefix
 
-    def containing(self, event):
+    def containing(self, event, *, include_end=False):
         group, starts, prefix = self.lanes.get((str(event.get("pid")), str(event.get("tid"))), ([], [], []))
         start, end = int(event["start_ns"]), int(event["end_ns"])
-        first, stop = bisect_right(prefix, start), bisect_right(starts, start)
+        first = (bisect_left if include_end else bisect_right)(prefix, start)
+        stop = bisect_right(starts, start)
         return [e for e in group[first:stop] if int(e["end_ns"]) >= end]
 
 
@@ -328,4 +360,390 @@ def export_anchor_links(core, capture, rounds, host_events, trace_path, trace_me
                   source_task_status_counts=dict(Counter(link["status"] for link in links)),
                   missing_host_event_indexes=sorted({int(e["event_index"]) for e in host_events} - raw.keys()))
     result["drawable_edges"] = _drawable_edges(links, bindings)
+    return result
+
+
+def _round_scopes(rounds, host_events):
+    """Recorded family roots, not a claim that every overlap is submission."""
+    events = {int(event["event_index"]): event for event in host_events}
+    result = []
+    for row in rounds:
+        pair = row.get("host_pairing") or {}
+        selected = dict(pair.get("functions") or {})
+        selected.update({"context_"+key: value for key, value in (pair.get("context") or {}).items()})
+        seen = set()
+        for role, number in selected.items():
+            if number is None or int(number) not in events or (role, int(number)) in seen:
+                continue
+            seen.add((role, int(number)))
+            event = events[int(number)]
+            result.append({"round_id": row["round_id"], "role": role,
+                           "workload_round": "n" if role in ("outer_propose", "context_current_execute", "context_current_sample") else "n+1",
+                           "host_event_index": int(number), "name": event.get("name"),
+                           "start_ns": int(event["start_ns"]), "end_ns": int(event["end_ns"])})
+        for role, lane in (row.get("host_lanes") or {}).items():
+            number = lane.get("event_index", lane.get("start_event_index"))
+            if number is None:
+                number = (pair.get("functions") or {}).get(role)
+            if number is None or (role, int(number)) in seen:
+                continue
+            seen.add((role, int(number)))
+            result.append({"round_id": row["round_id"], "role": role,
+                           "workload_round": "n" if role == "outer_propose" else "n+1",
+                           "host_event_index": int(number), "name": events.get(int(number), {}).get("name"),
+                           "start_ns": int(lane["start_ns"]), "end_ns": int(lane["end_ns"])})
+    return result
+
+
+def _overlap(left, right, start, end):
+    """Half-open spans; a zero-duration event is an observation at one point."""
+    return left < end and right > start if left != right else start <= left < end
+
+
+def _temporal_bindings(tasks, rounds, scopes=()):
+    result = []
+    for task in tasks:
+        a, b = int(task["start_ns"]), int(task["end_ns"])
+        identity = {"task_key": task["task_key"], "row_index": task["row_index"],
+                    "csv_row_index": task.get("csv_row_index"), "trace_event_index": task.get("trace_event_index")}
+        for row in rounds:
+            left, right = int(row["start_ns"]), int(row["end_ns"])
+            if not _overlap(a, b, left, right):
+                continue
+            stages = []
+            for window in row.get("u_windows") or []:
+                for stage in window.get("stages") or []:
+                    start, end = int(stage["start_ns"]), int(stage["end_ns"])
+                    if _overlap(a, b, start, end):
+                        stages.append({"stage_number": stage.get("stage_number"), "stage_key": stage.get("stage_key"),
+                            "window_key": window.get("window_key"), "status": stage.get("status"),
+                            "overlap_start_ns": max(a, start), "overlap_end_ns": min(b, end),
+                            "overlap_duration_ns": max(0, min(b, end)-max(a, start))})
+            result.append({**identity, "round_id": row["round_id"], "relation": "DEVICE_CYCLE_OVERLAP",
+                           "runtime_submission_confirmed": False, "overlap_start_ns": max(a, left),
+                           "overlap_end_ns": min(b, right), "overlap_duration_ns": max(0, min(b, right)-max(a, left)),
+                           "u_stage_overlaps": stages,
+                           "hc_region_overlaps": [name for name, region in (row.get("regions") or {}).items()
+                               if _overlap(a, b, int(region["start_ns"]), int(region["end_ns"]))],
+                           "scope": "Device execution intersects the cycle; this does not identify its Host submitter or a global batch"})
+        for scope in scopes:
+            if _overlap(a, b, scope["start_ns"], scope["end_ns"]):
+                result.append({**identity, "round_id": scope["round_id"], "role": scope["role"],
+                    "workload_round": scope["workload_round"], "host_event_index": scope["host_event_index"],
+                    "relation": "HOST_SCOPE_TIME_OVERLAP", "runtime_submission_confirmed": False,
+                    "overlap_start_ns": max(a, scope["start_ns"]), "overlap_end_ns": min(b, scope["end_ns"]),
+                    "overlap_duration_ns": max(0, min(b, scope["end_ns"])-max(a, scope["start_ns"])),
+                    "scope": "Execution-time overlap only; asynchronous submission can precede execution and other functions can overlap"})
+    return result
+
+
+def _catalog(capture, trace_device_events=()):
+    """Unfiltered CSV catalog plus device observations missing from that CSV.
+
+    Negative row IDs are internal resolver keys for trace-only observations;
+    ``csv_row_index`` remains None and ``task_key`` is a namespaced identity.
+    Ambiguous trace/CSV observations are preserved without counting them as a
+    definitely independent physical task.
+    """
+    tasks, resolver, counts, by_shape = [], [], Counter(), defaultdict(list)
+    csv_tasks = list(capture.get("tasks") or [])
+    multiplicity = Counter(int(t.row_index) for t in csv_tasks)
+    for task in csv_tasks:
+        row = int(task.row_index)
+        counts[row] += 1
+        key = "csv:"+str(row) + (":duplicate:"+str(counts[row]) if multiplicity[row] > 1 else "")
+        record = {**_task_identity(task), "task_key": key, "source_kind": "KERNEL_CSV",
+                  "csv_row_index": row, "trace_event_index": None, "trace_event_indexes": [],
+                  "catalog_identity_status": "AMBIGUOUS_CSV_ROW" if multiplicity[row] > 1 else "CSV_ROW_IDENTITY",
+                  "counts_as_independent_task": multiplicity[row] == 1}
+        tasks.append(record)
+        by_shape[(task.name, int(task.start_ns), int(task.end_ns))].append(record)
+        if multiplicity[row] == 1:
+            resolver.append(task)
+    observations, ambiguous, zero_duration = [], [], 0
+    used_trace_ids = set()
+    for raw in trace_device_events:
+        event = deepcopy(raw)
+        number = int(event.get("trace_event_index", event.get("event_index")))
+        if number <= 0 or number in used_trace_ids:
+            raise ValueError("Trace device event indexes must be unique positive original indexes")
+        used_trace_ids.add(number)
+        a, b = int(event["start_ns"]), int(event["end_ns"])
+        if b < a:
+            raise ValueError("Reversed trace device interval")
+        zero_duration += int(a == b)
+        candidates = []
+        for candidate in by_shape.get((event["name"], a, b), []):
+            if all(candidate.get(k) is None or event.get(k) is None or str(candidate[k]) == str(event[k])
+                   for k in ("stream_id", "task_id", "model_id", "device_id")):
+                candidates.append(candidate)
+        event.update(trace_event_index=number, task_key="trace:"+str(number),
+                     candidate_task_keys=[c["task_key"] for c in candidates])
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            candidate["trace_event_indexes"].append(number)
+            event.update(catalog_match_status="CSV_MATCH", represented_by_task_key=candidate["task_key"])
+        elif candidates:
+            event.update(catalog_match_status="AMBIGUOUS_CSV_MATCH", counts_as_independent_task=False)
+            ambiguous.append(deepcopy(event))
+            for candidate in candidates:
+                # A duplicate CSV row remains ambiguous even before matching a
+                # trace event; do not erase that original identity diagnostic.
+                if candidate["catalog_identity_status"] != "AMBIGUOUS_CSV_ROW":
+                    candidate["catalog_identity_status"] = "AMBIGUOUS_TRACE_CSV_MATCH"
+                candidate["counts_as_independent_task"] = False
+        else:
+            # Core source resolution expects row_index but uses only name, exact
+            # timestamps and native identities to match the original trace.
+            fields = {key: event.get(key) for key in _IDENTITY_FIELDS}
+            fields.update(row_index=-number, row_indices=[-number], name=event["name"],
+                          op_type=event.get("op_type", event.get("task_type", "TRACE_DEVICE")),
+                          start_ns=a, end_ns=b)
+            resolver.append(SimpleNamespace(**fields))
+            record = {**fields, "task_key": event["task_key"], "source_kind": "TRACE_ONLY",
+                      "csv_row_index": None, "trace_event_index": number, "trace_event_indexes": [number],
+                      "row_indices": [], "catalog_identity_status": "TRACE_EVENT_IDENTITY",
+                      "counts_as_independent_task": True, "category": event.get("cat"),
+                      "trace_pid": event.get("pid"), "trace_tid": event.get("tid"),
+                      "connection_id": event.get("connection_id"), "correlation_id": event.get("correlation_id")}
+            tasks.append(record)
+            event.update(catalog_match_status="TRACE_ONLY", represented_by_task_key=record["task_key"])
+        observations.append(event)
+    return tasks, resolver, observations, ambiguous, zero_duration
+
+
+def export_device_catalog(capture, rounds, *, trace_device_events=(), trace_meta=None, offset=None):
+    """Device-only catalog, with trace observations only under a verified clock.
+
+    The caller may retain an already SHA-checked collector snapshot before
+    source resolution. This protects parsed DMA and other trace-only tasks if
+    source resolution later fails, without exposing untrusted Host evidence.
+    """
+    trace_device_events = list(trace_device_events)
+    if trace_device_events:
+        if (not trace_meta or trace_meta.get("status") != "ALIGNED_X_EVENTS" or not trace_meta.get("sha256")
+                or offset is None or int(offset) != int(trace_meta.get("clock_offset_ns", offset))):
+            raise ValueError("Aligned trace metadata, SHA256 and matching offset required for trace device snapshot")
+    tasks, _, observations, ambiguous, zeros = _catalog(capture, trace_device_events)
+    result = {"schema": "u_swimlane_device_task_links_v1", "status": "DEVICE_ONLY",
+            "catalog_scope": "All parsed selected-rank kernel CSV tasks plus already verified trace-only device observations; full intervals retained, no task-name or time filtering" if trace_device_events else
+                             "All parsed tasks in the selected rank kernel CSV; full intervals retained, no task-name or time filtering",
+            "device_tasks": tasks, "links": [], "source_events": [], "task_edges": [],
+            "task_round_bindings": _temporal_bindings(tasks, rounds),
+            "trace_device_observations": observations, "ambiguous_trace_device_observations": ambiguous,
+            "trace_zero_duration_observations": zeros,
+            "trace_only_task_status": "RETAINED" if trace_device_events else "UNAVAILABLE_CLOCK_UNALIGNED_OR_NOT_SCANNED",
+            "evidence_omitted": False, "scan_passes": 0, "task_count": len(tasks),
+            "limitations": ["DEVICE_CYCLE_OVERLAP describes time context only, not a Host submission.",
+                            "No trace-only device coordinates or Host sources are trusted without aligned trace evidence."]}
+    if trace_device_events:
+        result.update(trace_sha256=trace_meta["sha256"], clock_alignment_status=trace_meta["status"])
+    return result
+
+
+def _source_status(links):
+    statuses = Counter(link["status"] for link in links)
+    return ("COMPLETE" if links and statuses["LINKED"] == len(links) else
+            "PARTIAL" if any(statuses[k] for k in ("LINKED", "CPU_ONLY", "API_ONLY")) else "UNAVAILABLE")
+
+
+def export_device_task_links(core, capture, rounds, host_events, trace_path, trace_meta,
+                             offset, directory, progress=None, *, trace_device_events=()):
+    """Resolve every catalog task, including interior kernels and trace-only DMA.
+
+    The unchanged core joins all capture tasks, not a stage-boundary whitelist.
+    Keeping the full rank catalog also retains delayed asynchronous tasks that
+    execute outside a selected cycle. Round/context bindings are separately
+    labeled as temporal candidates or explicit source-owner proof.
+    """
+    if trace_meta.get("status") != "ALIGNED_X_EVENTS" or not trace_meta.get("sha256"):
+        raise ValueError("Aligned trace metadata and SHA256 are required for device task links")
+    if offset is None or int(offset) != int(trace_meta.get("clock_offset_ns", offset)):
+        raise ValueError("Device task source clock offset differs from the verified trace")
+    trace_device_events = list(trace_device_events)
+    metadata = deepcopy(trace_meta)
+    metadata["clock_offset_ns"] = str(int(offset))
+    catalog, resolver_tasks, observations, ambiguous, zeros = _catalog(capture, trace_device_events)
+    scopes = _round_scopes(rounds, host_events)
+    bindings = _temporal_bindings(catalog, rounds, scopes)
+    anchor_bindings, anchor_tasks = _device_anchors(core, capture, rounds)
+    result = {"schema": "u_swimlane_device_task_links_v1", "device_tasks": catalog,
+              "links": [], "source_events": [], "task_edges": [], "task_round_bindings": bindings,
+              "trace_device_observations": observations, "ambiguous_trace_device_observations": ambiguous,
+              "trace_sha256": metadata["sha256"], "clock_alignment_status": metadata["status"],
+              "trace_only_task_status": "RETAINED" if trace_device_events else "NOT_REQUESTED",
+              "trace_zero_duration_observations": zeros, "evidence_omitted": False,
+              "catalog_scope": "All parsed selected-rank kernel CSV tasks plus aligned trace-only device X-event observations; no task-name, time, stage or record-budget filtering",
+              "source_resolution_scope": "All catalog tasks sent once to the unchanged flow/connection/queue resolver, including tasks outside selected Host and device cycles",
+              "scan_passes": 0, "host_family_scopes": scopes, "task_count": len(catalog),
+              "limitations": [*_LIMITATIONS,
+                "Only DEVICE_CYCLE_OVERLAP and HOST_SCOPE_TIME_OVERLAP are time context; they never identify a submitter.",
+                "EXPLICIT_SOURCE_OWNER requires complete recorded source and Python parent evidence; containment remains a candidate.",
+                "Trace-only internal negative row IDs are not CSV rows; task_key/csv_row_index/trace_event_index distinguish their provenance.",
+                "An ambiguous trace/CSV identity is a retained observation, not an additional proven independent task.",
+                "Zero-duration device observations remain in the catalog, but the existing source resolver does not resolve zero-duration X events."]}
+    directory = core._io_path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory/"device-tasks-host-events.csv"
+    protected = {core._source_path(trace_path)}
+    if capture.get("path"):
+        protected.add(core._source_path(capture["path"]))
+    for output in (destination, directory/"device-tasks-source-links.csv"):
+        if core._source_path(output) in protected:
+            raise ValueError("Device task evidence output overlaps a source input")
+    all_capture = {**capture, "tasks": resolver_tasks}
+    # A single synthetic owner per task requests every task without enlarging U.
+    requests = [{"round_id": "device-task:"+str(t.row_index), "window_key": "source_only",
+                 "start_ns": str(t.start_ns), "end_ns": str(t.end_ns), "_task_rows": [t.row_index],
+                 "_uncovered": [], "no_recorded_ms": 0.} for t in resolver_tasks]
+    summary = {"source_status": "UNAVAILABLE", "source_links_csv": None, "source_reason": "No resolvable catalog tasks"}
+    if resolver_tasks:
+        before = _stamp(core._io_path(trace_path))
+        if progress:
+            progress("Resolve full device catalog: " + format(len(resolver_tasks), ",") + " tasks")
+        summary = core.residual_host_rows(trace_path, all_capture, [], [], metadata, int(offset),
+                                          destination, directory, progress, requests)
+        if _stamp(core._io_path(trace_path)) != before:
+            raise ValueError("Trace changed during full device-source resolution")
+        result["scan_passes"] = 1
+    source_rows = []
+    if summary.get("source_links_csv"):
+        with core._io_path(summary["source_links_csv"]).open(encoding="utf-8-sig", newline="") as stream:
+            source_rows = [_parse_source(row) for row in csv.DictReader(stream)]
+        if {link["row_index"] for link in source_rows} != {int(t.row_index) for t in resolver_tasks}:
+            raise ValueError("Core source diagnostics lost a requested catalog task")
+    wanted = {int(e["event_index"]) for e in host_events}
+    for link in source_rows:
+        wanted.update(link[key] for key in _INDEX_FIELDS if link.get(key) is not None)
+        wanted.update(int(e["id"]) for e in link["cpu_ancestors"])
+    raw = {}
+    if resolver_tasks:
+        if progress:
+            progress("Verify full device-catalog source/parent references")
+        raw = _read_evidence_events(core, trace_path, metadata, wanted, progress, source_links=source_rows)
+        result["scan_passes"] = 2
+    # Include all recorded Python ancestors recovered by core, even if the old
+    # five-lane recognizer did not whitelist their names.
+    python_hosts = {int(event["event_index"]): event for event in host_events}
+    python_hosts.update({number: event for number, event in raw.items() if "python_function" in event.get("cat", "").lower()})
+    index, identities = _HostIntervals(python_hosts.values()), _python_identities(raw)
+    flows_by_key, queues_by_lane = defaultdict(list), defaultdict(list)
+    for event in raw.values():
+        if event.get("ph") in ("s", "f"):
+            flows_by_key[event["flow_key"]].append(event["event_index"])
+            if event.get("cat") == "async_task_queue":
+                queues_by_lane[(event["pid"], event["tid"])].append(event)
+    for events in queues_by_lane.values():
+        events.sort(key=lambda e: (e["start_ns"], e["event_index"]))
+    queue_starts = {lane: [e["start_ns"] for e in events] for lane, events in queues_by_lane.items()}
+    by_row = {link["row_index"]: link for link in source_rows}
+    scopes_by_id = defaultdict(list)
+    for scope in scopes:
+        scopes_by_id[scope["host_event_index"]].append(scope)
+    task_links, edges = [], []
+    temporal_rounds = defaultdict(set)
+    for binding in bindings:
+        temporal_rounds[binding["task_key"]].add(binding["round_id"])
+    for task in catalog:
+        original = by_row.get(task["row_index"]) if task["catalog_identity_status"] != "AMBIGUOUS_CSV_ROW" else None
+        link = deepcopy(original) if original else {"row_index": task["row_index"], "name": task["name"],
+            "device_start_ns": task["start_ns"], "device_end_ns": task["end_ns"],
+            "status": "AMBIGUOUS" if task["catalog_identity_status"] == "AMBIGUOUS_CSV_ROW" else "UNAVAILABLE",
+            "reason": "Duplicate CSV row identity" if task["catalog_identity_status"] == "AMBIGUOUS_CSV_ROW" else summary.get("source_reason"),
+            "cpu_ancestors": [], "flow_ids": []}
+        link.update(task_key=task["task_key"], csv_row_index=task.get("csv_row_index"),
+                    trace_event_index=task.get("trace_event_index"), source_kind=task["source_kind"])
+        invalid_identity = (task["catalog_identity_status"] == "AMBIGUOUS_TRACE_CSV_MATCH" or
+                            trace_device_events and task["source_kind"] == "KERNEL_CSV" and
+                            not task["trace_event_indexes"] and original and original.get("status") != "NO_TRACE_DEVICE")
+        if invalid_identity:
+            # The legacy resolver lacks a CSV/trace catalog cross-check on
+            # device_id and can match two unknown-ID rows to one trace event.
+            # Preserve its diagnostic candidate without claiming a source for
+            # a catalog identity that cannot be uniquely established.
+            link["rejected_core_source_candidate"] = deepcopy(original)
+            link["original_core_source_status"] = link.get("status")
+            link.update(status="AMBIGUOUS" if task["catalog_identity_status"] == "AMBIGUOUS_TRACE_CSV_MATCH" else "NO_TRACE_DEVICE",
+                        reason="Trace/CSV native device identity is not uniquely compatible", cpu_ancestors=[], flow_ids=[])
+            for key in (*_INDEX_FIELDS, *_NS_FIELDS, "cpu_name", "cpu_leaf_name", "cpu_category", "connection_id", "correlation_id"):
+                if key not in ("device_start_ns", "device_end_ns"):
+                    link[key] = None
+        selected_flows = set(link.get("flow_ids", []))
+        for field in ("enqueue_event_index", "dequeue_event_index"):
+            event = raw.get(link.get(field))
+            if event is None:
+                continue
+            lane = event["pid"], event["tid"]
+            events, starts = queues_by_lane.get(lane, []), queue_starts.get(lane, [])
+            # Evidence candidates include both scope endpoints. This list is
+            # provenance retention only, not input to the core source resolver.
+            first, stop = bisect_left(starts, event["start_ns"]), bisect_right(starts, event["end_ns"])
+            selected_flows.update(e["flow_key"] for e in events[first:stop])
+        link["flow_event_indexes"] = sorted({i for key in selected_flows for i in flows_by_key.get(key, [])})
+        link["source_event_indexes"] = sorted({link[k] for k in _INDEX_FIELDS if link.get(k) is not None}
+                                              | {int(e["id"]) for e in link.get("cpu_ancestors", [])}
+                                              | set(link["flow_event_indexes"]))
+        link["missing_source_event_indexes"] = sorted(set(link["source_event_indexes"]) - raw.keys())
+        link["host_associations"] = _associations(link, raw, identities, index) if original else []
+        linked_rounds = set()
+        for association in link["host_associations"]:
+            for scope in scopes_by_id.get(association["host_event_index"], []):
+                confirmed = association["runtime_submission_confirmed"] is True
+                bindings.append({"round_id": scope["round_id"], "role": scope["role"], "workload_round": scope["workload_round"],
+                    "task_key": task["task_key"], "row_index": task["row_index"], "csv_row_index": task.get("csv_row_index"),
+                    "trace_event_index": task.get("trace_event_index"), "host_event_index": association["host_event_index"],
+                    "source_event_index": association["source_event_index"], "host_relation": association["relation"],
+                    "relation": "EXPLICIT_SOURCE_OWNER" if confirmed else "HOST_SOURCE_TIME_CONTAINMENT_ONLY",
+                    "runtime_submission_confirmed": confirmed,
+                    "explicit_parent_event_indexes": association.get("explicit_parent_event_indexes", []),
+                    "scope": "Recorded Host/source owner" if confirmed else "Containing Host scope only; caller and round ownership unproven"})
+                linked_rounds.add(scope["round_id"])
+        link["task_round_ids"] = sorted(temporal_rounds[task["task_key"]] | linked_rounds)
+        for association in link["host_associations"]:
+            # A task can overlap several rounds and have unrelated containing
+            # scopes. Only this association's family owner (or an explicitly
+            # recorded ancestor of this exact source/Host path) binds its edge.
+            edge_rounds = {s["round_id"] for s in scopes_by_id.get(association["host_event_index"], [])}
+            if association["runtime_submission_confirmed"]:
+                for owner in link["host_associations"]:
+                    if (owner["runtime_submission_confirmed"]
+                            and owner["source_event_index"] == association["source_event_index"]
+                            and association["host_event_index"] in owner.get("explicit_parent_event_indexes", [])):
+                        edge_rounds.update(s["round_id"] for s in scopes_by_id.get(owner["host_event_index"], []))
+            edges.append({**deepcopy(association), "task_key": task["task_key"], "row_index": task["row_index"],
+                          "csv_row_index": task.get("csv_row_index"), "trace_event_index": task.get("trace_event_index"),
+                          "source_status": link["status"], "round_ids": sorted(edge_rounds),
+                          "device_start_ns": task["start_ns"], "device_end_ns": task["end_ns"],
+                          "edge_kind": "HOST_TO_DEVICE_TASK", "target": "whole device task, not a U boundary"})
+        task_links.append(link)
+    result.update(links=task_links, task_edges=edges, source_events=[raw[k] for k in sorted(raw)],
+                  status=_source_status(task_links), source_status=_source_status(task_links),
+                  core_source_status=summary["source_status"],
+                  source_scope=summary.get("source_scope"), source_reason=summary.get("source_reason"),
+                  source_task_status_counts=dict(Counter(link["status"] for link in task_links)),
+                  missing_host_event_indexes=sorted({int(e["event_index"]) for e in host_events}-raw.keys()))
+    # Project old boundary-only evidence from the same resolution pass. Legacy
+    # consumers keep their original endpoint/arrow semantics and do not trigger
+    # a second full trace scan.
+    anchor_rows = {int(t.row_index) for t in anchor_tasks}
+    old_links = [deepcopy(link) for link in task_links if link.get("csv_row_index") in anchor_rows]
+    for link in old_links:
+        link["anchor_binding_indexes"] = [i for i, binding in enumerate(anchor_bindings)
+                                         if link["row_index"] in binding["device_row_indexes"]]
+    old_references = {int(e["event_index"]) for e in host_events}
+    for link in old_links:
+        old_references.update(link.get("source_event_indexes", []))
+    old_source_status = _source_status(old_links)
+    anchor_status = ("PARTIAL" if old_source_status == "COMPLETE" and any(
+        b["status"] not in ("EXACT_SOURCE_ROW", "HC_MARKER_TIMESTAMP_UNIQUE") for b in anchor_bindings) else old_source_status)
+    result["anchor_links"] = {"schema": "u_swimlane_anchor_links_v1", "anchor_bindings": anchor_bindings,
+        "device_tasks": [_task_identity(t) for t in anchor_tasks], "links": old_links,
+        "source_events": [raw[k] for k in sorted(old_references) if k in raw],
+        "drawable_edges": _drawable_edges(old_links, anchor_bindings),
+        "trace_sha256": metadata["sha256"], "clock_alignment_status": metadata["status"],
+        "status": anchor_status, "source_status": old_source_status, "scan_passes": 0,
+        "source_scope": summary.get("source_scope"), "source_reason": summary.get("source_reason"),
+        "anchor_status_counts": dict(Counter(b["status"] for b in anchor_bindings)),
+        "source_task_status_counts": dict(Counter(link["status"] for link in old_links)),
+        "evidence_omitted": False, "resolution_reused_from": "device_task_links", "limitations": list(_LIMITATIONS)}
     return result
