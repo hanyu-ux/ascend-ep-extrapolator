@@ -41,7 +41,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-主脚本、Excel生成器、XLSX写入器、Attention准备识别模块及U主要耗时模块应放在同一目录。统计脚本与Excel生成器版本为 `20261123.1.u_hotspots`，写入器版本为 `20261116.1.combo_charts`。
+主脚本、Excel生成器、XLSX写入器、Attention准备识别模块及U主要耗时模块应放在同一目录。统计核心版本为 `20261123.1.u_hotspots`，Excel生成器为 `20261126.1.swimlane_charts`，写入器为 `20261126.1.native_vectors`；泳道绘图还需同步`ep128_swimlane_plot.py`、`ep128_swimlane_excel.py`及已有泳道证据模块。
 
 ## 快速运行
 
@@ -318,6 +318,26 @@ TPOT（ms/token） = R / Neff
 例如 `R=52 ms`、`Neff=5.2`，则 `TPOT=10 ms/token`。**TPOT 不再除 BS 或 DP**；它是周期与有效输出长度折算值，不是 HTTP 客户端逐 token 时间戳直接测量值。只有目标 DP 等于目标物理卡数时，单卡公式才可简化为 `1000×BS×Neff/R`。
 
 ## U 的15阶段与外推边界
+
+**直接在内网画Host/HC/U泳道，不必传出文本分片。** 已有完整`u_swimlane_dp4.json`或代表轮`u_swimlane_ppt_dp4.json`时，主脚本可以仅读JSON生成Excel和离线HTML，不读原CSV/trace，不重新采样。优先用已生成的代表轮JSON，避免重复加载数百MB全历史文件：
+
+```powershell
+python -X utf8 -B -u .\profile_ep128.py --u-swimlane-json .\u_swimlane_ppt_dp4\u_swimlane_ppt_dp4.json --u-swimlane-rank dp4 --out .\u_swimlane_charts_dp4
+```
+
+输出`u_swimlane_charts_dp4/u_swimlane.xlsx`和`u_swimlane.html`。独立模式的工作簿只含“额外图表统计”页，上方排列全部case的统一毫秒轴总览，随后连续排列各case放大图，底部保留全部已导出的子调用及来源候选明细；总览、放大图和明细间有内部跳转。一个工作表可以向下滚动，不表示把12份细节硬挤在一张打印纸里。
+
+**要保留原完整报表的11个工作表，并把泳道加进其“额外图表统计”页**，同一命令再加已有核心报告路径：
+
+```powershell
+python -X utf8 -B -u .\profile_ep128.py --u-swimlane-json .\u_swimlane_ppt_dp4\u_swimlane_ppt_dp4.json --u-swimlane-rank dp4 --u-swimlane-report .\ep128_report_11\model_architecture_report.json --out .\ep128_report_with_swimlane
+```
+
+也可直接用Excel生成器`--report 原报告.json --swimlane-json 泳道.json --swimlane-rank dp4 --out 新报表.xlsx`。该模式从已有核心JSON重建完整Excel；不修改输入报告或原XLSX，不改变已有外推值。泳道代表轮与方法页的外推均值分别标注，不把单轮值写回外推。输出目录应与输入JSON分开。
+
+图使用Excel原生矢量形状，函数名、子调用、竖分界和箭头可缩放；HTML复用同一几何。五条Host线分别为`propose`、下一轮前处理/DP聚合、Runner输入、Runner块表/slot、model-state metadata。U前8段与后7段沿用原设备锚点，竖线贯穿CPU/NPU；Host按函数着色，不按HC重叠染色。DP总范围、已验证wait及协调外wall分别显示，嵌套子调用不能相加。图只展开一层有语义的子函数，透明wrapper折叠；全部已保留子调用及精确时间在同页底部表中，图中省略的长名称可回查完整名称。
+
+来源箭头每条Host线只举一例，完整候选另表保留。原来源链、显式Host身份/父链、唯一同轮设备边界及必需事件均完整时才画实线；推断和不完整来源画虚线。没有来源不补造箭头。HC包络不代表完整FULL图或连续设备busy；留白不等于设备idle。`CLOCK_MISMATCH`等case仍显示错误，Host和关联箭头留空，设备侧已有边界可以展示。绘图返回0只表示文件生成成功，不表示这些缺失已经修复；两种模型的FULL graph设置不受绘图影响。
 
 用已有 S7、S15 等采样按同一 rank 比较不同 BS，可以运行 `python profile_ep128.py cases.local.json --u-overlap-rank dp4 --out u_overlap_dp4`。此模式导出第13、14阶段的逐轮数据、按 case 汇总和 trace 证据清单。需要同次同 rank 的 `kernel_details.csv` 和 `trace_view.json`，直接复用已有采样。完整命令及列说明见[固定 rank 的第13／14阶段覆盖分析](docs/usage.md#固定-rank-的第1314阶段覆盖分析)。
 

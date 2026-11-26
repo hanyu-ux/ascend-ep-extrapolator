@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
-WRITER_VERSION = "20261116.1.combo_charts"
+WRITER_VERSION = "20261126.1.native_vectors"
 MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -385,7 +385,7 @@ def _combo_chart_xml(spec):
     return root
 
 
-def _chart_drawing_xml(charts):
+def _chart_drawing_xml(charts, vector_drawings=(), worksheet=None):
     root = ET.Element("{" + DRAWING + "}wsDr")
     for index, spec in enumerate(charts, 1):
         node = _drawing_node(root, DRAWING, "twoCellAnchor", {"editAs": "oneCell"})
@@ -405,7 +405,194 @@ def _chart_drawing_xml(charts):
         data = _art_node(graphic, "graphicData", {"uri": CHART})
         _chart_node(data, "chart", {"{" + REL + "}id": "rId" + str(index)})
         _drawing_node(node, DRAWING, "clientData")
+    if vector_drawings and worksheet is None:
+        raise ValueError("Vector drawings require their worksheet dimensions")
+    shape_id = len(charts) + 1
+    for spec in vector_drawings:
+        shape_id = _vector_drawing_xml(root, spec, worksheet, shape_id)
     return root
+
+
+_EMU_PER_PIXEL = 9525
+_EMU_PER_POINT = 12700
+
+
+def _vector_color(value):
+    if value is None:
+        return None
+    value = str(value).removeprefix("#").upper()
+    if not re.fullmatch(r"[0-9A-F]{6}", value):
+        raise ValueError("Vector colors must be six hexadecimal RGB digits or None")
+    return value
+
+
+def _vector_number(value, label, minimum=None, maximum=None):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value):
+        raise ValueError("Vector " + label + " must be a finite number")
+    if minimum is not None and value < minimum or maximum is not None and value > maximum:
+        raise ValueError("Vector " + label + " is outside its allowed range")
+    return float(value)
+
+
+def _vector_elements(elements, view_box):
+    """Normalize only plain geometry/text, without interpreting external content."""
+    if not isinstance(view_box, (list, tuple)) or len(view_box) not in (2, 4):
+        raise ValueError("Vector view_box requires (width,height) or (x,y,width,height)")
+    box = (0, 0, *view_box) if len(view_box) == 2 else tuple(view_box)
+    x0, y0, width, height = [_vector_number(v, "view_box") for v in box]
+    if width <= 0 or height <= 0:
+        raise ValueError("Vector view_box must have positive width and height")
+    if not isinstance(elements, (list, tuple)) or not elements:
+        raise ValueError("Vector elements must be a nonempty sequence")
+    result = []
+    for supplied in elements:
+        if not isinstance(supplied, dict):
+            raise ValueError("Vector elements must be dictionaries")
+        kind = supplied.get("type")
+        if kind not in ("rect", "line", "text"):
+            raise ValueError("Vector type must be rect, line or text")
+        item = {"type": kind, "name": _text(supplied.get("name", kind)),
+                "description": _text(supplied.get("description", ""))}
+        if kind == "line":
+            for key in ("x1", "y1", "x2", "y2"):
+                item[key] = _vector_number(supplied.get(key), key)
+            a, b = sorted((item["x1"], item["x2"]))
+            c, d = sorted((item["y1"], item["y2"]))
+            if a == b and c == d:
+                raise ValueError("Vector line endpoints must differ")
+            arrow = supplied.get("arrow", "none")
+            if supplied.get("arrow_start") is True or supplied.get("arrow_end") is True:
+                arrow = ("both" if supplied.get("arrow_start") and supplied.get("arrow_end") else
+                         "start" if supplied.get("arrow_start") else "end")
+            if arrow not in ("none", "start", "end", "both"):
+                raise ValueError("Vector arrow must be none, start, end or both")
+            item["arrow"] = arrow
+        else:
+            for key in ("x", "y", "width", "height"):
+                item[key] = _vector_number(supplied.get(key), key)
+            if item["width"] <= 0 or item["height"] <= 0:
+                raise ValueError("Vector rectangle/text bounds must have positive width and height")
+            a, b, c, d = item["x"], item["x"] + item["width"], item["y"], item["y"] + item["height"]
+        epsilon = max(width, height, 1) * 1e-12
+        if a < x0 - epsilon or b > x0 + width + epsilon or c < y0 - epsilon or d > y0 + height + epsilon:
+            raise ValueError("Vector element falls outside view_box; enlarge the canvas instead of clipping")
+        opacity = _vector_number(supplied.get("opacity", 1), "opacity", 0, 1)
+        item.update(fill=_vector_color(supplied.get("fill")), stroke=_vector_color(
+            supplied.get("stroke", "64748B" if kind == "line" else None)),
+            stroke_width=_vector_number(supplied.get("stroke_width", 1), "stroke_width", 0, 1000),
+            fill_opacity=_vector_number(supplied.get("fill_opacity", opacity), "fill_opacity", 0, 1),
+            stroke_opacity=_vector_number(supplied.get("stroke_opacity", opacity), "stroke_opacity", 0, 1))
+        dash = supplied.get("dash", "solid")
+        dash = "dash" if dash is True else "solid" if dash is False else dash
+        if dash not in ("solid", "dash", "dot"):
+            raise ValueError("Vector dash must be solid, dash, dot or Boolean")
+        item["dash"] = dash
+        if kind == "text" or "text" in supplied:
+            item.update(text=_text(supplied.get("text", "")),
+                        font_size=_vector_number(supplied.get("font_size", 10), "font_size", 1, 400),
+                        color=_vector_color(supplied.get("color", "172B4D")),
+                        font_face=_text(supplied.get("font_face", "微软雅黑")),
+                        bold=bool(supplied.get("bold", False)), align=supplied.get("align", "left"),
+                        valign=supplied.get("valign", "center"))
+            if item["align"] not in ("left", "center", "right") or item["valign"] not in ("top", "center", "bottom"):
+                raise ValueError("Vector text requires left/center/right alignment and top/center/bottom vertical alignment")
+        result.append(item)
+    return result, (x0, y0, width, height)
+
+
+def _vector_fill(parent, color, opacity=1):
+    if color is None:
+        _art_node(parent, "noFill")
+    else:
+        color_node = _art_node(_art_node(parent, "solidFill"), "srgbClr", {"val": color})
+        if opacity != 1:
+            _art_node(color_node, "alpha", {"val": round(opacity * 100000)})
+
+
+def _vector_text(shape, item):
+    body = _drawing_node(shape, DRAWING, "txBody")
+    _art_node(body, "bodyPr", {"wrap": "square", "lIns": 0, "rIns": 0, "tIns": 0, "bIns": 0,
+                               "anchor": {"top": "t", "center": "ctr", "bottom": "b"}[item["valign"]]})
+    _art_node(body, "lstStyle")
+    for text in item["text"].replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        paragraph = _art_node(body, "p")
+        _art_node(paragraph, "pPr", {"algn": {"left": "l", "center": "ctr", "right": "r"}[item["align"]]})
+        run = _art_node(paragraph, "r")
+        style = _art_node(run, "rPr", {"lang": "zh-CN", "sz": round(item["font_size"] * 100),
+                                       "b": int(item["bold"])})
+        _vector_fill(style, item["color"])
+        _art_node(style, "latin", {"typeface": item["font_face"]})
+        _art_node(style, "ea", {"typeface": item["font_face"]})
+        _art_node(run, "t", {"{" + XML + "}space": "preserve"}, text)
+
+
+def _vector_shape(parent, item, identity):
+    shape = _drawing_node(parent, DRAWING, "sp")
+    properties = _drawing_node(shape, DRAWING, "nvSpPr")
+    _drawing_node(properties, DRAWING, "cNvPr", {"id": identity, "name": item["name"] + " " + str(identity),
+                                                "descr": item["description"]})
+    _drawing_node(properties, DRAWING, "cNvSpPr", {"txBox": int(item["type"] == "text")})
+    style = _drawing_node(shape, DRAWING, "spPr")
+    attrs = {}
+    if item["type"] == "line":
+        a, b, c, d = item["x1"], item["x2"], item["y1"], item["y2"]
+        if b < a:
+            attrs["flipH"] = 1
+        if d < c:
+            attrs["flipV"] = 1
+        x, y, width, height = min(a, b), min(c, d), abs(b-a), abs(d-c)
+    else:
+        x, y, width, height = (item[key] for key in ("x", "y", "width", "height"))
+    transform = _art_node(style, "xfrm", attrs)
+    _art_node(transform, "off", {"x": round(x * _EMU_PER_PIXEL), "y": round(y * _EMU_PER_PIXEL)})
+    _art_node(transform, "ext", {"cx": round(width * _EMU_PER_PIXEL), "cy": round(height * _EMU_PER_PIXEL)})
+    _art_node(_art_node(style, "prstGeom", {"prst": "line" if item["type"] == "line" else "rect"}), "avLst")
+    _vector_fill(style, item["fill"] if item["type"] != "line" else None, item["fill_opacity"])
+    stroke = _art_node(style, "ln", {"w": round(item["stroke_width"] * _EMU_PER_PIXEL)})
+    _vector_fill(stroke, item["stroke"] if item["stroke_width"] else None, item["stroke_opacity"])
+    _art_node(stroke, "prstDash", {"val": item["dash"]})
+    if item["type"] == "line":
+        _art_node(stroke, "headEnd", {"type": "triangle" if item["arrow"] in ("start", "both") else "none"})
+        _art_node(stroke, "tailEnd", {"type": "triangle" if item["arrow"] in ("end", "both") else "none"})
+    if "text" in item:
+        _vector_text(shape, item)
+
+
+def _column_pixels(width):
+    return int(width * 12 + .5) if width < 1 else int(width * 7 + .5) + 5
+
+
+def _vector_drawing_xml(root, spec, worksheet, identity):
+    """One grouped native panel, scaled from logical pixels into its cell frame."""
+    node = _drawing_node(root, DRAWING, "twoCellAnchor", {"editAs": "oneCell"})
+    r1, c1, r2, c2 = spec["anchor"]
+    for label, row, col in (("from", r1, c1), ("to", r2, c2)):
+        corner = _drawing_node(node, DRAWING, label)
+        for key, value in (("col", col-1), ("colOff", 0), ("row", row-1), ("rowOff", 0)):
+            _drawing_node(corner, DRAWING, key, text=value)
+    def x_coordinate(col):
+        return (_column_pixels(8.43) * (col-1) + sum(_column_pixels(width)-_column_pixels(8.43)
+            for width in worksheet.widths[:col-1])) * _EMU_PER_PIXEL
+    def y_coordinate(row):
+        return round((20 * (row-1) + sum(height-20 for number, height in worksheet.heights.items()
+                                       if number < row)) * _EMU_PER_POINT)
+    x0, y0, width, height = spec["view_box"]
+    group = _drawing_node(node, DRAWING, "grpSp")
+    properties = _drawing_node(group, DRAWING, "nvGrpSpPr")
+    _drawing_node(properties, DRAWING, "cNvPr", {"id": identity, "name": "Vector panel " + str(identity),
+                                                "descr": spec["description"]})
+    _drawing_node(properties, DRAWING, "cNvGrpSpPr")
+    transform = _art_node(_drawing_node(group, DRAWING, "grpSpPr"), "xfrm")
+    _art_node(transform, "off", {"x": x_coordinate(c1), "y": y_coordinate(r1)})
+    _art_node(transform, "ext", {"cx": x_coordinate(c2)-x_coordinate(c1), "cy": y_coordinate(r2)-y_coordinate(r1)})
+    _art_node(transform, "chOff", {"x": round(x0 * _EMU_PER_PIXEL), "y": round(y0 * _EMU_PER_PIXEL)})
+    _art_node(transform, "chExt", {"cx": round(width * _EMU_PER_PIXEL), "cy": round(height * _EMU_PER_PIXEL)})
+    identity += 1
+    for item in spec["elements"]:
+        _vector_shape(group, item, identity)
+        identity += 1
+    _drawing_node(node, DRAWING, "clientData")
+    return identity
 
 
 def _text(value):
@@ -577,6 +764,7 @@ class Worksheet:
         self.heights = {}
         self.frozen = (0, 0)
         self.charts = []
+        self.vector_drawings = []
         self.internal_links = {}
 
     def _check_position(self, row, col):
@@ -674,6 +862,28 @@ class Worksheet:
         return self._add_chart("bar", title, categories, series, anchor, stacked=stacked,
                                x_axis_title=x_axis_title, categories_ref=categories_ref,
                                value_format=value_format)
+
+    def add_vector_drawing(self, elements, view_box, anchor, description=""):
+        """Add grouped, editable native rect/text/line shapes to this sheet.
+
+        ``view_box`` is logical pixel ``(width,height)`` or ``(x,y,width,height)``;
+        ``anchor`` is the same one-based ``(r1,c1,r2,c2)`` frame used by charts.
+        Coordinates stay continuous rather than being rounded to cell columns.
+        Text is plain DrawingML text, never a formula, hyperlink or external SVG.
+        Callers must enlarge the canvas for out-of-bounds geometry; no element
+        or time interval is silently clipped. Geometry is copied on insertion.
+        """
+        if not isinstance(anchor, (list, tuple)) or len(anchor) != 4:
+            raise ValueError("Vector drawing anchor requires four one-based coordinates")
+        r1, c1, r2, c2 = anchor
+        self._check_position(r1, c1)
+        self._check_position(r2, c2)
+        if r1 >= r2 or c1 >= c2:
+            raise ValueError("Vector drawing anchor must have positive height and width")
+        normalized, box = _vector_elements(elements, view_box)
+        self.vector_drawings.append({"elements": normalized, "view_box": box,
+                                     "anchor": tuple(anchor), "description": _text(description)})
+        return self
 
     def add_line_chart(self, title, categories, series, anchor, x_axis_title="BS",
                        y_axis_title="", categories_ref=None):
@@ -820,9 +1030,11 @@ class Worksheet:
 
     def _extent(self):
         return (max([1, *self.heights, *(row for row, _ in self.cells), *(m[2] for m in self.merges),
-                     *(chart["anchor"][2] for chart in self.charts)]),
+                     *(chart["anchor"][2] for chart in self.charts),
+                     *(drawing["anchor"][2] for drawing in self.vector_drawings)]),
                 max([1, *(col for _, col in self.cells), *(m[3] for m in self.merges),
-                     *(chart["anchor"][3] for chart in self.charts)]))
+                     *(chart["anchor"][3] for chart in self.charts),
+                     *(drawing["anchor"][3] for drawing in self.vector_drawings)]))
 
     def _print_range(self):
         if self.print_area is None:
@@ -921,7 +1133,7 @@ class Worksheet:
                                   "fitToWidth": 1, "fitToHeight": 0})
         footer = _node(root, "headerFooter")
         _node(footer, "oddFooter", text="&L" + self.name + "&C第 &P / &N 页")
-        if self.charts:
+        if self.charts or self.vector_drawings:
             _node(root, "drawing", {"{" + REL + "}id": "rIdDrawing"})
         return root
 
@@ -976,13 +1188,14 @@ class Workbook:
             ET.SubElement(relationships, "Relationship", Id="rId" + str(index), Type=REL + "/worksheet", Target="worksheets/sheet" + str(index) + ".xml")
             overrides.append(("/xl/worksheets/sheet" + str(index) + ".xml",
                               "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"))
-            if sheet.charts:
+            if sheet.charts or sheet.vector_drawings:
                 drawing_name = "drawing" + str(index) + ".xml"
                 sheet_rels = ET.Element("Relationships", {"xmlns": PACKAGE_REL})
                 ET.SubElement(sheet_rels, "Relationship", Id="rIdDrawing", Type=REL + "/drawing",
                               Target="../drawings/" + drawing_name)
                 chart_parts.append(("xl/worksheets/_rels/sheet" + str(index) + ".xml.rels", sheet_rels))
-                chart_parts.append(("xl/drawings/" + drawing_name, _chart_drawing_xml(sheet.charts)))
+                chart_parts.append(("xl/drawings/" + drawing_name,
+                                    _chart_drawing_xml(sheet.charts, sheet.vector_drawings, sheet)))
                 overrides.append(("/xl/drawings/" + drawing_name,
                                   "application/vnd.openxmlformats-officedocument.drawing+xml"))
                 drawing_rels = ET.Element("Relationships", {"xmlns": PACKAGE_REL})
@@ -997,7 +1210,8 @@ class Workbook:
                                       "application/vnd.openxmlformats-officedocument.drawingml.chart+xml"))
                     ET.SubElement(drawing_rels, "Relationship", Id="rId" + str(local_index),
                                   Type=REL + "/chart", Target="../charts/" + chart_name)
-                chart_parts.append(("xl/drawings/_rels/" + drawing_name + ".rels", drawing_rels))
+                if sheet.charts:
+                    chart_parts.append(("xl/drawings/_rels/" + drawing_name + ".rels", drawing_rels))
         _node(workbook, "calcPr", {"calcId": 191029, "calcMode": "auto", "fullCalcOnLoad": 1, "forceFullCalc": 1})
         ET.SubElement(relationships, "Relationship", Id="rId" + str(len(self.sheets) + 1), Type=REL + "/styles", Target="styles.xml")
         for part, content_type in overrides:

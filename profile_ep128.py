@@ -6376,6 +6376,11 @@ def main():
                         help='U简图固定使用此rank；默认沿用各case保存的源rank')
     parser.add_argument('--u-hotspots-case', action='append', metavar='CASE',
                         help='仅重绘模式下筛选case；可重复填写')
+    parser.add_argument('--u-swimlane-json', type=Path, metavar='JSON',
+                        help='直接从已有完整/代表轮泳道JSON画图，不读CSV/trace；输出额外图表统计sheet及HTML')
+    parser.add_argument('--u-swimlane-rank', default='dp4', metavar='RANK', help='泳道固定rank，默认dp4')
+    parser.add_argument('--u-swimlane-report', type=Path, metavar='REPORT',
+                        help='可选已有model_architecture_report.json，将泳道并入完整Excel的额外图表统计页')
     parser.add_argument('--workers', type=_cli_positive_workers, default=None,
                         help='总分析进程数；默认最多2，低内存自动用1；--workers 1串行')
     parser.add_argument('--parallel', choices=('case', 'rank'), default='case',
@@ -6383,6 +6388,35 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.u_top <= 15:
         parser.error('--u-top必须为1..15的整数')
+    if args.u_swimlane_json:
+        if (args.cases or args.inventory or args.list_inputs or args.excel or args.u_overlap_rank
+                or args.u_hotspots_report or args.u_hotspots_case or args.bound_profile or args.comm_reference
+                or args.workers is not None or args.parallel != 'case'):
+            parser.error('--u-swimlane-json是只读已有JSON的绘图模式，请单独运行')
+        from build_ep128_leadership_excel import build_swimlane_workbook, build_workbook
+        out = _source_path(args.out)
+        source = _source_path(args.u_swimlane_json)
+        report_source = _source_path(args.u_swimlane_report) if args.u_swimlane_report else None
+        if report_source is not None and _io_path(report_source).is_dir():
+            report_source = report_source / 'model_architecture_report.json'
+        destination = out / 'u_swimlane.xlsx'
+        protected = {source} | ({report_source} if report_source is not None else set())
+        if any(p in protected for p in (destination, destination.with_suffix('.html'))):
+            parser.error('泳道绘图输出不能覆盖输入JSON')
+        progress = lambda message: print('泳道绘图：' + message, flush=True)
+        try:
+            if report_source is None:
+                path = build_swimlane_workbook(destination, swimlane_json=source, rank=args.u_swimlane_rank, progress=progress)
+            else:
+                path = build_workbook(destination, report=report_source, swimlane_json=source,
+                                      swimlane_rank=args.u_swimlane_rank, progress=progress)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            parser.error('泳道绘图失败：' + type(error).__name__ + ': ' + str(error))
+        print('Excel（额外图表统计页）：' + str(path.resolve()), flush=True)
+        print('可缩放HTML泳道：' + str(path.with_suffix('.html').resolve()), flush=True)
+        return 0
+    if args.u_swimlane_report:
+        parser.error('--u-swimlane-report只能与--u-swimlane-json一起使用')
     if args.u_hotspots_report:
         if (args.cases or args.inventory or args.list_inputs or args.excel or args.u_overlap_rank
                 or args.bound_profile or args.comm_reference or args.workers is not None or args.parallel != 'case'):

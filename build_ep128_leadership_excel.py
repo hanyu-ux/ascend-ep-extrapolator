@@ -23,7 +23,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261123.1.u_hotspots"
+RENDERER_VERSION = "20261126.1.swimlane_charts"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"
@@ -1909,12 +1909,17 @@ def _u_hotspots_html(report):
 def _extra_charts_sheet(book, report):
     sheet = book.add_sheet(SHEETS[10], widths=[12] * 24, paper_size=8)
     sheet.detail_rows, sheet.report_origin = book.detail_rows, book.report_origin
-    sheet.merge(1, 1, 2, 24, "额外图表统计 · 外推后轮次剩余区间占比", "title")
+    has_swimlane = getattr(book, "swimlane_summary", None) is not None
+    sheet.merge(1, 1, 2, 24, "额外图表统计 · 同轮泳道与U耗时" if has_swimlane else
+                "额外图表统计 · 外推后轮次剩余区间占比", "title")
     sheet.row_height(1, 29).row_height(2, 14).freeze(5, 2)
     row = _note(sheet, 3, EXTRA_CHART_SCOPE, columns=24)
     sheet.add_internal_link(row, 1, "返回估算总览", SHEETS[0], "A1")
     sheet.add_internal_link(row, 7, "查看源采样基线", SHEETS[1], "A1")
     row += 2
+    if getattr(book, "swimlane_summary", None) is not None:
+        from ep128_swimlane_excel import append_swimlanes
+        row = append_swimlanes(sheet, row, book.swimlane_summary, note=_note, table=_table)
     row = _u_hotspots_excel_section(sheet, row, report)
     groups = _extra_residual_groups(report)
     if not groups:
@@ -3911,7 +3916,7 @@ else if(location.hash)showTarget(location.hash);
     return _html_insertions(document, insertions)
 
 
-def _html_preview(report, out, progress=None):
+def _html_preview(report, out, progress=None, swimlane_summary=None):
     started = time.perf_counter()
 
     def mark(message):
@@ -3936,6 +3941,9 @@ def _html_preview(report, out, progress=None):
     parts.append(_bs_comparison_html(report))
     parts.append(_s_comparison_html(report))
     parts.append(_source_sweeps_html(report))
+    if swimlane_summary is not None:
+        from ep128_swimlane_excel import html_section
+        parts.append(html_section(swimlane_summary))
     parts.append(_extra_charts_html(report))
     parts.append(_focus_source_html(report))
     case_counts = collections.Counter(case['name'] for case in report['cases'])
@@ -4018,10 +4026,67 @@ def _check_result_cells(book, report):
                                          f"字段={field}；核心值={expected!r}；显示值={actual!r}。已停止保存。")
 
 
+def _load_swimlane_summary(path, rank="dp4"):
+    from ep128_swimlane_plot import summarize_swimlanes
+    access = Path(path).expanduser().resolve()
+    if sys.platform == "win32" and not str(access).startswith("\\\\?\\"):
+        value = str(access)
+        access = Path("\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value)
+    before = access.stat()
+    digest = hashlib.sha256()
+    with access.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    with access.open(encoding="utf-8-sig") as handle:
+        payload = json.load(handle)
+    after = access.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError("泳道JSON在读取期间改变")
+    summary = summarize_swimlanes(payload, rank=rank,
+        source_info={"sha256": digest.hexdigest(), "bytes": before.st_size, "schema": payload.get("schema")})
+    if not summary.get("panels"):
+        raise ValueError("泳道JSON没有case数据，未构造图形")
+    summary["input_json"] = str(Path(path).resolve())
+    return summary
+
+
+def build_swimlane_workbook(out, *, swimlane_json, rank="dp4", progress=None):
+    """Draw saved fixed-rank swimlanes without needing a projection report."""
+    from ep128_swimlane_excel import append_swimlanes, html_section
+    source = Path(swimlane_json).resolve()
+    destination = Path(out).resolve()
+    if source in (destination, destination.with_suffix(".html")):
+        raise ValueError("泳道输出不能覆盖输入JSON")
+    if not callable(getattr(xlsx_writer.Worksheet, "add_vector_drawing", None)):
+        raise ValueError("Excel写入器缺少原生泳道绘图接口，请同步更新ep128_xlsx_writer.py")
+    if progress:
+        progress("仅读取已有泳道JSON，不读取CSV/trace，不重新采样")
+    summary = _load_swimlane_summary(source, rank)
+    book = Workbook()
+    book.detail_rows, book.report_origin = DEFAULT_DETAIL_ROWS, str(source)
+    sheet = book.add_sheet(SHEETS[10], widths=[12] * 24, paper_size=8)
+    sheet.detail_rows, sheet.report_origin = book.detail_rows, book.report_origin
+    sheet.merge(1, 1, 2, 24, "额外图表统计 · Host / HC / U 同轮泳道", "title")
+    sheet.row_height(1, 29).row_height(2, 14).freeze(3, 0)
+    if progress:
+        progress("绘制全部case总览、放大泳道及调用明细")
+    append_swimlanes(sheet, 4, summary, note=_note, table=_table)
+    path = book.save(destination)
+    document = ('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Host / HC / U 同轮泳道</title>'
+                '<style>body{margin:20px;color:#173451;font:14px system-ui}table{border-collapse:collapse;width:100%}'
+                'th,td{border:1px solid #d2dde8;padding:7px}th{background:#edf2f7}svg{display:block}</style>'
+                + html_section(summary) + '</html>')
+    destination.with_suffix(".html").write_text(document, encoding="utf-8")
+    if progress:
+        progress("独立泳道工作簿已写出；工作表：额外图表统计")
+    return Path(path)
+
+
 def build_workbook(out, *, report=None, report_data=None, cases=None, reference=None,
                    reference_unit='unknown', preview=False, detail_rows=DEFAULT_DETAIL_ROWS, progress=None,
                    expected_method_set=None, align_source_rank=False, refresh_bound=False,
-                   bound_profile=None, bound_template=None, add_method3=False):
+                   bound_profile=None, bound_template=None, add_method3=False,
+                   swimlane_json=None, swimlane_rank="dp4"):
     """Render a core report or an honestly empty configuration preview.
 
     ``report_data`` reuses an already loaded report without parsing its JSON
@@ -4040,6 +4105,8 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
         raise ValueError("expected_method_set must be " + METHOD_SET)
     if (report is None) == (cases is None):
         raise ValueError('provide exactly one of report or cases')
+    if swimlane_json is not None and (cases is not None or preview):
+        raise ValueError('泳道实测不能与配置预览组合；请使用已有报告或独立泳道模式')
     if report_data is not None:
         if report is None or cases is not None or preview:
             raise ValueError('report_data必须同时提供report来源路径，不能配合cases或preview')
@@ -4061,7 +4128,7 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
     method3_path = Path(out).with_suffix('.method3.json') if add_method3 else None
     if aligned_path is not None and aligned_path.resolve() == Path(report).resolve():
         raise ValueError('对齐后的JSON不能覆盖输入报告；请为--out选择另一个文件名')
-    protected = [Path(value).resolve() for value in (report, bound_profile) if value is not None]
+    protected = [Path(value).resolve() for value in (report, bound_profile, swimlane_json) if value is not None]
     outputs = [Path(value).resolve() for value in (out, Path(out).with_suffix('.html'), aligned_path, bound_path, method3_path, bound_template)
                if value is not None]
     if len(outputs) != len(set(outputs)) or any(value in protected for value in outputs):
@@ -4115,6 +4182,10 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
     book = Workbook()
     book.detail_rows = detail_rows
     book.report_origin = str(report or cases)
+    if swimlane_json is not None:
+        if not callable(getattr(xlsx_writer.Worksheet, "add_vector_drawing", None)):
+            raise ValueError("Excel写入器缺少原生泳道绘图接口，请同步更新ep128_xlsx_writer.py")
+        book.swimlane_summary = stage("读取已有固定rank泳道JSON", lambda: _load_swimlane_summary(swimlane_json, swimlane_rank))
     stage(SHEETS[0], lambda: _overview(book,payload))
     stage(SHEETS[1], lambda: _source_sheet(book,payload))
     stage(SHEETS[2], lambda: _layers_sheet(book,payload))
@@ -4128,7 +4199,10 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
     stage(SHEETS[10], lambda: _extra_charts_sheet(book,payload))
     stage("核对Excel关键结果", lambda: _check_result_cells(book, payload))
     path = stage("写入XLSX", lambda: book.save(out))
-    stage("写入HTML预览", lambda: _html_preview(payload,path,progress=progress))
+    if swimlane_json is None:
+        stage("写入HTML预览", lambda: _html_preview(payload,path,progress=progress))
+    else:
+        stage("写入HTML预览", lambda: _html_preview(payload,path,progress=progress, swimlane_summary=book.swimlane_summary))
     if aligned_path is not None:
         stage("保存共同源rank核心JSON", lambda: _save_source_rank_report(aligned_path, payload))
     if bound_path is not None:
@@ -4141,9 +4215,11 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--version',action='version',version='EP128 Excel '+RENDERER_VERSION)
-    group=parser.add_mutually_exclusive_group(required=True)
+    group=parser.add_mutually_exclusive_group()
     group.add_argument('--report',type=Path,help='schema 2 model_architecture_report.json')
     group.add_argument('--cases',type=Path,help='cases配置，仅可搭配--preview')
+    parser.add_argument('--swimlane-json',type=Path,help='已有完整或代表轮泳道JSON；可单独绘图，或加到已有报告的额外图表统计页')
+    parser.add_argument('--swimlane-rank',default='dp4',help='泳道固定rank，默认dp4，不借用其他rank')
     parser.add_argument('--preview',action='store_true',help='只看配置版式，性能全部待估算')
     parser.add_argument('--reference',type=Path,help='原通信CSV仅展示；不参与renderer估算')
     parser.add_argument('--reference-unit',choices=('unknown','us','ms'),default='unknown')
@@ -4161,6 +4237,13 @@ def main():
     parser.add_argument('--detail-rows',type=int,default=DEFAULT_DETAIL_ROWS,
                         help='每case每类明细在Excel中最多预览的条数，默认1000，范围1..10000；核心统计及完整JSON不变')
     args=parser.parse_args()
+    if args.report is None and args.cases is None and args.swimlane_json is None:
+        parser.error('provide --report, --cases, or --swimlane-json')
+    if args.swimlane_json is not None and args.cases is not None:
+        parser.error('--swimlane-json不能与--cases预览组合')
+    if args.report is None and args.cases is None and (args.preview or args.align_source_rank or args.add_method3
+            or args.refresh_bound or args.bound_profile or args.bound_template or args.reference):
+        parser.error('独立泳道模式仅使用--swimlane-json、--swimlane-rank和--out')
     runtime = runtime_diagnostics()
     print(f"Excel导出版本：{runtime['renderer_version']}；写入器版本：{runtime['writer_version']}", file=sys.stderr, flush=True)
     print('生成器：'+runtime['renderer_path'], file=sys.stderr, flush=True)
@@ -4168,13 +4251,18 @@ def main():
     print('坐标校验代码：'+runtime['position_code_path']+':'+str(runtime['position_code_line']), file=sys.stderr, flush=True)
     print('Python：'+runtime['python_executable']+' ('+runtime['python_version']+')', file=sys.stderr, flush=True)
     try:
-        path=build_workbook(args.out,report=args.report,cases=args.cases,reference=args.reference,
+        if args.report is None and args.cases is None:
+            path=build_swimlane_workbook(args.out,swimlane_json=args.swimlane_json,rank=args.swimlane_rank,
+                progress=lambda name: print('泳道绘图：'+name,file=sys.stderr,flush=True))
+        else:
+            path=build_workbook(args.out,report=args.report,cases=args.cases,reference=args.reference,
                             reference_unit=args.reference_unit,preview=args.preview,detail_rows=args.detail_rows,
                             align_source_rank=args.align_source_rank,
                             add_method3=args.add_method3,
                             refresh_bound=args.refresh_bound, bound_profile=args.bound_profile,
                             bound_template=args.bound_template,
-                            progress=lambda name: print('Excel阶段：'+name, file=sys.stderr, flush=True))
+                            progress=lambda name: print('Excel阶段：'+name, file=sys.stderr, flush=True),
+                            swimlane_json=args.swimlane_json,swimlane_rank=args.swimlane_rank)
     except (OSError,ValueError,KeyError,TypeError) as error:
         traceback.print_exc(file=sys.stderr)
         return 1
