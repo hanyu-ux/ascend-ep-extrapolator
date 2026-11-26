@@ -431,7 +431,8 @@ def panel_drawing(panel, width=1600, overview=False, x_min_ms=None, x_max_ms=Non
                     name = {"outer_propose": "propose", "preparation_dp_aggregate": "前处理 / DP",
                             "runner_inputs": "prepare_inputs", "runner_attn": "prepare_attn · slot", "state_attn": "prepare_attn · metadata"}[role]
                     text = f"{lane['duration_ms']:.3f} ms" if overview else name+f"  {lane['duration_ms']:.3f} ms"
-                    _text(elements, start, row_y+5, end-start, row_h-10, text, 7 if overview else 9, "FFFFFF", True, "center")
+                    ink = "1C344D" if role in ("preparation_dp_aggregate", "runner_inputs", "runner_attn") else "FFFFFF"
+                    _text(elements, start, row_y+5, end-start, row_h-10, text, 7 if overview else 9, ink, True, "center")
                 elif not overview:
                     _text(elements, left-105, row_y+17, 94, 17, f"{lane['duration_ms']:.3f} ms", 8, "536578", align="right")
                 event_y[lane.get("event_index")] = row_y+row_h/2
