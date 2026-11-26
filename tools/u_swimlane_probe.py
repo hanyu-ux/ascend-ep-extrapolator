@@ -19,6 +19,7 @@ import multiprocessing
 from pathlib import Path
 import sys
 import tempfile
+import time
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -28,7 +29,7 @@ from ep128_swimlane_links import export_device_catalog, export_device_task_links
 
 
 SCHEMA = "u_swimlane_v3"
-EXPORT_VERSION = "20261126.4.full_device_sources"
+EXPORT_VERSION = "20261126.5.indexed_device_sources"
 TEXT_CHUNK = 60000
 ROLE_KEYS = ("outer_propose", "runner_inputs", "runner_attn", "state_attn")
 HOST_LANE_KEYS = ("outer_propose", "preparation_dp_aggregate", "runner_inputs", "runner_attn", "state_attn")
@@ -351,6 +352,7 @@ def run_cases(items, config, base, rank, workers, detail_limit=0):
             except Exception as error:
                 outcome = worker_failure(index, item, rank, error, "serial")
             yield outcome
+            del outcome
         return
     try:
         executor = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
@@ -370,13 +372,14 @@ def run_cases(items, config, base, rank, workers, detail_limit=0):
                 pending[future] = index, item
         try:
             for future in as_completed(pending):
-                index, item = pending[future]
+                index, item = pending.pop(future)
                 try:
                     outcome = checked_outcome(future.result(), index, item, rank)
                 except Exception as error:
                     outcome = worker_failure(index, item, rank, error, "collect")
                 reported.add(index)
                 yield outcome
+                del outcome, future
         except Exception as error:
             for index, item in pending.values():
                 if index not in reported:
@@ -452,7 +455,58 @@ def write_status(payload, out, rank):
             writer.writerow(row)
 
 
-def write_device_tables(payload, out, rank):
+class CaseCheckpoints:
+    """Repeatable one-case-at-a-time reads; no accumulated full result tree."""
+    def __init__(self, paths):
+        self.paths = tuple(paths)
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __iter__(self):
+        for path in self.paths:
+            with core._io_path(path).open(encoding="utf-8") as stream:
+                yield json.load(stream)
+
+
+def write_case_checkpoint(entry, index, out, rank, progress=None):
+    """Durably save each completed case once, without rewriting earlier cases."""
+    path = out/("u_swimlane_"+rank+"_cases")/("case-"+str(index+1).zfill(6)+".json")
+    if progress:
+        progress("Saving completed case: " + entry["case"])
+    core.atomic_json(core._io_path(path), wire(entry), progress=progress)
+    return path
+
+
+def write_full_checkpoint(payload, checkpoints, out, rank, progress=None):
+    """Assemble already serialized cases without copying or decoding their trees."""
+    destination = out/("u_swimlane_"+rank+".json")
+    header = {key: value for key, value in payload.items() if key != "cases"}
+    text = json.dumps(wire(header), ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    last = time.monotonic()
+    with core.atomic_writer(core._io_path(destination)) as stream:
+        stream.write(text[:-1] + ',"cases":[')
+        for index, path in enumerate(checkpoints.paths):
+            if progress:
+                progress(f"Assembling complete JSON: case {index+1}/{len(checkpoints)}")
+            if index:
+                stream.write(",")
+            with core._io_path(path).open(encoding="utf-8", newline="") as source:
+                while True:
+                    chunk = source.read(1024*1024)
+                    if not chunk:
+                        break
+                    stream.write(chunk)
+                    now = time.monotonic()
+                    if progress and now-last >= 5:
+                        stream.flush()
+                        progress(f"Complete JSON: {stream.tell()/1024/1024:.1f} MiB written")
+                        last = now
+        stream.write("]}\n")
+    return destination
+
+
+def write_device_tables(payload, out, rank, progress=None):
     """Readable task/source/round indexes; full event/flow proof stays in JSON."""
     stem = "u_swimlane_" + rank
     catalog_fields = ("case", "rank", "task_key", "source_kind", "csv_row_index", "trace_event_index", "name", "op_type",
@@ -475,22 +529,37 @@ def write_device_tables(payload, out, rank):
         tasks_out, sources_out, rounds_out = (make_writer(stream, fields) for stream, fields in
                                              ((a,catalog_fields),(b,source_fields),(c,round_fields)))
         for entry in payload.get("cases", []):
+            if progress:
+                progress("Writing full device CSV indexes: " + entry["case"])
             common = {"case": entry.get("case"), "rank": entry.get("rank", rank)}
             device = entry.get("device_task_links") or {}
             statuses = {link.get("task_key"): link.get("status") for link in device.get("links", [])}
-            for task in device.get("device_tasks", []):
+            last = time.monotonic()
+            def report_rows(kind, number, total):
+                nonlocal last
+                if not progress or number % 1000:
+                    return
+                now = time.monotonic()
+                if now-last >= 5:
+                    progress(f"{entry['case']}: {kind} CSV {number:,}/{total:,} rows")
+                    last = now
+            tasks, links, bindings = (device.get(key, []) for key in ("device_tasks", "links", "task_round_bindings"))
+            for number, task in enumerate(tasks, 1):
                 row = {**common, **task, "source_status": statuses.get(task.get("task_key"), task.get("source_status", "NOT_RESOLVED"))}
                 if row.get("start_ns") is not None and row.get("end_ns") is not None:
                     row["duration_ns"] = int(row["end_ns"])-int(row["start_ns"])
                 tasks_out.writerow(row)
-            for link in device.get("links", []):
+                report_rows("device tasks", number, len(tasks))
+            for number, link in enumerate(links, 1):
                 row = {**common, **link, "source_status": link.get("status")}
                 for field in ("flow_ids", "host_associations", "missing_source_event_indexes"):
                     row[field+"_json"] = json.dumps(wire(link.get(field, [])), ensure_ascii=True, separators=(",", ":"))
                 sources_out.writerow(row)
-            for binding in device.get("task_round_bindings", []):
+                report_rows("task sources", number, len(links))
+            for number, binding in enumerate(bindings, 1):
                 rounds_out.writerow({**common, **binding, "host_role": binding.get("role", binding.get("host_role")),
                                      "binding_json": json.dumps(wire(binding), ensure_ascii=True, separators=(",", ":"))})
+                report_rows("task round relations", number, len(bindings))
     return paths
 
 
@@ -567,7 +636,8 @@ def main(argv=None):
         except ValueError:
             continue
         if (p.parent == out and p.name.casefold().startswith(stem.casefold())
-                or relative.parts and relative.parts[0].casefold().startswith(stem.casefold()+"_parts_")):
+                or relative.parts and (relative.parts[0].casefold().startswith(stem.casefold()+"_parts_")
+                                       or relative.parts[0].casefold() == stem.casefold()+"_cases")):
             parser.error("Output directory would overwrite a source input")
     core._io_path(out).mkdir(parents=True, exist_ok=True)
     workers = core._cli_case_workers(args.workers, len(selected), "swimlane case (fixed " + args.rank + ")")
@@ -590,18 +660,33 @@ def main(argv=None):
                "scope": "Existing CSV/trace offline diagnostic only. HC envelopes are not full graphs or continuous busy time. "
                         "Host calls are full wall ranges. Round association by Host order/graph entry is labeled inference, "
                         "not a complete device flow proof. Missing/ambiguous/unaligned data are never filled from other rounds."}
-    complete = {}
+    complete, outcomes = {}, {}
+    progress = lambda message: print(message, flush=True)
     for index, entry in run_cases(selected, config, manifest.parent, args.rank, workers, args.detail_rounds):
-        complete[index] = entry
-        payload["cases"] = [complete[k] for k in sorted(complete)]
+        complete[index] = write_case_checkpoint(entry, index, out, args.rank, progress)
+        outcomes[index] = {key: entry.get(key) for key in ("status", "detail_status", "device_task_status")}
         payload["completed_cases"] = len(complete)
-        core.atomic_json(core._io_path(out/("u_swimlane_"+args.rank+".json")), wire(payload))
+        core.atomic_json(core._io_path(out/("u_swimlane_"+args.rank+"_progress.json")), {
+            "export_version": EXPORT_VERSION, "planned_cases": len(selected), "completed_cases": len(complete),
+            "checkpoint_files": [str(complete[k].relative_to(out)) for k in sorted(complete)],
+            "full_json_status": "ASSEMBLED_AFTER_ALL_CASES"})
         print(f"[{len(complete)}/{len(selected)}] {entry['case']} {entry['status']}; complete rounds={entry.get('complete_rounds', 0)}", flush=True)
+        del entry
+    checkpoints = CaseCheckpoints([complete[k] for k in sorted(complete)])
+    write_full_checkpoint(payload, checkpoints, out, args.rank, progress)
+    payload["cases"] = checkpoints
+    progress("Writing per-case status table")
     write_status(payload, out, args.rank)
-    tables = write_device_tables(payload, out, args.rank)
-    archive, parts = (None, []) if args.no_package else write_packages(payload, out, args.rank)
-    ready = sum(e["status"] == "READY" for e in payload["cases"])
-    detailed = sum(e.get("detail_status") == "READY" for e in payload["cases"])
+    tables = write_device_tables(payload, out, args.rank, progress)
+    # Packaging is an explicit extra copy; the recommended intranet command
+    # skips it. Its existing public helper and lossless format stay compatible.
+    if args.no_package:
+        archive, parts = None, []
+    else:
+        progress("Packaging complete history (ZIP/base64)")
+        archive, parts = write_packages({**payload, "cases": list(checkpoints)}, out, args.rank)
+    ready = sum(e["status"] == "READY" for e in outcomes.values())
+    detailed = sum(e.get("detail_status") == "READY" for e in outcomes.values())
     print(f"READY={ready}/{len(selected)}; child-detail READY={detailed}/{len(selected)}; full coordinates were not truncated", flush=True)
     for path in tables:
         print("Device evidence: " + str(path), flush=True)
@@ -612,7 +697,7 @@ def main(argv=None):
         print("Full JSON and CSVs kept locally; ZIP/base64 packaging skipped (--no-package)", flush=True)
     print("For copy/paste PPT evidence, run tools/u_swimlane_share.py on " +
           str(out / ("u_swimlane_" + args.rank + ".json")), flush=True)
-    return int(ready != len(selected) or any(e.get("device_task_status") == "ERROR" for e in payload["cases"]))
+    return int(ready != len(selected) or any(e.get("device_task_status") == "ERROR" for e in outcomes.values()))
 
 
 if __name__ == "__main__":
