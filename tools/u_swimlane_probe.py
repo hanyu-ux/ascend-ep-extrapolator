@@ -391,7 +391,8 @@ def write_packages(payload, out, rank):
         names.append(path.relative_to(out).as_posix())
     manifest = {"schema": "u_swimlane_package_v1", "raw_sha256": raw_sha, "raw_bytes": len(raw),
                 "zip": zip_path.name, "parts": names, "gzip_sha256": gzip_sha,
-                "truncated": False, "send": "Send the ZIP, or every text part listed here; do not send only the first part"}
+                "truncated": False, "purpose": "Full local diagnostic history",
+                "send": "For copy/paste PPT evidence, run tools/u_swimlane_share.py on the full JSON; these full-history parts may number in the hundreds"}
     core.atomic_json(core._io_path(out / (stem + "_package.json")), manifest)
     return zip_path, names
 
@@ -504,8 +505,10 @@ def main(argv=None):
     ready = sum(e["status"] == "READY" for e in payload["cases"])
     detailed = sum(e.get("detail_status") == "READY" for e in payload["cases"])
     print(f"READY={ready}/{len(selected)}; child-detail READY={detailed}/{len(selected)}; full coordinates were not truncated", flush=True)
-    print("Send ZIP: " + str(archive), flush=True)
-    print("Or send ALL " + str(len(parts)) + " text parts listed in u_swimlane_"+args.rank+"_package.json", flush=True)
+    print("Local full-history archive: " + str(archive), flush=True)
+    print("Full-history text parts: " + str(len(parts)) + "; keep this archive locally", flush=True)
+    print("For copy/paste PPT evidence, run tools/u_swimlane_share.py on " +
+          str(out / ("u_swimlane_" + args.rank + ".json")), flush=True)
     return int(ready != len(selected))
 
 
