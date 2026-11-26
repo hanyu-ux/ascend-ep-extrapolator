@@ -26,9 +26,10 @@ from ep128_swimlane_trace import collect_host_events, pair_rounds
 from ep128_swimlane_links import export_anchor_links
 
 
-SCHEMA = "u_swimlane_v2"
+SCHEMA = "u_swimlane_v3"
 TEXT_CHUNK = 60000
-ROLE_KEYS = ("outer_propose", "runner_inputs", "state_attn")
+ROLE_KEYS = ("outer_propose", "runner_inputs", "runner_attn", "state_attn")
+HOST_LANE_KEYS = ("outer_propose", "preparation_dp_aggregate", "runner_inputs", "runner_attn", "state_attn")
 STAMP_KEYS = {"start_ns", "end_ns", "origin_ns", "timestamp_ns", "clock_offset_ns",
               "csv_start_ns", "trace_start_ns"}
 
@@ -207,7 +208,7 @@ def attach_host(rounds, pairs, events):
 def detail_rounds(rounds, limit):
     """Suggest complete business families without discarding any saved round."""
     ready = [r for r in rounds if r["host_pairing"]["status"] == "MATCHED"
-             and len(r["host_lanes"]) == 4 and r["stage_status"] == "MATCHED"]
+             and set(HOST_LANE_KEYS).issubset(r["host_lanes"]) and r["stage_status"] == "MATCHED"]
     def detailed(row):
         child = row["host_pairing"].get("child_layer", {})
         roles = child.get("by_role", {})
@@ -226,7 +227,7 @@ def analyze_case(item, config, base, rank, progress=print, detail_limit=1):
     result = {"case": item.get("name", "invalid"), "rank": rank, "status": "ERROR", "error": None,
               "rounds": [], "host_events": [], "device_anchors": [], "complete_rounds": 0,
               "incomplete_rounds": 0, "ready_requires_all_rounds": False, "detail_status": "UNAVAILABLE",
-              "ready_definition": "At least one retained round has all four verified Host scopes and 15 matched U stages; "
+              "ready_definition": "At least one retained round has four verified Host functions, the preparation/DP aggregate, and 15 matched U stages; "
                                   "READY does not mean every retained round is complete"}
     try:
         case = core.normalize_case(config.get("defaults", {}), item, base,
@@ -260,10 +261,10 @@ def analyze_case(item, config, base, rank, progress=print, detail_limit=1):
         pairs = pair_rounds(core, measured["rounds"], host["events"])
         result["rounds"] = attach_host(result["rounds"], pairs, host["events"])
         ready = [r for r in result["rounds"] if r["host_pairing"]["status"] == "MATCHED"
-                 and len(r["host_lanes"]) == 4 and r["stage_status"] == "MATCHED"]
+                 and set(HOST_LANE_KEYS).issubset(r["host_lanes"]) and r["stage_status"] == "MATCHED"]
         result["complete_rounds"] = len(ready)
         result["incomplete_rounds"] = len(result["rounds"]) - len(ready)
-        result["complete_host_rounds"] = sum(len(r["host_lanes"]) == 4 for r in result["rounds"])
+        result["complete_host_rounds"] = sum(set(HOST_LANE_KEYS).issubset(r["host_lanes"]) for r in result["rounds"])
         if ready:
             selected, result["detail_status"] = detail_rounds(result["rounds"], detail_limit)
             result["suggested_round_id"] = selected[0]["round_id"]
@@ -281,7 +282,7 @@ def analyze_case(item, config, base, rank, progress=print, detail_limit=1):
             result["status"] = "READY"
         else:
             result["status"] = "PARTIAL"
-            result["error"] = "No round has both four verified Host call scopes and all 15 matched U stages"
+            result["error"] = "No round has all four verified Host functions, the preparation/DP aggregate and all 15 matched U stages"
         result["round_selection"] = "All complete CSV HC rounds retained; suggested round is median-cycle among complete candidates"
         if any(stamp(path) != info for path, info in before.items()):
             raise ValueError("An input changed during offline export")
@@ -481,6 +482,8 @@ def main(argv=None):
                "detail_rounds_per_case": args.detail_rounds,
                "trace_passes_per_aligned_case": 4,
                "diagram_contract": {"host_color_by": "function_kind", "host_labels": "function name and wall time",
+                                    "host_lane_order": list(HOST_LANE_KEYS),
+                                    "runner_attn": "Independent runner block-table/slot scope; not the model-state metadata builder",
                                     "show_hc_overlap_labels": False, "children_depth_to_display": 1,
                                     "confirmed_device_edge": "solid", "inferred_or_source_only_edge": "dashed",
                                     "cpu_wait": "Do not invent a directly submitted device kernel"},
