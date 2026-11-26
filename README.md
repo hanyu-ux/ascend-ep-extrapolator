@@ -41,7 +41,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-主脚本、Excel生成器、XLSX写入器、Attention准备识别模块及U主要耗时模块应放在同一目录。统计核心版本为 `20261123.1.u_hotspots`，Excel生成器为 `20261126.3.exclusive_swimlanes`，写入器为 `20261126.2.merge_index`；泳道绘图还需同步`ep128_swimlane_plot.py`、`ep128_swimlane_excel.py`、`ep128_swimlane_partition.py`、`ep128_swimlane_anchor_audit.py`、`ep128_swimlane_business.py`、`ep128_swimlane_mechanism.py`及已有泳道证据模块。
+主脚本、Excel生成器、XLSX写入器、Attention准备识别模块及U主要耗时模块应放在同一目录。统计核心版本为 `20261123.1.u_hotspots`，Excel生成器为 `20261126.3.exclusive_swimlanes`，写入器为 `20261126.2.merge_index`；泳道绘图还需同步`ep128_swimlane_plot.py`、`ep128_swimlane_excel.py`、`ep128_swimlane_partition.py`、`ep128_swimlane_anchor_audit.py`、`ep128_swimlane_business.py`、`ep128_swimlane_mechanism.py`及已有泳道证据模块。来源关联另依赖同目录的 `ep128_interval_index.py`，通过 Git 更新时会一起获取。
 
 ## 快速运行
 
@@ -383,6 +383,10 @@ Host主线共五条：`propose`、前处理/DP聚合范围、Runner `prepare_inp
 上述命令的 `--no-package` 适合在内网直接检查 JSON/CSV 和后续本地绘图，不生成 ZIP 或 Base64 碎片。只有省略该选项时才另生成 `u_swimlane_dp4.zip`、`u_swimlane_dp4_parts_<SHA前12位>/part001.txt` 等无损分片及 `u_swimlane_dp4_package.json` 清单；每片不超过64KiB，不同完整 JSON 使用不同摘要目录。
 
 上述文件是完整本地诊断存档。包含全部轮次时，文本分片可能达到数百片；只有复制文本能力的环境不要逐片传这个全历史包。原始CSV/trace和完整JSON保留内网。
+
+导出器 `20261126.5.indexed_device_sources` 优化了全量任务关联：长时间外层 Python scope 使用精确区间索引，重复来源与队列查询复用结果，检查缺失引用时不再逐任务遍历整张来源表。代表轮工具也复用父链索引及缺失引用传播结果。全部任务、原始时序、歧义候选和来源等级仍保留；这些是离线算法提速，不是模型性能变化。
+
+为避免每完成一个 case 就重写此前全部大 JSON，新版将每个已完成 case 单独保存为 `u_swimlane_dp4_cases/case-000001.json` 等，并更新小型 `u_swimlane_dp4_progress.json`。全部 case 处理结束后，按原清单顺序流式合并成兼容的 `u_swimlane_dp4.json`，状态表及任务 CSV 逐 case 写出。生成过程会打印来源扫描、任务关联数量、case 保存、JSON 合并和 CSV 写出进度。中断时已完成的 case 文件保留；此版本不会自动跳过上次运行的 case。整体耗时仍取决于原 trace 大小、任务数、磁盘和并行度，不把局部合成基准的倍数当作整套脚本的加速承诺。
 
 **已经完成完整导出，只需给PPT提供12个case的代表轮证据时**，运行下面的轻量分享工具。它只读现有`u_swimlane_dp4.json`，不重扫CSV/trace、不重新采样；每个case选原建议轮（优先已有来源解析的轮），保存完整HC/U边界、五条Host线、该轮全部已记录子调用和来源引用闭包。新工具还保留 `device_task_links` 中已绑定到所选轮的全部任务、内部任务与逐任务来源，包括由该轮 Host 下发、但在其返回或周期结束后才执行的任务；按已有关系选取，不重新靠时间猜归属。缩小体积依靠选轮、过滤其他轮事件及去除重复字段，不按字节预算删函数/父链或裁剪所选区间；原目录规模、未选任务数及歧义上下文另有记录。错误case也保留原时钟诊断及设备侧一轮，Host保持未知；不把`PARTIAL`提升为已确认。
 

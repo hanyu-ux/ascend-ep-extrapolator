@@ -12,7 +12,10 @@ from copy import deepcopy
 import csv
 import json
 from pathlib import Path
+import time
 from types import SimpleNamespace
+
+from ep128_interval_index import MaxEndIntervalIndex
 
 
 _IDENTITY_FIELDS = (
@@ -58,8 +61,11 @@ def _device_anchors(core, capture, rounds):
     """Return every boundary binding, including missing/ambiguous candidates."""
     tasks = list(capture["tasks"])
     by_row = defaultdict(list)
+    by_edge = {"start": defaultdict(list), "end": defaultdict(list)}
     for task in tasks:
         by_row[int(task.row_index)].append(task)
+        by_edge["start"][int(task.start_ns)].append(task)
+        by_edge["end"][int(task.end_ns)].append(task)
     bindings, selected = [], {}
 
     def add(round_id, kind, side, stamp, *, declared=None, pattern=None, edge="start", **extra):
@@ -71,7 +77,7 @@ def _device_anchors(core, capture, rounds):
             status = "EXACT_SOURCE_ROW" if len(matches) == 1 else (
                 "AMBIGUOUS" if len(matches) > 1 else "ANCHOR_IDENTITY_MISMATCH" if candidates else "MISSING_DEVICE_TASK")
         elif pattern is not None:
-            matches = [t for t in tasks if int(getattr(t, edge + "_ns")) == stamp and (
+            matches = [t for t in by_edge[edge].get(stamp, []) if (
                 pattern.search(t.name) or pattern.search(getattr(t, "op_type", "")))]
             status = "HC_MARKER_TIMESTAMP_UNIQUE" if len(matches) == 1 else "AMBIGUOUS" if matches else "MISSING_DEVICE_TASK"
         else:
@@ -133,6 +139,8 @@ def _read_evidence_events(core, trace_path, trace_meta, wanted, progress, *, sou
     before, scan, found = _stamp(access), {}, {}
     flow_keys = {key for link in source_links for key in link.get("flow_ids", [])}
     flow_events = []
+    started = last = time.monotonic()
+    number = 0
     for number, raw in enumerate(core.residual_iter_trace_events(trace_path, stats=scan), 1):
         if source_links and raw.get("ph") in ("s", "f"):
             identity = raw.get("id", raw.get("id2"))
@@ -167,8 +175,12 @@ def _read_evidence_events(core, trace_path, trace_meta, wanted, progress, *, sou
                              "python_parent_id": core.residual_id(args.get("pythonparentid")),
                              "connection_id": core.residual_id(args.get("connectionid")),
                              "correlation_id": core.residual_id(args.get("correlationid"))}
-        if progress and number % 100000 == 0:
-            progress("Anchor source references: " + format(number, ",") + " events")
+        if progress and number % 10000 == 0:
+            now = time.monotonic()
+            if now-last >= 5:
+                progress("Device source references: scanned " + format(number, ",") +
+                         " events; elapsed " + format(now-started, ".1f") + "s")
+                last = now
     if _stamp(access) != before or scan.get("sha256") != trace_meta["sha256"]:
         raise ValueError("Trace changed or SHA256 differs during anchor-source enrichment")
     if source_links:
@@ -183,6 +195,9 @@ def _read_evidence_events(core, trace_path, trace_meta, wanted, progress, *, sou
         # Retain every endpoint of a selected/shared ID, rather than one nearby
         # pair that could falsely turn reused graph flow IDs into unique proof.
         found.update({e["event_index"]: e for e in flow_events if e["flow_key"] in selected_flow_keys})
+    if progress:
+        progress("Device source references complete: " + format(number, ",") + " scanned / " +
+                 format(len(found), ",") + " retained events; elapsed " + format(time.monotonic()-started, ".1f") + "s")
     return found
 
 
@@ -195,18 +210,16 @@ class _HostIntervals:
         self.lanes = {}
         for lane, group in grouped.items():
             group.sort(key=lambda e: (int(e["start_ns"]), int(e["end_ns"]), e["event_index"]))
-            maximum, prefix = -2**63, []
-            for event in group:
-                maximum = max(maximum, int(event["end_ns"]))
-                prefix.append(maximum)
-            self.lanes[lane] = group, [int(e["start_ns"]) for e in group], prefix
+            self.lanes[lane] = group, MaxEndIntervalIndex(
+                [int(e["start_ns"]) for e in group], [int(e["end_ns"]) for e in group])
 
     def containing(self, event, *, include_end=False):
-        group, starts, prefix = self.lanes.get((str(event.get("pid")), str(event.get("tid"))), ([], [], []))
+        lane = self.lanes.get((str(event.get("pid")), str(event.get("tid"))))
+        if lane is None:
+            return []
+        group, intervals = lane
         start, end = int(event["start_ns"]), int(event["end_ns"])
-        first = (bisect_left if include_end else bisect_right)(prefix, start)
-        stop = bisect_right(starts, start)
-        return [e for e in group[first:stop] if int(e["end_ns"]) >= end]
+        return [group[position] for position in intervals.containing(start, end, include_end=include_end)]
 
 
 def _python_identities(raw_events):
@@ -259,6 +272,77 @@ def _associations(link, raw_events, identities, index):
                        "explicit_parent_event_indexes": [source_id] if number == source_id else explicit.get(number, []),
                        "scope": "Recorded core source with exact event identity or explicit Python parent path" if solid else
                                 "Partial source chain or temporal containment; not a verified Host-to-device caller"})
+    return result
+
+
+def _missing_references(references, raw):
+    # ``set(refs) - raw.keys()`` visits the entire large evidence dictionary on
+    # every device task. Membership probes depend only on the requested refs.
+    return sorted({number for number in references if number not in raw})
+
+
+class _AssociationCache:
+    """Case-local parent-path results; each exported link owns its own lists."""
+
+    def __init__(self, raw, identities, intervals):
+        self.raw, self.identities, self.intervals = raw, identities, intervals
+        self.results = {}
+
+    def associations(self, link):
+        source = next((link.get(key) for key in ("cpu_event_index", "enqueue_event_index", "node_event_index")
+                       if link.get(key) is not None), None)
+        key = source, link["status"], bool(link.get("missing_source_event_indexes"))
+        if key not in self.results:
+            self.results[key] = _associations(link, self.raw, self.identities, self.intervals)
+        return [{**row, "explicit_parent_event_indexes": list(row["explicit_parent_event_indexes"])}
+                for row in self.results[key]]
+
+
+class _FlowReferences:
+    """Index raw endpoints once and reuse repeated graph/queue provenance."""
+
+    def __init__(self, raw):
+        self.raw, self.by_key, self.queues = raw, defaultdict(list), defaultdict(list)
+        for event in raw.values():
+            if event.get("ph") in ("s", "f"):
+                self.by_key[event["flow_key"]].append(event["event_index"])
+                if event.get("cat") == "async_task_queue":
+                    self.queues[(event["pid"], event["tid"])].append(event)
+        for events in self.queues.values():
+            events.sort(key=lambda e: (e["start_ns"], e["event_index"]))
+        self.starts = {lane: [e["start_ns"] for e in events] for lane, events in self.queues.items()}
+        self.queue_keys, self.references = {}, {}
+
+    def _queue_keys(self, event_index):
+        if event_index not in self.queue_keys:
+            event = self.raw.get(event_index)
+            if event is None:
+                keys = ()
+            else:
+                lane = event["pid"], event["tid"]
+                events, starts = self.queues.get(lane, []), self.starts.get(lane, [])
+                # Closed endpoints retain evidence candidates only. No source
+                # or causality decision consumes this provenance lookup.
+                first, stop = bisect_left(starts, event["start_ns"]), bisect_right(starts, event["end_ns"])
+                keys = tuple(e["flow_key"] for e in events[first:stop])
+            self.queue_keys[event_index] = keys
+        return self.queue_keys[event_index]
+
+    def event_indexes(self, link):
+        key = tuple(link.get("flow_ids", [])), link.get("enqueue_event_index"), link.get("dequeue_event_index")
+        if key not in self.references:
+            selected = set(key[0])
+            selected.update(self._queue_keys(key[1]))
+            selected.update(self._queue_keys(key[2]))
+            self.references[key] = tuple(sorted({i for flow in selected for i in self.by_key.get(flow, [])}))
+        return list(self.references[key])
+
+
+def _bindings_by_row(bindings):
+    result = defaultdict(list)
+    for index, binding in enumerate(bindings):
+        for number in binding["device_row_indexes"]:
+            result[number].append(index)
     return result
 
 
@@ -350,15 +434,17 @@ def export_anchor_links(core, capture, rounds, host_events, trace_path, trace_me
     raw = _read_evidence_events(core, trace_path, metadata, wanted, progress)
     index = _HostIntervals(host_events)
     identities = _python_identities(raw)
+    associations = _AssociationCache(raw, identities, index)
+    binding_indexes = _bindings_by_row(bindings)
     for link in links:
         link["source_event_indexes"] = sorted({link[k] for k in _INDEX_FIELDS if link.get(k) is not None}
                                              | {int(e["id"]) for e in link["cpu_ancestors"]})
-        link["missing_source_event_indexes"] = sorted(set(link["source_event_indexes"]) - raw.keys())
-        link["host_associations"] = _associations(link, raw, identities, index)
-        link["anchor_binding_indexes"] = [i for i, b in enumerate(bindings) if link["row_index"] in b["device_row_indexes"]]
+        link["missing_source_event_indexes"] = _missing_references(link["source_event_indexes"], raw)
+        link["host_associations"] = associations.associations(link)
+        link["anchor_binding_indexes"] = list(binding_indexes.get(link["row_index"], []))
     result.update(links=links, source_events=[raw[k] for k in sorted(raw)], scan_passes=2,
                   source_task_status_counts=dict(Counter(link["status"] for link in links)),
-                  missing_host_event_indexes=sorted({int(e["event_index"]) for e in host_events} - raw.keys()))
+                  missing_host_event_indexes=_missing_references((int(e["event_index"]) for e in host_events), raw))
     result["drawable_edges"] = _drawable_edges(links, bindings)
     return result
 
@@ -622,20 +708,15 @@ def export_device_task_links(core, capture, rounds, host_events, trace_path, tra
             progress("Verify full device-catalog source/parent references")
         raw = _read_evidence_events(core, trace_path, metadata, wanted, progress, source_links=source_rows)
         result["scan_passes"] = 2
+    if progress:
+        progress("Building device-source indexes: " + format(len(raw), ",") + " evidence events / " +
+                 format(len(host_events), ",") + " recorded Host functions")
     # Include all recorded Python ancestors recovered by core, even if the old
     # five-lane recognizer did not whitelist their names.
     python_hosts = {int(event["event_index"]): event for event in host_events}
     python_hosts.update({number: event for number, event in raw.items() if "python_function" in event.get("cat", "").lower()})
     index, identities = _HostIntervals(python_hosts.values()), _python_identities(raw)
-    flows_by_key, queues_by_lane = defaultdict(list), defaultdict(list)
-    for event in raw.values():
-        if event.get("ph") in ("s", "f"):
-            flows_by_key[event["flow_key"]].append(event["event_index"])
-            if event.get("cat") == "async_task_queue":
-                queues_by_lane[(event["pid"], event["tid"])].append(event)
-    for events in queues_by_lane.values():
-        events.sort(key=lambda e: (e["start_ns"], e["event_index"]))
-    queue_starts = {lane: [e["start_ns"] for e in events] for lane, events in queues_by_lane.items()}
+    associations, flows = _AssociationCache(raw, identities, index), _FlowReferences(raw)
     by_row = {link["row_index"]: link for link in source_rows}
     scopes_by_id = defaultdict(list)
     for scope in scopes:
@@ -644,7 +725,10 @@ def export_device_task_links(core, capture, rounds, host_events, trace_path, tra
     temporal_rounds = defaultdict(set)
     for binding in bindings:
         temporal_rounds[binding["task_key"]].add(binding["round_id"])
-    for task in catalog:
+    association_started = association_last = time.monotonic()
+    if progress:
+        progress("Device task associations: 0/" + format(len(catalog), ",") + " tasks")
+    for task_number, task in enumerate(catalog, 1):
         original = by_row.get(task["row_index"]) if task["catalog_identity_status"] != "AMBIGUOUS_CSV_ROW" else None
         link = deepcopy(original) if original else {"row_index": task["row_index"], "name": task["name"],
             "device_start_ns": task["start_ns"], "device_end_ns": task["end_ns"],
@@ -668,23 +752,12 @@ def export_device_task_links(core, capture, rounds, host_events, trace_path, tra
             for key in (*_INDEX_FIELDS, *_NS_FIELDS, "cpu_name", "cpu_leaf_name", "cpu_category", "connection_id", "correlation_id"):
                 if key not in ("device_start_ns", "device_end_ns"):
                     link[key] = None
-        selected_flows = set(link.get("flow_ids", []))
-        for field in ("enqueue_event_index", "dequeue_event_index"):
-            event = raw.get(link.get(field))
-            if event is None:
-                continue
-            lane = event["pid"], event["tid"]
-            events, starts = queues_by_lane.get(lane, []), queue_starts.get(lane, [])
-            # Evidence candidates include both scope endpoints. This list is
-            # provenance retention only, not input to the core source resolver.
-            first, stop = bisect_left(starts, event["start_ns"]), bisect_right(starts, event["end_ns"])
-            selected_flows.update(e["flow_key"] for e in events[first:stop])
-        link["flow_event_indexes"] = sorted({i for key in selected_flows for i in flows_by_key.get(key, [])})
+        link["flow_event_indexes"] = flows.event_indexes(link)
         link["source_event_indexes"] = sorted({link[k] for k in _INDEX_FIELDS if link.get(k) is not None}
                                               | {int(e["id"]) for e in link.get("cpu_ancestors", [])}
                                               | set(link["flow_event_indexes"]))
-        link["missing_source_event_indexes"] = sorted(set(link["source_event_indexes"]) - raw.keys())
-        link["host_associations"] = _associations(link, raw, identities, index) if original else []
+        link["missing_source_event_indexes"] = _missing_references(link["source_event_indexes"], raw)
+        link["host_associations"] = associations.associations(link) if original else []
         linked_rounds = set()
         for association in link["host_associations"]:
             for scope in scopes_by_id.get(association["host_event_index"], []):
@@ -716,20 +789,31 @@ def export_device_task_links(core, capture, rounds, host_events, trace_path, tra
                           "device_start_ns": task["start_ns"], "device_end_ns": task["end_ns"],
                           "edge_kind": "HOST_TO_DEVICE_TASK", "target": "whole device task, not a U boundary"})
         task_links.append(link)
+        if progress:
+            now = time.monotonic()
+            if now-association_last >= 5:
+                progress("Device task associations: " + format(task_number, ",") + "/" +
+                         format(len(catalog), ",") + " tasks; elapsed " + format(now-association_started, ".1f") + "s")
+                association_last = now
     result.update(links=task_links, task_edges=edges, source_events=[raw[k] for k in sorted(raw)],
                   status=_source_status(task_links), source_status=_source_status(task_links),
                   core_source_status=summary["source_status"],
                   source_scope=summary.get("source_scope"), source_reason=summary.get("source_reason"),
                   source_task_status_counts=dict(Counter(link["status"] for link in task_links)),
-                  missing_host_event_indexes=sorted({int(e["event_index"]) for e in host_events}-raw.keys()))
+                  missing_host_event_indexes=_missing_references((int(e["event_index"]) for e in host_events), raw))
+    if progress:
+        progress("Device task associations complete: " + format(len(task_links), ",") + "/" +
+                 format(len(catalog), ",") + " tasks; elapsed " + format(time.monotonic()-association_started, ".1f") +
+                 "s; source statuses=" + json.dumps(result["source_task_status_counts"], sort_keys=True))
+        progress("Projecting legacy U/HC anchor evidence from the same full task catalog")
     # Project old boundary-only evidence from the same resolution pass. Legacy
     # consumers keep their original endpoint/arrow semantics and do not trigger
     # a second full trace scan.
     anchor_rows = {int(t.row_index) for t in anchor_tasks}
     old_links = [deepcopy(link) for link in task_links if link.get("csv_row_index") in anchor_rows]
+    binding_indexes = _bindings_by_row(anchor_bindings)
     for link in old_links:
-        link["anchor_binding_indexes"] = [i for i, binding in enumerate(anchor_bindings)
-                                         if link["row_index"] in binding["device_row_indexes"]]
+        link["anchor_binding_indexes"] = list(binding_indexes.get(link["row_index"], []))
     old_references = {int(e["event_index"]) for e in host_events}
     for link in old_links:
         old_references.update(link.get("source_event_indexes", []))

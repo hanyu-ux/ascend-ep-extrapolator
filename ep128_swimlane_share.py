@@ -139,34 +139,80 @@ def _available(host, source):
     return merged
 
 
-def _closure(seeds, events):
-    """Preserve explicit index references and all recorded parent candidates.
+class _EventReferences:
+    """Reuse one case's parent index and exact reference graph.
 
-    Parent candidates are retained for audit, not resolved or promoted here.
-    In particular an ambiguous parent remains ambiguous after this selection.
+    All enclosing candidates with the recorded Python parent ID are retained;
+    this cache never resolves ambiguity or changes evidence confidence.
     """
-    parents = defaultdict(list)
-    for event in events.values():
-        if event.get("python_id") is not None:
-            parents[(str(event.get("pid")), str(event.get("tid")), str(event["python_id"]))].append(event)
-    pending, wanted = deque(seeds), set(seeds)
-    while pending:
-        number = pending.popleft()
-        event = events.get(number)
-        if event is None:
-            continue
-        more = _refs(event)
-        parent_id = event.get("python_parent_id")
-        if parent_id is not None and "start_ns" in event and "end_ns" in event:
-            key = (str(event.get("pid")), str(event.get("tid")), str(parent_id))
-            more.update(parent["event_index"] for parent in parents.get(key, [])
-                        if "start_ns" in parent and "end_ns" in parent
-                        and int(parent["start_ns"]) <= int(event["start_ns"])
-                        and int(parent["end_ns"]) >= int(event["end_ns"]))
-        for candidate in more - wanted:
-            wanted.add(candidate)
-            pending.append(candidate)
-    return wanted
+
+    def __init__(self, events):
+        self.events = events
+        self.parents = defaultdict(list)
+        self.neighbors = {}
+        for event in events.values():
+            if event.get("python_id") is not None:
+                key = (str(event.get("pid")), str(event.get("tid")), str(event["python_id"]))
+                self.parents[key].append(event)
+
+    def _neighbors(self, number):
+        if number not in self.neighbors:
+            event = self.events.get(number)
+            more = set()
+            if event is not None:
+                more = _refs(event)
+                parent_id = event.get("python_parent_id")
+                if parent_id is not None and "start_ns" in event and "end_ns" in event:
+                    key = (str(event.get("pid")), str(event.get("tid")), str(parent_id))
+                    more.update(parent["event_index"] for parent in self.parents.get(key, [])
+                                if "start_ns" in parent and "end_ns" in parent
+                                and int(parent["start_ns"]) <= int(event["start_ns"])
+                                and int(parent["end_ns"]) >= int(event["end_ns"]))
+            self.neighbors[number] = frozenset(more)
+        return self.neighbors[number]
+
+    def closure(self, seeds):
+        pending, wanted = deque(seeds), set(seeds)
+        while pending:
+            for candidate in self._neighbors(pending.popleft()) - wanted:
+                wanted.add(candidate)
+                pending.append(candidate)
+        return wanted
+
+    def missing_lookup(self, seeds):
+        """Compute exact missing descendants once for all requested sources.
+
+        Propagation over reverse references handles shared ancestors and cycles
+        without materializing a potentially quadratic full closure per event.
+        """
+        reachable = self.closure(seeds)
+        reverse = defaultdict(list)
+        missing = {}
+        for number in reachable:
+            if number not in self.events:
+                missing[number] = {number}
+            for target in self._neighbors(number):
+                if target != number:
+                    reverse[target].append(number)
+        pending = deque(missing)
+        queued = set(missing)
+        while pending:
+            number = pending.popleft()
+            queued.remove(number)
+            for parent in reverse.get(number, ()):
+                known = missing.setdefault(parent, set())
+                addition = missing[number] - known
+                if addition:
+                    known.update(addition)
+                    if parent not in queued:
+                        pending.append(parent)
+                        queued.add(parent)
+        return missing
+
+
+def _closure(seeds, events):
+    """Preserve explicit references and all recorded parent candidates."""
+    return _EventReferences(events).closure(seeds)
 
 
 def _selected_round(case):
@@ -365,22 +411,40 @@ def _task_link_subset(original, round_id, *, trusted=True, untrusted_status="CLO
     return result, _refs(selected_links) | _refs(edges) | _refs(task_edges) | _refs(selected) | _refs(families), keys
 
 
-def _task_reference_status(result, available, wanted):
+def _task_reference_status(result, available, wanted, references=None):
     """Expose missing saved proof and never keep a confirmed partial path."""
     available_ids = set(available)
     missing = set(wanted) - available_ids
     incomplete_tasks = set(result.get("missing_device_task_keys") or [])
-    binding_missing = {}
-    for number, binding in enumerate(result.get("task_round_bindings") or []):
-        absent = _closure(_refs(binding), available) - available_ids
-        binding_missing[number] = absent
+    bindings = result.get("task_round_bindings") or []
+    links = result.get("links") or []
+    edges = [*(result.get("drawable_edges") or []), *(result.get("task_edges") or [])]
+    binding_refs = [_refs(binding) for binding in bindings]
+    link_refs = [_refs(link) for link in links]
+    edge_refs = [_refs(edge) for edge in edges]
+    seeds = set()
+    for group in (binding_refs, link_refs, edge_refs):
+        for refs in group:
+            seeds.update(refs)
+    references = references if references is not None else _EventReferences(available)
+    missing_lookup = references.missing_lookup(seeds)
+
+    def missing_from(refs):
+        absent = set()
+        for number in refs:
+            absent.update(missing_lookup.get(number, ()))
+        return absent
+
+    binding_missing = [missing_from(refs) for refs in binding_refs]
+    link_missing = [missing_from(refs) for refs in link_refs]
+    for binding, absent in zip(bindings, binding_missing):
         if absent:
             incomplete_tasks.add(_task_key(binding))
             missing.update(absent)
-    for link in result.get("links") or []:
-        if _closure(_refs(link), available) - available_ids:
+    for link, absent in zip(links, link_missing):
+        if absent:
             incomplete_tasks.add(_task_key(link))
-    for number, binding in enumerate(result.get("task_round_bindings") or []):
+    for number, binding in enumerate(bindings):
         if binding_missing[number] or _task_key(binding) in incomplete_tasks:
             if (_binding_relation(binding) == "EXPLICIT_SOURCE_OWNER"
                     or binding.get("runtime_submission_confirmed") is True):
@@ -391,19 +455,18 @@ def _task_reference_status(result, available, wanted):
             binding["selection_evidence_status"] = "MISSING_SAVED_REFERENCES_OR_TASK"
             if binding_missing[number]:
                 binding["missing_source_event_indexes"] = sorted(binding_missing[number])
-    for link in result.get("links") or []:
-        link_missing = _closure(_refs(link), available) - available_ids
-        if link_missing or _task_key(link) in incomplete_tasks:
+    for link, absent in zip(links, link_missing):
+        if absent or _task_key(link) in incomplete_tasks:
             incomplete_tasks.add(_task_key(link))
-            link["missing_source_event_indexes"] = sorted(set(link.get("missing_source_event_indexes") or []) | link_missing)
+            link["missing_source_event_indexes"] = sorted(set(link.get("missing_source_event_indexes") or []) | absent)
             for association in link.get("host_associations") or []:
                 if association.get("runtime_submission_confirmed"):
                     association["original_runtime_submission_confirmed"] = True
                 association.update(runtime_submission_confirmed=False, line_style="dashed")
                 association["selection_evidence_status"] = "MISSING_SAVED_REFERENCES_OR_TASK"
-        missing.update(link_missing)
-    for edge in [*(result.get("drawable_edges") or []), *(result.get("task_edges") or [])]:
-        if _closure(_refs(edge), available) - available_ids or _task_key(edge) in incomplete_tasks:
+        missing.update(absent)
+    for edge, refs in zip(edges, edge_refs):
+        if missing_from(refs) or _task_key(edge) in incomplete_tasks:
             if edge.get("runtime_submission_confirmed"):
                 edge["original_runtime_submission_confirmed"] = True
             edge.update(runtime_submission_confirmed=False, line_style="dashed",
@@ -510,10 +573,12 @@ def _case_evidence(case, core, host_analysis, attach_host, rank, source_case_ind
     available = _available(host_lookup, source_lookup)
     task_events, task_lookup = _events((task_original or {}).get("source_events") or [] if task_clock_ok else [])
     available = _available(available, task_lookup)
-    source_wanted = _closure(source_seeds, available)
-    task_wanted = _closure(task_seeds, available)
-    anchor_host_wanted = _closure(_round_refs(row) | source_seeds, available)
-    host_wanted = _closure(_round_refs(row) | source_seeds | task_seeds, available)
+    references = _EventReferences(available)
+    source_wanted = references.closure(source_seeds)
+    task_wanted = references.closure(task_seeds)
+    round_refs = _round_refs(row)
+    anchor_host_wanted = references.closure(round_refs | source_seeds)
+    host_wanted = references.closure(round_refs | source_seeds | task_seeds)
     kept_host = [deepcopy(event) for event in host_events if event["event_index"] in host_wanted]
     # Host proofs can have a recorded ancestor only in the raw source table.
     # It must survive even when it was not also a selected device-link source.
@@ -527,7 +592,7 @@ def _case_evidence(case, core, host_analysis, attach_host, rank, source_case_ind
     task_missing = set()
     if tasks is not None and task_clock_ok:
         tasks["source_events"] = [deepcopy(available[number]) for number in sorted(task_wanted) if number in available]
-        task_missing = _task_reference_status(tasks, available, task_wanted)
+        task_missing = _task_reference_status(tasks, available, task_wanted, references)
         output["device_task_links"] = tasks
     elif tasks is not None:
         output["device_task_links"] = tasks

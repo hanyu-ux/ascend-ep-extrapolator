@@ -31,6 +31,7 @@ import tempfile
 import time
 
 from ep128_attention_prepare import analyze_attention_prepare
+from ep128_interval_index import MaxEndIntervalIndex
 
 SCHEMA_VERSION = 2
 PROFILE_VERSION = "20261123.1.u_hotspots"
@@ -2554,8 +2555,10 @@ def residual_source_rows(connection, tasks, stages, destination, progress):
         CREATE TABLE resolved(row_index INTEGER PRIMARY KEY,cpu INTEGER,node INTEGER,enq INTEGER,deq INTEGER,
                               wait INTEGER,latency INTEGER,status TEXT);
     """)
-    # Four compact integer vectors per thread avoid repeated scans of 217k CPU
-    # intervals. Dequeue uses worker tid because CANN has a synthetic process ID.
+    # Exact max-end queries keep broad Python scopes without rescanning all
+    # earlier children for every task. Dequeue uses worker tid because CANN has
+    # a synthetic process ID. Input ordering and containment predicates stay the
+    # same as the original scan; this index never chooses a causal owner.
     intervals = {}
     for identity, kind, pid, tid, start, end in connection.execute(
             "SELECT event_index,kind,pid,tid,start,end FROM source_events WHERE kind IN ('cpu','dequeue') "
@@ -2565,13 +2568,11 @@ def residual_source_rows(connection, tasks, stages, destination, progress):
         vectors[0].append(start); vectors[1].append(end); vectors[3].append(identity)
     for key, vectors in intervals.items():
         ordered = sorted(zip(vectors[0], vectors[1], vectors[3]))
-        maximum = -2 ** 63
-        compact = tuple(array('q') for _ in range(4))
+        compact = tuple(array('q') for _ in range(3))
         for start, end, identity in ordered:
-            maximum = max(maximum, end)
-            for vector, value in zip(compact, (start, end, maximum, identity)):
+            for vector, value in zip(compact, (start, end, identity)):
                 vector.append(value)
-        intervals[key] = compact
+        intervals[key] = (*compact, MaxEndIntervalIndex(compact[0], compact[1]))
 
     @lru_cache(maxsize=4096)
     def event(identity):
@@ -2583,10 +2584,8 @@ def residual_source_rows(connection, tasks, stages, destination, progress):
         vectors = intervals.get((kind, pid if kind == "cpu" else None, tid))
         if vectors is None:
             return []
-        starts, ends, prefix, identities = vectors
-        stop, first = bisect.bisect_right(starts, start), bisect.bisect_right(prefix, start)
-        return [event(identities[i]) for i in range(first, stop)
-                if ends[i] > start and (end is None or ends[i] >= end)]
+        _, _, identities, index = vectors
+        return [event(identities[i]) for i in index.containing(start, end)]
 
     def cpu_chain(pid, tid, point):
         return sorted(containing("cpu", pid, tid, point), key=lambda row: (row["start"], -row["end"], row["id"]))
