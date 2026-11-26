@@ -345,7 +345,27 @@ Host主线共五条：`propose`、前处理/DP聚合范围、Runner `prepare_inp
 - `u_swimlane_dp4_package.json`：当前包的 SHA-256 和分片相对路径清单。
 - `u_swimlane_dp4_status.csv`：各 case 的主线 `status`、子函数 `detail_status` 和独立的 `anchor_link_status`。
 
-发送 ZIP 或**最新 `u_swimlane_dp4_package.json` 列出的全部文本分片**即可，不能只取第一片，也不要把不同摘要目录的分片混在一起；原始 CSV/trace 留在原位置。
+上述文件是完整本地诊断存档。包含全部轮次时，文本分片可能达到数百片；只有复制文本能力的环境不要逐片传这个全历史包。原始CSV/trace和完整JSON保留内网。
+
+**已经完成完整导出，只需给PPT提供12个case的代表轮证据时**，运行下面的轻量分享工具。它只读现有`u_swimlane_dp4.json`，不重扫CSV/trace、不重新采样；每个case选原建议轮（优先已有来源解析的轮），保存完整HC/U边界、五条Host线、该轮全部已记录子调用和来源引用闭包。缩小体积依靠选轮、过滤其他轮事件及去除重复字段，不按字节预算删函数/父链或裁剪所选区间。错误case也保留原时钟诊断及设备侧一轮，Host保持未知；不把`PARTIAL`提升为已确认。
+
+```powershell
+python -X utf8 -B -u .\tools\u_swimlane_share.py .\u_swimlane_all12_dp4\u_swimlane_dp4.json --rank dp4 --expected-cases 12 --out .\u_swimlane_ppt_dp4
+```
+
+第一个参数是**已经导出的完整JSON**，不是cases清单或`part001.txt`。将示例路径替换为实际完整导出目录。v2导出的原始Host事件已保留runner attn，分享工具会用完整事件集合重新核对同轮父链，恢复第五条线，不需要重扫trace；歧义候选在过滤前判定，不因分享包变小而被误认为唯一。
+
+新分享包为`u_swimlane_ppt_evidence_v1`，明确不是全历史；每case标明源轮数及未选轮数。`host_children`不再与`host_pairing.child_layer`存两份，子调用名称/起止等相同字段从`host_events`事件表引用恢复，归属和父链证据仍保存。`u_swimlane_ppt_dp4_package.json`列出本次**代表轮分享包**的实际文本片数和全部路径。每片最多64KiB，片数取决于保留证据，不承诺固定一片。重新包装成功退出码为0只表示分享包已写出，原case的`CLOCK_MISMATCH`等状态不会被改变。
+
+只传新分享包的全部文本分片；在内网终端直接显示文件内容，不使用`Set-Clipboard`。例如显示第1片：
+
+```powershell
+$uShare = Get-Content -LiteralPath .\u_swimlane_ppt_dp4\u_swimlane_ppt_dp4_package.json -Raw -Encoding UTF8 | ConvertFrom-Json
+$uShareParts = @($uShare.parts)
+Get-Content -LiteralPath (Join-Path .\u_swimlane_ppt_dp4 $uShareParts[0]) -Raw -Encoding UTF8
+```
+
+按环境已有的文本传递方式发送完整`{"schema":...}`内容，并按清单依次显示其余片；不传ZIP，不混用不同摘要目录的分片。
 
 三个状态应分开读取：主线 `status=READY` 表示至少一轮同时具备四个已验证Host函数、前处理/DP聚合范围（共五条主线）和15个匹配的U阶段，不代表所有保留轮次均完整；`complete_rounds`、`incomplete_rounds` 分别记录两类轮次数量。`detail_status=READY` 另要求前处理/DP区间可互斥拆分，且 `propose`、Runner `prepare_inputs`、Runner `prepare_attn`、model-state `prepare_attn` 四条主函数均有可用的一级子调用。`anchor_link_status` 单独说明设备来源的完整程度，缺少来源不改变主线READY，也不等于设备箭头已被确认。
 
