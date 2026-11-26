@@ -98,9 +98,36 @@ class SwimlaneCoordinatesTests(unittest.TestCase):
             self.assertEqual(lanes["runner_inputs"]["relative_start_ns"], 200)
             self.assertEqual(lanes["runner_inputs"]["overlap_ns"]["main_hc"], 30)
             self.assertEqual(lanes["preparation_dp_aggregate"]["duration_ns"], 40)
+            self.assertEqual(lanes["runner_attn"]["relative_start_ns"], 232)
+            self.assertEqual(lanes["runner_attn"]["duration_ns"], 6)
+            self.assertEqual(lanes["runner_attn"]["overlap_ns"]["main_hc"], 6)
+            self.assertEqual(set(lanes), set(probe.HOST_LANE_KEYS))
             self.assertEqual(row["host_pairing"]["pairing_basis"], "HOST_CALL_ORDER_AND_GRAPH_ENTRY_INFERRED")
             for p, before in original.items():
                 self.assertEqual(p.read_bytes(), before)
+
+    def test_missing_runner_attn_keeps_U_but_cannot_claim_a_complete_host_timeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case, capture, measured, kernel, trace, clock = input_fixture(Path(tmp))
+            events = [e for e in json.loads(trace.read_bytes())
+                      if e.get("name") != host_fixtures.NAMES["runner_attn"]]
+            trace.write_text(json.dumps(events), encoding="utf-8")
+            clock["sha256"] = hashlib.sha256(trace.read_bytes()).hexdigest()
+            with patch.object(core, "normalize_case", return_value=case), patch.object(core, "validate_models"), \
+                    patch.object(core, "_fixed_overlap_input", return_value=kernel), \
+                    patch.object(core, "_case_trace_path", return_value=trace), \
+                    patch.object(core, "read_capture", return_value=capture), \
+                    patch.object(core, "measure_capture", return_value=measured), \
+                    patch.object(core, "residual_trace_scan", return_value=(clock, 0)):
+                result = probe.analyze_case(case, {"sample_model": {}}, Path(tmp), "dp4", lambda _: None)
+            self.assertEqual(result["status"], "PARTIAL")
+            self.assertEqual(result["complete_host_rounds"], 0)
+            self.assertEqual(result["complete_rounds"], 0)
+            row = result["rounds"][0]
+            self.assertEqual(row["stage_status"], "MATCHED")
+            self.assertEqual(row["u_ns"], 220)
+            self.assertNotIn("runner_attn", row["host_lanes"])
+            self.assertIn("runner_attn", row["host_pairing"]["missing"])
 
     def test_clock_failure_keeps_device_boundaries_without_host_attribution(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -203,7 +230,7 @@ class CoordinationBreakdownTests(unittest.TestCase):
         self.assertEqual(report["verified_dp_wait_union_ns"],11)
 
     def test_detail_selection_keeps_all_rounds_and_prefers_available_children(self):
-        good={"round_id":"good","duration_ns":200,"stage_status":"MATCHED","host_lanes":dict.fromkeys(range(4)),
+        good={"round_id":"good","duration_ns":200,"stage_status":"MATCHED","host_lanes":dict.fromkeys(probe.HOST_LANE_KEYS),
               "coordination_breakdown":{"status":"MATCHED"},"host_pairing":{"status":"MATCHED", "child_layer":{
                 "by_role":{k:[{}] for k in probe.ROLE_KEYS}}}}
         partial=deepcopy(good);partial.update(round_id="missing",duration_ns=100,coordination_breakdown={"status":"PARTIAL"})

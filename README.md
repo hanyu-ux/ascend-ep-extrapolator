@@ -321,7 +321,7 @@ TPOT（ms/token） = R / Neff
 
 用已有 S7、S15 等采样按同一 rank 比较不同 BS，可以运行 `python profile_ep128.py cases.local.json --u-overlap-rank dp4 --out u_overlap_dp4`。此模式导出第13、14阶段的逐轮数据、按 case 汇总和 trace 证据清单。需要同次同 rank 的 `kernel_details.csv` 和 `trace_view.json`，直接复用已有采样。完整命令及列说明见[固定 rank 的第13／14阶段覆盖分析](docs/usage.md#固定-rank-的第1314阶段覆盖分析)。
 
-**完整业务泳道导出 v2（Windows，复用已有采样）**：需要逐轮核对主模型、草稿模型、下一主模型准备及 Host 提前提交时，使用独立工具 `tools/u_swimlane_probe.py`。它直接按 cases JSON 读取同次同 rank 的 kernel CSV 和 trace，重新进行离线时钟校验与 HC 分段，输出 `u_swimlane_v2` 数据。v2增加一级子函数、前处理/DP分计，以及设备锚点的 CPU/API/队列/flow 来源诊断；不依赖旧的有界分享文件，也不启动服务、压测或重新采样。配置中的路径须指向仍可访问的原始文件。
+**完整业务泳道导出 v3（Windows，复用已有采样）**：需要逐轮核对主模型、草稿模型、下一主模型准备及 Host 提前提交时，使用独立工具 `tools/u_swimlane_probe.py`。它直接按 cases JSON 读取同次同 rank 的 kernel CSV 和 trace，重新进行离线时钟校验与 HC 分段，输出 `u_swimlane_v3` 数据。工具保留一级子函数、前处理/DP分计，以及设备锚点的 CPU/API/队列/flow 来源诊断；v3另将 Runner `prepare_attn`（块表/slot）列为独立 Host 主线及子调用归属。不依赖旧的有界分享文件，也不启动服务、压测或重新采样。配置中的路径须指向仍可访问的原始文件。
 
 在仓库根目录的 PowerShell 中执行：
 
@@ -335,6 +335,8 @@ python -B -u .\tools\u_swimlane_probe.py .\cases.local.json --rank dp4 --workers
 
 一级子函数按 Host 父 ID 与同线程包含关系核对。下一主调用入口至 Runner `prepare_inputs` 入口之间，分别统计前处理、DP协调及其嵌套等待，按区间 union 做互斥分解；父子调用不能直接相加。DP总调用包含本地图选择和元数据整理，不能标成纯等待；函数及子函数的 wall time 也不等于纯 CPU busy。
 
+Host主线共五条：`propose`、前处理/DP聚合范围、Runner `prepare_inputs`、Runner `prepare_attn`、model-state `prepare_attn`。其中后两者同名但职责不同：Runner方法整理批次块表并下发slot映射计算，model-state方法构造后续attention metadata。二者按同一次next execute的直接Python父ID分别核对，严格检查 inputs→runner attn→state attn→graph 的调用次序；不把runner attn归进metadata函数，不以时间相邻替代父链。`gather_block_tables`、`compute_slot_mappings`等实际出现的调用单独保留到runner attn子层。CPU函数区间与U设备阶段只在同一时钟上求交或回查来源，不强制一对一；原有U总量和15阶段边界不变。v2原始函数列表虽然已采集runner attn，但其四条主线和完整性检查未单独包含它，不能据此声称Host流程已全部展示。
+
 输出目录包含：
 
 - `u_swimlane_dp4.json`：完整导出，保留逐轮15阶段及全部目标 Host 函数的完整起止区间，不按分享文件大小裁剪关键时序；未识别的函数或阶段保留缺失状态。
@@ -345,7 +347,7 @@ python -B -u .\tools\u_swimlane_probe.py .\cases.local.json --rank dp4 --workers
 
 发送 ZIP 或**最新 `u_swimlane_dp4_package.json` 列出的全部文本分片**即可，不能只取第一片，也不要把不同摘要目录的分片混在一起；原始 CSV/trace 留在原位置。
 
-三个状态应分开读取：主线 `status=READY` 表示至少一轮同时具备四条已验证 Host 业务范围和15个匹配的 U 阶段，不代表所有保留轮次均完整；`complete_rounds`、`incomplete_rounds` 分别记录两类轮次数量。`detail_status=READY` 另要求前处理/DP区间可互斥拆分，且 `propose`、Runner `prepare_inputs`、model-state `prepare_attn` 三条主函数均有可用的一级子调用。`anchor_link_status` 单独说明设备来源的完整程度，缺少来源不改变主线READY，也不等于设备箭头已被确认。
+三个状态应分开读取：主线 `status=READY` 表示至少一轮同时具备四个已验证Host函数、前处理/DP聚合范围（共五条主线）和15个匹配的U阶段，不代表所有保留轮次均完整；`complete_rounds`、`incomplete_rounds` 分别记录两类轮次数量。`detail_status=READY` 另要求前处理/DP区间可互斥拆分，且 `propose`、Runner `prepare_inputs`、Runner `prepare_attn`、model-state `prepare_attn` 四条主函数均有可用的一级子调用。`anchor_link_status` 单独说明设备来源的完整程度，缺少来源不改变主线READY，也不等于设备箭头已被确认。
 
 导出会保留各 case 的主线 `PARTIAL`/`ERROR` 及原因，并继续处理其他 case；存在这些主线状态时以非零退出码结束。时钟不匹配不会强制对齐，函数缺失、父 ID 不足或 Host lane 不唯一也不会被补成有效泳道。来源诊断有错误或缺失时仍保留有效的 Host/HC 坐标，单独查看其来源状态，不能只凭退出码判断因果链完整。重新离线处理已有文件不能保证12个 case 都匹配。
 

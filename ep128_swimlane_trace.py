@@ -80,7 +80,7 @@ _PATTERNS_BY_NAME = defaultdict(list)
 for _function_kind, _function_path, _function_name in _FUNCTIONS:
     _PATTERNS_BY_NAME[_function_name].append((_function_kind,
         re.compile(r"(?:^|/)" + _function_path + r"\(\d+\): " + _function_name + r"$")))
-_ROLES = ("outer_propose", "next_execute", "runner_inputs", "state_attn")
+_ROLES = ("outer_propose", "next_execute", "runner_inputs", "runner_attn", "state_attn")
 _BASIS = "HOST_CALL_ORDER_AND_GRAPH_ENTRY_INFERRED"
 _LIMITATIONS = (
     "Python parent IDs verify Host call ownership, not Host-to-kernel causality.",
@@ -265,7 +265,8 @@ def _child_ref(owner, event, index):
 
 
 def _empty_child_layer():
-    return {"by_role": {role: [] for role in ("outer_propose", "preparation_dp_aggregate", "runner_inputs", "state_attn")},
+    return {"by_role": {role: [] for role in (
+                "outer_propose", "preparation_dp_aggregate", "runner_inputs", "runner_attn", "state_attn")},
             "prefix_partition": {"status": "UNCONFIRMED", "parts": [],
                                  "dp_sync": {"events": [], "all_reduce_events": [],
                                              "scope": "Nested observed sync/collective envelopes; inclusive durations are not additive"},
@@ -278,7 +279,8 @@ def _empty_child_layer():
 def _child_layer(pair, events, index):
     result = _empty_child_layer()
     lookup = {e["event_index"]: e for e in events}
-    roots = {role: lookup.get(pair["functions"].get(role)) for role in ("outer_propose", "runner_inputs", "state_attn")}
+    roots = {role: lookup.get(pair["functions"].get(role)) for role in (
+        "outer_propose", "runner_inputs", "runner_attn", "state_attn")}
     owner = lookup.get(pair["functions"].get("next_execute"))
     inputs = roots["runner_inputs"]
     prefix = (owner["start_ns"], inputs["start_ns"]) if owner and inputs else None
@@ -417,16 +419,22 @@ def pair_rounds(core, rounds, events):
         if owner:
             result["functions"]["next_execute"] = owner["event_index"]
             selected_children = {}
-            for role in ("runner_inputs", "state_attn"):
+            for role in ("runner_inputs", "runner_attn", "state_attn"):
                 event = select(role, [e for e in by_kind[role] if _child(owner, e)])
                 if event:
                     result["functions"][role] = event["event_index"]
                     selected_children[role] = event
-            inputs, metadata = selected_children.get("runner_inputs"), selected_children.get("state_attn")
+            inputs, runner_attn, metadata = (selected_children.get(role) for role in (
+                "runner_inputs", "runner_attn", "state_attn"))
             if inputs and metadata:
-                result["order_verified"] = inputs["end_ns"] <= metadata["start_ns"] and metadata["end_ns"] <= graph["start_ns"]
-                if not result["order_verified"]:
+                parent_order = inputs["end_ns"] <= metadata["start_ns"] and metadata["end_ns"] <= graph["start_ns"]
+                attn_order = (runner_attn is not None and inputs["end_ns"] <= runner_attn["start_ns"]
+                              and runner_attn["end_ns"] <= metadata["start_ns"])
+                result["order_verified"] = parent_order and attn_order
+                if not parent_order or runner_attn is not None and not attn_order:
                     result["reasons"].append("INPUT_METADATA_GRAPH_ORDER_CONFLICT")
+                if runner_attn is not None and not attn_order:
+                    result["reasons"].append("RUNNER_ATTN_ORDER_CONFLICT")
             prior = [e for e in cores if _lane(e) == _lane(owner) and e["start_ns"] < owner["start_ns"]]
             current = None
             if prior:

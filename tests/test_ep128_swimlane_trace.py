@@ -32,6 +32,8 @@ NAMES = {
     "graph_dispatch": "vllm/v1/worker/gpu/cudagraph_utils.py(193): dispatch",
     "build_attn_metadata": "vllm_ascend/worker/v2/attn_utils.py(370): build_attn_metadata",
     "metadata_builder": "vllm_ascend/attention/dsa_v1.py(846): build",
+    "blocktable_gather": "vllm/v1/worker/gpu/block_table.py(188): gather_block_tables",
+    "slot_mappings": "vllm/v1/worker/gpu/block_table.py(213): compute_slot_mappings",
 }
 
 
@@ -180,7 +182,7 @@ class PairingTests(unittest.TestCase):
         result = swim.pair_rounds(core, rounds, events)[0]
         self.assertEqual(result["status"], "MATCHED")
         self.assertEqual(result["functions"], {"outer_propose": 3, "next_execute": 4,
-                                               "runner_inputs": 5, "state_attn": 6})
+                                               "runner_inputs": 5, "runner_attn": 9, "state_attn": 6})
         self.assertEqual(result["context"], {"current_execute": 1, "current_sample": 2, "next_main_graph": 7})
         self.assertEqual(result["missing"], [])
         self.assertIn("INFERRED", result["pairing_basis"])
@@ -240,7 +242,8 @@ class PairingTests(unittest.TestCase):
                        host(14, "core_execute", 560, 850, 13, 0),
                        host(15, "runner_inputs", 600, 630, 130, 13),
                        host(16, "state_attn", 640, 780, 131, 13),
-                       host(17, "main_graph", 790, 830, 132, 13)])
+                       host(17, "main_graph", 790, 830, 132, 13),
+                       host(18, "runner_attn", 632, 638, 133, 13)])
         rounds.append({"round_id": "hc-2", "start_ns": "400", "end_ns": "800", "layers": []})
         first, second = swim.pair_rounds(core, rounds, events)
         self.assertEqual(first["status"], "PARTIAL")
@@ -288,6 +291,82 @@ class PairingTests(unittest.TestCase):
         result = swim.pair_rounds(core, rounds, events)[0]
         self.assertEqual(result["status"], "AMBIGUOUS")
         self.assertIsNone(result["functions"]["outer_propose"])
+
+    def test_runner_attn_has_its_own_verified_blocktable_and_slot_children(self):
+        events, rounds = fixture()
+        events.extend([host(60, "blocktable_gather", 233, 234, 60, 34),
+                       host(61, "slot_mappings", 234, 237, 61, 34)])
+        original = deepcopy(events)
+        result = swim.pair_rounds(core, rounds, events)[0]
+        self.assertEqual(result["status"], "MATCHED")
+        self.assertEqual(result["functions"]["runner_attn"], 9)
+        self.assertTrue(result["ownership_verified"]["runner_attn"])
+        children = result["child_layer"]["by_role"]["runner_attn"]
+        self.assertEqual([c["event_index"] for c in children], [60, 61])
+        self.assertEqual([c["kind"] for c in children], ["blocktable_gather", "slot_mappings"])
+        self.assertTrue(all(c["parent_chain_verified"] and c["depth"] == 1 for c in children))
+        self.assertEqual([(c["start_ns"], c["end_ns"]) for c in children], [(233, 234), (234, 237)])
+        self.assertEqual(result["child_layer"]["by_role"]["runner_inputs"][0]["event_index"], 8)
+        self.assertEqual(events, original)
+
+    def test_runner_attn_in_propose_cannot_fill_missing_next_runner_attn(self):
+        events, rounds = fixture()
+        events = [e for e in events if e["kind"] != "runner_attn"]
+        events.append(host(60, "runner_attn", 60, 70, 60, 20))
+        result = swim.pair_rounds(core, rounds, events)[0]
+        self.assertEqual(result["status"], "PARTIAL")
+        self.assertIsNone(result["functions"]["runner_attn"])
+        self.assertIn("runner_attn", result["missing"])
+        self.assertFalse(result["order_verified"])
+        self.assertEqual(result["child_layer"]["by_role"]["runner_attn"], [])
+        self.assertIn(60, [c["event_index"] for c in result["child_layer"]["by_role"]["outer_propose"]])
+
+    def test_runner_attn_requires_same_parent_and_worker_thread(self):
+        for change in ({"python_parent_id": "999"}, {"tid": "999"}):
+            with self.subTest(change=change):
+                events, rounds = fixture()
+                events[-1].update(change)
+                result = swim.pair_rounds(core, rounds, events)[0]
+                self.assertEqual(result["status"], "PARTIAL")
+                self.assertIsNone(result["functions"]["runner_attn"])
+                self.assertFalse(result["ownership_verified"]["runner_attn"])
+
+    def test_runner_attn_order_must_follow_inputs_and_precede_state_metadata(self):
+        for start, end in ((220, 235), (241, 245)):
+            with self.subTest(start=start, end=end):
+                events, rounds = fixture()
+                events[-1].update(start_ns=start, end_ns=end, duration_ns=end-start)
+                result = swim.pair_rounds(core, rounds, events)[0]
+                self.assertEqual(result["status"], "PARTIAL")
+                self.assertEqual(result["round_identity_status"], "ORDER_CONFLICT")
+                self.assertIn("RUNNER_ATTN_ORDER_CONFLICT", result["reasons"])
+                self.assertTrue(result["ownership_verified"]["runner_attn"])
+                self.assertFalse(result["order_verified"])
+
+    def test_two_runner_attn_calls_are_ambiguous_not_selected_by_duration(self):
+        events, rounds = fixture()
+        events.append(host(60, "runner_attn", 231, 239, 60, 3))
+        result = swim.pair_rounds(core, rounds, events)[0]
+        self.assertEqual(result["status"], "AMBIGUOUS")
+        self.assertEqual(result["candidates"]["runner_attn"], [60, 9])
+        self.assertIsNone(result["functions"]["runner_attn"])
+
+    def test_runner_attn_is_not_borrowed_from_the_next_hc_round(self):
+        events, rounds = fixture()
+        events = [e for e in events if e["kind"] != "runner_attn"]
+        events.extend([host(12, "core_sample", 460, 550, 12, 0),
+                       host(13, "outer_propose", 480, 540, 120, 12),
+                       host(14, "core_execute", 560, 850, 13, 0),
+                       host(15, "runner_inputs", 600, 630, 130, 13),
+                       host(16, "state_attn", 640, 780, 131, 13),
+                       host(17, "main_graph", 790, 830, 132, 13),
+                       host(18, "runner_attn", 632, 638, 133, 13)])
+        rounds.append({"round_id": "hc-2", "start_ns": "400", "end_ns": "800", "layers": []})
+        first, second = swim.pair_rounds(core, rounds, events)
+        self.assertEqual(first["status"], "PARTIAL")
+        self.assertIsNone(first["functions"]["runner_attn"])
+        self.assertEqual(second["status"], "MATCHED")
+        self.assertEqual(second["functions"]["runner_attn"], 18)
 
     def test_nested_dp_wait_proof_and_prefix_partition_do_not_sum_inclusive_times(self):
         events, rounds = fixture()
