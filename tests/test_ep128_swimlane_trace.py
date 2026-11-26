@@ -22,6 +22,16 @@ NAMES = {
     "runner_attn": "vllm/v1/worker/gpu/model_runner.py(1472): prepare_attn",
     "main_graph": "vllm_ascend/worker/v2/aclgraph_utils.py(174): run_fullgraph",
     "seq_lens_cpu": "vllm_ascend/worker/v2/model_runner.py(1306): _update_seq_lens_cpu",
+    "dp_dispatch_patch": "vllm_ascend/patch/worker/patch_v2/patch_model_runner.py(16): dispatch_cg_and_sync_dp",
+    "dp_dispatch": "vllm/v1/worker/gpu/dp_utils.py(214): dispatch_cg_and_sync_dp",
+    "dp_sync": "vllm/v1/worker/gpu/dp_utils.py(44): sync_cudagraph_and_dp_padding",
+    "all_reduce": "torch/distributed/distributed_c10d.py(2917): all_reduce",
+    "collective_wrapper": "torch/distributed/c10d_logger.py(80): wrapper",
+    "cpu_wait": "<built-in method wait of pybind11_builtins.Work object at 0x123>",
+    "stream_dependency": "torch_npu/npu/streams.py(38): wait_stream",
+    "graph_dispatch": "vllm/v1/worker/gpu/cudagraph_utils.py(193): dispatch",
+    "build_attn_metadata": "vllm_ascend/worker/v2/attn_utils.py(370): build_attn_metadata",
+    "metadata_builder": "vllm_ascend/attention/dsa_v1.py(846): build",
 }
 
 
@@ -50,6 +60,12 @@ def fixture():
 
 
 class CollectionTests(unittest.TestCase):
+    def collect(self, records):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.json"
+            path.write_text(json.dumps(records), encoding="utf-8")
+            return swim.collect_host_events(core, path, 0, hashlib.sha256(path.read_bytes()).hexdigest())
+
     def test_exact_integer_times_full_ranges_and_original_indexes(self):
         epoch = 1790000000000000000
         records = [{"ph": "M", "name": "thread_name", "pid": 10, "tid": 7, "args": {"name": "worker"}}]
@@ -104,6 +120,57 @@ class CollectionTests(unittest.TestCase):
             with patch.object(core, "residual_iter_trace_events", changing_trace):
                 with self.assertRaisesRegex(ValueError, "Trace changed"):
                     swim.collect_host_events(core, path, 0, expected)
+
+    def test_native_cpu_apis_and_source_ids_survive_but_device_duplicates_do_not(self):
+        name = "AscendCL@aclnnMixedQuantSparseFlashMlaMetadataGetWorkspaceSize"
+        raw = {"ph": "X", "name": name, "cat": "cann_api", "pid": 20, "tid": 7,
+               "ts": "1.000", "dur": "0.125", "id": 55, "id2": {"global": "g1"},
+               "args": {"Connection Id": 100, "Correlation Id": "corr", "Stream Id": 61,
+                        "thread_id": 7, "Tensor Content": [1, 2, 3]}}
+        device = {**raw, "pid": 30, "cat": "kernel"}
+        late_device = {**raw, "pid": 31}
+        result = self.collect([raw, device, late_device,
+            {"ph": "M", "name": "process_name", "pid": 20, "args": {"name": "CANN"}},
+            {"ph": "M", "name": "process_name", "pid": 31, "args": {"name": "Ascend Hardware"}}])
+        self.assertEqual(len(result["events"]), 1)
+        saved = result["events"][0]
+        self.assertEqual(saved["kind"], "native_workspace")
+        self.assertEqual(saved["event_type"], "native_api")
+        self.assertEqual(saved["source_ids"], {"connectionid": "100", "correlationid": "corr", "streamid": "61",
+                                              "raw_id": "55", "raw_id2_global": "g1"})
+        self.assertEqual(saved["thread_id"], "7")
+        self.assertEqual(result["counts"]["device_events_rejected"], 2)
+        self.assertNotIn("tensorcontent", json.dumps(saved).lower())
+
+    def test_stream_dependencies_are_distinct_from_blocking_waits_and_copies(self):
+        names = [NAMES["stream_dependency"], "AscendCL@aclrtStreamWaitEvent",
+                 NAMES["cpu_wait"], "Event::synchronize", "aten::copy_"]
+        records = [{"ph": "X", "name": name, "cat": "python_function" if i in (0, 2) else "cpu_op",
+                    "pid": 10, "tid": 7, "ts": i, "dur": 1} for i, name in enumerate(names)]
+        result = self.collect(records)
+        self.assertEqual([e["kind"] for e in result["events"]],
+                         ["stream_dependency", "stream_dependency", "cpu_wait", "cpu_sync", "host_copy"])
+
+    def test_capture_builder_is_a_recorded_call_not_synthesized_per_replay(self):
+        names = ["vllm_ascend/attention/dsa_v1.py(835): build_for_cudagraph_capture", NAMES["main_graph"], NAMES["main_graph"]]
+        result = self.collect([{"ph": "X", "name": name, "cat": "python_function", "pid": 10,
+                                "tid": 7, "ts": i*100, "dur": 5} for i, name in enumerate(names)])
+        self.assertEqual(sum(e["kind"] == "metadata_capture_builder" for e in result["events"]), 1)
+        self.assertEqual(sum(e["kind"] == "main_graph" for e in result["events"]), 2)
+
+    def test_lifecycle_gather_and_input_wrappers_are_selected_by_path(self):
+        names = ["vllm/v1/worker/gpu/model_runner.py(100): update_requests",
+                 "vllm_ascend/worker/v2/model_runner.py(751): gather_batch_req_state",
+                 "vllm/v1/worker/gpu/block_table.py(135): apply_staged_writes",
+                 "vllm/v1/worker/gpu/input_batch.py(300): prepare_pos_seq_lens",
+                 "vllm/v1/worker/gpu/input_batch.py(400): combine_sampled_and_draft_tokens",
+                 "vllm/utils/torch_utils.py(600): async_tensor_h2d",
+                 "other_package/model_runner.py(100): update_requests"]
+        result = self.collect([{"ph": "X", "name": name, "cat": "python_function", "pid": 10,
+                                "tid": 7, "ts": i, "dur": 1} for i, name in enumerate(names)])
+        self.assertEqual([e["kind"] for e in result["events"]],
+                         ["request_update_requests", "request_gather_batch_req_state", "blocktable_apply",
+                          "input_prepare_pos_seq_lens", "input_combine_sampled_and_draft_tokens", "input_h2d"])
 
 
 class PairingTests(unittest.TestCase):
@@ -221,6 +288,85 @@ class PairingTests(unittest.TestCase):
         result = swim.pair_rounds(core, rounds, events)[0]
         self.assertEqual(result["status"], "AMBIGUOUS")
         self.assertIsNone(result["functions"]["outer_propose"])
+
+    def test_nested_dp_wait_proof_and_prefix_partition_do_not_sum_inclusive_times(self):
+        events, rounds = fixture()
+        events.extend([host(40, "dp_dispatch_patch", 170, 195, 40, 3),
+                       host(41, "dp_dispatch", 171, 194, 41, 40),
+                       host(42, "dp_sync", 173, 192, 42, 41),
+                       host(43, "collective_wrapper", 175, 190, 43, 42),
+                       host(44, "all_reduce", 176, 189, 44, 43),
+                       host(45, "cpu_wait", 177, 188, 45, 44),
+                       host(46, "stream_dependency", 178, 180, 46, 44)])
+        result = swim.pair_rounds(core, rounds, events)[0]
+        block = result["child_layer"]["prefix_partition"]
+        self.assertEqual(block["status"], "VERIFIED_HOST_BOUNDARIES")
+        self.assertEqual([(p["key"], p["duration_ns"]) for p in block["parts"]],
+                         [("pre_dispatch", 10), ("dispatch_envelope", 25), ("post_dispatch", 5)])
+        self.assertEqual(sum(p["duration_ns"] for p in block["parts"]), 40)
+        self.assertEqual([r["event_index"] for r in block["dp_sync"]["events"]], [42])
+        self.assertEqual([r["event_index"] for r in block["dp_sync"]["all_reduce_events"]], [44])
+        self.assertEqual([r["event_index"] for r in block["wait_candidates"]], [45])
+        wait = block["wait_candidates"][0]
+        self.assertTrue(wait["parent_chain_verified"])
+        self.assertEqual(wait["owning_all_reduce_event_index"], 44)
+        self.assertEqual(wait["duration_ns"], 11)
+        self.assertGreater(wait["depth"], 1)
+
+    def test_same_named_collective_in_propose_is_not_next_prefix_dp_wait(self):
+        events, rounds = fixture()
+        events.extend([host(50, "all_reduce", 70, 100, 50, 20), host(51, "cpu_wait", 75, 95, 51, 50)])
+        result = swim.pair_rounds(core, rounds, events)[0]
+        layer = result["child_layer"]
+        self.assertIn(51, [r["event_index"] for r in layer["by_role"]["outer_propose"]])
+        self.assertEqual(layer["prefix_partition"]["wait_candidates"], [])
+        self.assertEqual(layer["prefix_partition"]["dp_sync"]["events"], [])
+
+    def test_inferred_wait_is_preserved_but_not_counted_as_verified_dp_wait(self):
+        events, rounds = fixture()
+        events.extend([host(40, "dp_dispatch", 170, 195, 40, 3),
+                       host(42, "dp_sync", 173, 192, 42, 40),
+                       host(44, "all_reduce", 176, 189, 44, 42),
+                       host(45, "cpu_wait", 177, 188, 45, 999)])
+        result = swim.pair_rounds(core, rounds, events)[0]
+        layer = result["child_layer"]
+        wait = next(r for r in layer["by_role"]["preparation_dp_aggregate"] if r["event_index"] == 45)
+        self.assertEqual(wait["relation"], "time_containment_only")
+        self.assertFalse(wait["parent_chain_verified"])
+        self.assertEqual(layer["prefix_partition"]["wait_candidates"], [])
+
+    def test_missing_child_calls_remain_unknown_instead_of_fabricated_dp(self):
+        events, rounds = fixture()
+        result = swim.pair_rounds(core, rounds, events)[0]
+        block = result["child_layer"]["prefix_partition"]
+        self.assertEqual(block["status"], "NOT_RECORDED")
+        self.assertEqual(block["parts"][0]["key"], "preparation_dp_aggregate")
+        self.assertEqual(block["parts"][0]["duration_ns"], 40)
+        self.assertEqual(block["dp_sync"]["events"], [])
+        self.assertEqual(block["wait_candidates"], [])
+
+    def test_two_outer_dispatch_calls_do_not_choose_one_for_a_complete_partition(self):
+        events, rounds = fixture()
+        events.extend([host(40, "dp_dispatch", 170, 180, 40, 3),
+                       host(41, "dp_dispatch", 185, 195, 41, 3)])
+        block = swim.pair_rounds(core, rounds, events)[0]["child_layer"]["prefix_partition"]
+        self.assertEqual(block["status"], "AMBIGUOUS")
+        self.assertEqual([p["key"] for p in block["parts"]], ["preparation_dp_aggregate"])
+
+    def test_native_metadata_is_containment_only_and_direct_python_child_has_depth_one(self):
+        events, rounds = fixture()
+        events.extend([host(60, "build_attn_metadata", 250, 370, 60, 31),
+                       host(61, "metadata_builder", 260, 350, 61, 60),
+                       {"event_index": 62, "kind": "native_workspace", "name": "AscendCL@aclnnMetadataGetWorkspaceSize",
+                        "pid": "20", "tid": "7", "event_type": "native_api", "cat": "cann_api",
+                        "start_ns": 270, "end_ns": 340, "duration_ns": 70}])
+        layer = swim.pair_rounds(core, rounds, events)[0]["child_layer"]["by_role"]["state_attn"]
+        rows = {r["event_index"]: r for r in layer}
+        self.assertEqual(rows[60]["depth"], 1)
+        self.assertEqual(rows[61]["depth"], 2)
+        self.assertIsNone(rows[62]["depth"])
+        self.assertEqual(rows[62]["relation"], "native_thread_time_containment_only")
+        self.assertFalse(rows[62]["parent_chain_verified"])
 
 
 if __name__ == "__main__":

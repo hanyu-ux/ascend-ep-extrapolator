@@ -17,14 +17,16 @@ import json
 import multiprocessing
 from pathlib import Path
 import sys
+import tempfile
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import profile_ep128 as core
 from ep128_swimlane_trace import collect_host_events, pair_rounds
+from ep128_swimlane_links import export_anchor_links
 
 
-SCHEMA = "u_swimlane_v1"
+SCHEMA = "u_swimlane_v2"
 TEXT_CHUNK = 60000
 ROLE_KEYS = ("outer_propose", "runner_inputs", "state_attn")
 STAMP_KEYS = {"start_ns", "end_ns", "origin_ns", "timestamp_ns", "clock_offset_ns",
@@ -49,7 +51,8 @@ def wire(value, key=""):
 
 def task_anchor(task):
     return {key: getattr(task, key, None) for key in
-            ("row_index", "name", "op_type", "start_ns", "end_ns", "stream_id", "task_id", "model_id")}
+            ("row_index", "name", "op_type", "start_ns", "end_ns", "device_id", "stream_id", "task_id", "model_id",
+             "context_id", "batch_id", "subtask_id", "task_type")}
 
 
 def round_coordinates(measured, capture, case):
@@ -111,6 +114,61 @@ def coordinate(event, origin):
             "relative_start_ns": start-origin, "relative_end_ns": end-origin, "duration_ns": end-start}
 
 
+def coordination_breakdown(prefix, child):
+    """Disjoint wall ranges; verified nested waits never become additive costs."""
+    left, right = int(prefix["start_ns"]), int(prefix["end_ns"])
+    partition = child.get("prefix_partition", {})
+    sync = partition.get("dp_sync", {}).get("events", [])
+    waits = partition.get("wait_candidates", [])
+    refs = child.get("by_role", {}).get("preparation_dp_aggregate", [])
+    verified = lambda ref: ref.get("parent_chain_verified") is True
+    contained = lambda ref: left <= int(ref["start_ns"]) < int(ref["end_ns"]) <= right
+    span = lambda ref: (int(ref["start_ns"]), int(ref["end_ns"]))
+    result = {"status": "PARTIAL", "duration_ns": right-left,
+              "dp_coordination_wall_ns": None, "outside_coordination_wall_ns": None,
+              "verified_dp_wait_union_ns": None, "wait_status": "NOT_RECORDED_OR_NOT_VERIFIED",
+              "scope": "Wall intervals, not CPU busy or pure communication latency. DP sync includes its local setup and graph selection. "
+                       "Nested all_reduce and wait scopes are not added to their parent."}
+    if any(verified(r) and not contained(r) for r in sync):
+        result["reason"] = "Verified DP scope crosses preparation aggregate boundary"
+        return result
+    d = core.a_union([span(r) for r in sync if verified(r) and contained(r)])
+    def subtract(intervals, mask):
+        return core.a_union([piece for a, b in intervals for piece in core.residual_complement(
+            a, b, core.a_union([(max(a, c), min(b, e)) for c, e in mask if max(a,c)<min(b,e)]))])
+    def amount(intervals):
+        return sum(b-a for a,b in intervals)
+    local_names = {"update_pp_decode_requests", "finish_requests", "free_states", "add_requests", "update_requests",
+                   "apply_staged_writes", "gather_batch_req_state"}
+    def name(ref):
+        return str(ref.get("name", "")).rsplit(": ", 1)[-1]
+    graph = core.a_union([span(r) for r in refs if verified(r) and contained(r) and name(r)=="dispatch"])
+    graph = subtract(graph, d)
+    local = core.a_union([span(r) for r in refs if verified(r) and contained(r) and name(r) in local_names])
+    local = subtract(local, core.a_union(d+graph))
+    rest = subtract([(left,right)], core.a_union(d+graph+local))
+    categories = (("local_request_batch", local), ("local_graph_selection", graph),
+                  ("dp_coordination", d), ("unattributed_wall", rest))
+    parts = sorted(({"key": key, "start_ns": a, "end_ns": b, "duration_ns": b-a}
+                    for key, intervals in categories for a,b in intervals), key=lambda p:p["start_ns"])
+    if sum(p["duration_ns"] for p in parts) != right-left or any(
+            a["end_ns"] != b["start_ns"] for a,b in zip(parts,parts[1:])):
+        raise ValueError("Preparation/DP wall partition does not close")
+    result.update(parts=parts, known_local_request_batch_ns=amount(local), local_graph_outside_dp_ns=amount(graph),
+                  unattributed_wall_ns=amount(rest), unknown_sync_events=sum(not verified(r) for r in sync))
+    if d:
+        result.update(dp_coordination_wall_ns=amount(d), outside_coordination_wall_ns=right-left-amount(d))
+        w = core.a_union([span(r) for r in waits if verified(r) and contained(r)])
+        if w and subtract(w,d):
+            result["reason"] = "Verified wait is outside verified DP synchronization scopes"
+        elif w:
+            result.update(verified_dp_wait_union_ns=amount(w), wait_status="PYTHON_PARENT_CHAIN_VERIFIED",
+                          dp_other_wall_ns=amount(d)-amount(w))
+        if partition.get("status") in ("MATCHED", "VERIFIED_HOST_BOUNDARIES") and not result.get("unknown_sync_events") and not result.get("reason"):
+            result["status"] = "MATCHED"
+    return result
+
+
 def attach_host(rounds, pairs, events):
     """Store original call envelopes and separate temporal intersections."""
     lookup = {e["event_index"]: e for e in events}
@@ -131,6 +189,11 @@ def attach_host(rounds, pairs, events):
                 "relative_end_ns": b-row["origin_ns"], "duration_ns": b-a,
                 "start_event_index": next_id, "end_event_index": input_id,
                 "scope": "Aggregate from next core execute entry to runner inputs entry; not DP wait duration"}
+        child = pair.get("child_layer", {})
+        row["host_children"] = {role: [{**ref, **coordinate(ref, row["origin_ns"])} for ref in refs]
+                                for role, refs in child.get("by_role", {}).items()}
+        if "preparation_dp_aggregate" in row["host_lanes"]:
+            row["coordination_breakdown"] = coordination_breakdown(row["host_lanes"]["preparation_dp_aggregate"], child)
         regions = {**row["regions"], **{w["window_key"]: w for w in row["u_windows"]}}
         regions.update({"u" + str(stage["stage_number"]): stage
                         for w in row["u_windows"] for stage in w["stages"]})
@@ -141,10 +204,28 @@ def attach_host(rounds, pairs, events):
     return rounds
 
 
-def analyze_case(item, config, base, rank, progress=print):
+def detail_rounds(rounds, limit):
+    """Suggest complete business families without discarding any saved round."""
+    ready = [r for r in rounds if r["host_pairing"]["status"] == "MATCHED"
+             and len(r["host_lanes"]) == 4 and r["stage_status"] == "MATCHED"]
+    def detailed(row):
+        child = row["host_pairing"].get("child_layer", {})
+        roles = child.get("by_role", {})
+        return (row.get("coordination_breakdown", {}).get("status") == "MATCHED"
+                and all(roles.get(role) for role in ROLE_KEYS))
+    candidates = [r for r in ready if detailed(r)] or ready
+    ordered = sorted(candidates, key=lambda r: (r["duration_ns"], r["round_id"]))
+    if not ordered:
+        return [], "PARTIAL"
+    middle = len(ordered)//2
+    sequence = sorted(range(len(ordered)), key=lambda i: (abs(i-middle), i))[:limit]
+    return [ordered[i] for i in sequence], "READY" if any(detailed(r) for r in candidates) else "PARTIAL"
+
+
+def analyze_case(item, config, base, rank, progress=print, detail_limit=1):
     result = {"case": item.get("name", "invalid"), "rank": rank, "status": "ERROR", "error": None,
               "rounds": [], "host_events": [], "device_anchors": [], "complete_rounds": 0,
-              "incomplete_rounds": 0, "ready_requires_all_rounds": False,
+              "incomplete_rounds": 0, "ready_requires_all_rounds": False, "detail_status": "UNAVAILABLE",
               "ready_definition": "At least one retained round has all four verified Host scopes and 15 matched U stages; "
                                   "READY does not mean every retained round is complete"}
     try:
@@ -167,40 +248,51 @@ def analyze_case(item, config, base, rank, progress=print):
                       declared_trim_rounds=case.get("trim_rounds", 2), exported_trim_rounds=0)
         result["rounds"], result["device_anchors"] = round_coordinates(measured, capture, diagnostic_case)
         result["incomplete_rounds"] = len(result["rounds"])
-        progress("Pass 1/2: verifying trace/device clock anchors")
+        progress("Pass 1/4: verifying trace/device clock anchors")
         clock, offset = core.residual_trace_scan(trace, capture["tasks"], progress)
         result["trace"] = clock
         if clock.get("status") != "ALIGNED_X_EVENTS" or offset is None:
             raise ValueError("Trace alignment failed: " + str(clock.get("status")))
-        progress("Pass 2/2: retaining complete target Host calls across the whole trace")
+        progress("Pass 2/4: retaining Host children, coordination, wait and native API calls")
         host = collect_host_events(core, trace, offset, clock["sha256"], progress)
         result["host_events"] = host["events"]
         result["host_scan"] = {key: value for key, value in host.items() if key != "events"}
         pairs = pair_rounds(core, measured["rounds"], host["events"])
         result["rounds"] = attach_host(result["rounds"], pairs, host["events"])
-        if any(stamp(path) != info for path, info in before.items()):
-            raise ValueError("An input changed during offline export")
         ready = [r for r in result["rounds"] if r["host_pairing"]["status"] == "MATCHED"
                  and len(r["host_lanes"]) == 4 and r["stage_status"] == "MATCHED"]
         result["complete_rounds"] = len(ready)
         result["incomplete_rounds"] = len(result["rounds"]) - len(ready)
         result["complete_host_rounds"] = sum(len(r["host_lanes"]) == 4 for r in result["rounds"])
         if ready:
-            ordered = sorted(ready, key=lambda r: (r["duration_ns"], r["round_id"]))
-            result["suggested_round_id"] = ordered[len(ordered)//2]["round_id"]
+            selected, result["detail_status"] = detail_rounds(result["rounds"], detail_limit)
+            result["suggested_round_id"] = selected[0]["round_id"]
+            result["source_link_round_ids"] = [r["round_id"] for r in selected]
+            result["source_link_scope"] = "Detailed source links for these complete representative rounds; all rounds and target Host calls remain retained"
+            progress("Pass 3/4: resolving device-anchor CPU/API/queue/flow sources")
+            try:
+                with tempfile.TemporaryDirectory(prefix="u-swimlane-links-") as directory:
+                    result["anchor_links"] = export_anchor_links(core, capture, selected, host["events"],
+                        trace, clock, offset, Path(directory), progress)
+            except Exception as error:
+                result["anchor_links"] = {"status": "ERROR", "error": type(error).__name__+": "+str(error),
+                                          "scope": "Valid Host/HC coordinates are preserved; no device arrows are confirmed"}
+                result["detail_status"] = "PARTIAL"
             result["status"] = "READY"
         else:
             result["status"] = "PARTIAL"
             result["error"] = "No round has both four verified Host call scopes and all 15 matched U stages"
         result["round_selection"] = "All complete CSV HC rounds retained; suggested round is median-cycle among complete candidates"
+        if any(stamp(path) != info for path, info in before.items()):
+            raise ValueError("An input changed during offline export")
     except Exception as error:
         result["status"], result["error"] = "ERROR", type(error).__name__ + ": " + str(error)
     return result
 
 
-def worker(index, item, config, base, rank):
+def worker(index, item, config, base, rank, detail_limit=1):
     with redirect_stdout(core._CaseProgressStream(sys.stdout, item["name"] + " / " + rank)):
-        return index, analyze_case(item, config, base, rank, lambda message: print(message, flush=True))
+        return index, analyze_case(item, config, base, rank, lambda message: print(message, flush=True), detail_limit)
 
 
 def worker_failure(index, item, rank, error, stage):
@@ -217,11 +309,11 @@ def checked_outcome(outcome, index, item, rank):
     return outcome
 
 
-def run_cases(items, config, base, rank, workers):
+def run_cases(items, config, base, rank, workers, detail_limit=1):
     if workers == 1:
         for index, item in enumerate(items):
             try:
-                outcome = checked_outcome(worker(index, item, config, base, rank), index, item, rank)
+                outcome = checked_outcome(worker(index, item, config, base, rank, detail_limit), index, item, rank)
             except Exception as error:
                 outcome = worker_failure(index, item, rank, error, "serial")
             yield outcome
@@ -236,7 +328,7 @@ def run_cases(items, config, base, rank, workers):
     try:
         for index, item in enumerate(items):
             try:
-                future = executor.submit(worker, index, item, config, base, rank)
+                future = executor.submit(worker, index, item, config, base, rank, detail_limit)
             except Exception as error:
                 reported.add(index)
                 yield worker_failure(index, item, rank, error, "submit")
@@ -304,14 +396,15 @@ def write_packages(payload, out, rank):
 
 
 def write_status(payload, out, rank):
-    fields = ("case", "rank", "bs", "S", "status", "rounds", "complete_host_rounds", "complete_rounds", "incomplete_rounds",
-              "suggested_round_id", "trace_status", "error")
+    fields = ("case", "rank", "bs", "S", "status", "detail_status", "rounds", "complete_host_rounds", "complete_rounds", "incomplete_rounds",
+              "suggested_round_id", "trace_status", "anchor_link_status", "error")
     with core._io_path(out / ("u_swimlane_" + rank + "_status.csv")).open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fields)
         writer.writeheader()
         for entry in payload["cases"]:
             row = {key: entry.get(key) for key in fields}
-            row.update(rounds=len(entry.get("rounds", [])), trace_status=(entry.get("trace") or {}).get("status"))
+            row.update(rounds=len(entry.get("rounds", [])), trace_status=(entry.get("trace") or {}).get("status"),
+                       anchor_link_status=(entry.get("anchor_links") or {}).get("status"))
             writer.writerow(row)
 
 
@@ -322,6 +415,8 @@ def main(argv=None):
     parser.add_argument("--workers", type=core._cli_positive_workers, default=None)
     parser.add_argument("--case", dest="names", action="append", help="Optional case selection; default exports ALL cases")
     parser.add_argument("--expected-cases", type=core._cli_positive_workers)
+    parser.add_argument("--detail-rounds", type=core._cli_positive_workers, default=1,
+                        help="Complete representative rounds per case for device-source links; all Host calls and HC/U rounds are still retained")
     parser.add_argument("--out", type=Path, default=Path("u_swimlane_all_dp4"))
     args = parser.parse_args(argv)
     if not args.rank or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-" for c in args.rank):
@@ -383,13 +478,19 @@ def main(argv=None):
                "manifest_sha256": hashlib.sha256(core._io_path(manifest).read_bytes()).hexdigest(),
                "planned_cases": len(selected), "completed_cases": 0,
                "execution": {"parallelism": "case", "workers": workers}, "cases": [],
+               "detail_rounds_per_case": args.detail_rounds,
+               "trace_passes_per_aligned_case": 4,
+               "diagram_contract": {"host_color_by": "function_kind", "host_labels": "function name and wall time",
+                                    "show_hc_overlap_labels": False, "children_depth_to_display": 1,
+                                    "confirmed_device_edge": "solid", "inferred_or_source_only_edge": "dashed",
+                                    "cpu_wait": "Do not invent a directly submitted device kernel"},
                "retention": {"all_complete_hc_rounds": True, "all_recognized_host_calls": True,
                              "host_calls_clipped": False, "byte_budget_truncation": False},
                "scope": "Existing CSV/trace offline diagnostic only. HC envelopes are not full graphs or continuous busy time. "
                         "Host calls are full wall ranges. Round association by Host order/graph entry is labeled inference, "
                         "not a complete device flow proof. Missing/ambiguous/unaligned data are never filled from other rounds."}
     complete = {}
-    for index, entry in run_cases(selected, config, manifest.parent, args.rank, workers):
+    for index, entry in run_cases(selected, config, manifest.parent, args.rank, workers, args.detail_rounds):
         complete[index] = entry
         payload["cases"] = [complete[k] for k in sorted(complete)]
         payload["completed_cases"] = len(complete)
@@ -398,7 +499,8 @@ def main(argv=None):
     write_status(payload, out, args.rank)
     archive, parts = write_packages(payload, out, args.rank)
     ready = sum(e["status"] == "READY" for e in payload["cases"])
-    print(f"READY={ready}/{len(selected)}; full coordinates were not truncated", flush=True)
+    detailed = sum(e.get("detail_status") == "READY" for e in payload["cases"])
+    print(f"READY={ready}/{len(selected)}; child-detail READY={detailed}/{len(selected)}; full coordinates were not truncated", flush=True)
     print("Send ZIP: " + str(archive), flush=True)
     print("Or send ALL " + str(len(parts)) + " text parts listed in u_swimlane_"+args.rank+"_package.json", flush=True)
     return int(ready != len(selected))

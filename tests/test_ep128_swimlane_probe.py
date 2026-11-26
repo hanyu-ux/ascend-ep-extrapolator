@@ -19,6 +19,7 @@ from unittest.mock import patch
 import zipfile
 
 import profile_ep128 as core
+import ep128_swimlane_trace as host_analysis
 import test_ep128_swimlane_trace as host_fixtures
 import test_ep128_v2_measure as stage_fixtures
 
@@ -131,6 +132,88 @@ class SwimlaneCoordinatesTests(unittest.TestCase):
                     probe.round_coordinates(measured, capture, case)
 
 
+class CoordinationBreakdownTests(unittest.TestCase):
+    def ref(self, name, start, end, index=1, verified=True):
+        return {"event_index": index, "name": "fixture.py(1): "+name, "kind": name,
+                "start_ns": start, "end_ns": end, "duration_ns": end-start,
+                "parent_chain_verified": verified}
+
+    def child(self, waits=True):
+        f=self.ref
+        sync=f("sync_cudagraph_and_dp_padding",250,800,10)
+        refs=[f("update_requests",10,100),f("gather_batch_req_state",110,160,2),
+              f("dispatch",170,200,3),f("dispatch",300,350,4),sync]
+        return {"by_role":{"preparation_dp_aggregate":refs},
+                "prefix_partition":{"status":"MATCHED", "dp_sync":{"events":[sync]},
+                    "wait_candidates":[f("wait",400,600,11),f("wait",450,500,12)] if waits else []}}
+
+    def test_dp_local_and_graph_wall_partition_closes_without_nested_double_count(self):
+        report=probe.coordination_breakdown({"start_ns":0,"end_ns":1000},self.child())
+        self.assertEqual(report["status"],"MATCHED")
+        self.assertEqual(report["dp_coordination_wall_ns"],550)
+        self.assertEqual(report["outside_coordination_wall_ns"],450)
+        self.assertEqual(report["verified_dp_wait_union_ns"],200)
+        self.assertEqual(report["dp_other_wall_ns"],350)
+        self.assertEqual(report["known_local_request_batch_ns"],140)
+        self.assertEqual(report["local_graph_outside_dp_ns"],30)
+        self.assertEqual(report["unattributed_wall_ns"],280)
+        self.assertEqual(sum(p["duration_ns"] for p in report["parts"]),1000)
+        self.assertTrue(all(a["end_ns"]==b["start_ns"] for a,b in zip(report["parts"],report["parts"][1:])))
+
+    def test_no_recorded_wait_stays_unknown_instead_of_zero(self):
+        report=probe.coordination_breakdown({"start_ns":0,"end_ns":1000},self.child(waits=False))
+        self.assertEqual(report["dp_coordination_wall_ns"],550)
+        self.assertIsNone(report["verified_dp_wait_union_ns"])
+        self.assertNotIn("dp_other_wall_ns",report)
+
+    def test_containment_only_sync_does_not_become_verified_dp_time(self):
+        child=self.child()
+        child["prefix_partition"]["dp_sync"]["events"][0]["parent_chain_verified"]=False
+        report=probe.coordination_breakdown({"start_ns":0,"end_ns":1000},child)
+        self.assertEqual(report["status"],"PARTIAL")
+        self.assertIsNone(report["dp_coordination_wall_ns"])
+        self.assertIsNone(report["verified_dp_wait_union_ns"])
+
+    def test_wait_outside_sync_is_not_used_as_dp_wait(self):
+        child=self.child()
+        child["prefix_partition"]["wait_candidates"][0].update(start_ns=300,end_ns=900)
+        report=probe.coordination_breakdown({"start_ns":0,"end_ns":1000},child)
+        self.assertEqual(report["status"],"PARTIAL")
+        self.assertIn("outside",report["reason"])
+        self.assertIsNone(report["verified_dp_wait_union_ns"])
+
+    def test_old_parent_only_evidence_is_not_invented_into_a_dp_split(self):
+        report=probe.coordination_breakdown({"start_ns":0,"end_ns":1000},{})
+        self.assertEqual(report["status"],"PARTIAL")
+        self.assertEqual(report["unattributed_wall_ns"],1000)
+        self.assertIsNone(report["dp_coordination_wall_ns"])
+
+    def test_real_child_schema_integrates_with_verified_prefix_statistics(self):
+        events,rounds=host_fixtures.fixture()
+        h=host_fixtures.host
+        events.extend([h(40,"dp_dispatch_patch",170,195,40,3), h(41,"dp_dispatch",171,194,41,40),
+                       h(42,"dp_sync",173,192,42,41), h(43,"collective_wrapper",175,190,43,42),
+                       h(44,"all_reduce",176,189,44,43), h(45,"cpu_wait",177,188,45,44)])
+        pair=host_analysis.pair_rounds(core,rounds,events)[0]
+        report=probe.coordination_breakdown({"start_ns":160,"end_ns":200},pair["child_layer"])
+        self.assertEqual(pair["child_layer"]["prefix_partition"]["status"],"VERIFIED_HOST_BOUNDARIES")
+        self.assertEqual(report["status"],"MATCHED")
+        self.assertEqual(report["duration_ns"],40)
+        self.assertEqual(report["dp_coordination_wall_ns"],19)
+        self.assertEqual(report["verified_dp_wait_union_ns"],11)
+
+    def test_detail_selection_keeps_all_rounds_and_prefers_available_children(self):
+        good={"round_id":"good","duration_ns":200,"stage_status":"MATCHED","host_lanes":dict.fromkeys(range(4)),
+              "coordination_breakdown":{"status":"MATCHED"},"host_pairing":{"status":"MATCHED", "child_layer":{
+                "by_role":{k:[{}] for k in probe.ROLE_KEYS}}}}
+        partial=deepcopy(good);partial.update(round_id="missing",duration_ns=100,coordination_breakdown={"status":"PARTIAL"})
+        rounds=[partial,good];before=deepcopy(rounds)
+        selected,status=probe.detail_rounds(rounds,1)
+        self.assertEqual(status,"READY")
+        self.assertEqual(selected[0]["round_id"],"good")
+        self.assertEqual(rounds,before)
+
+
 class LosslessPackageTests(unittest.TestCase):
     def test_twelve_cases_and_multipart_preserve_every_coordinate_byte(self):
         rng = random.Random(123)
@@ -223,7 +306,7 @@ class WorkerIsolationTests(unittest.TestCase):
                 return False
             def shutdown(self, **kwargs):
                 pass
-            def submit(self, function, index, item, config, base, rank):
+            def submit(self, function, index, item, config, base, rank, detail_limit):
                 if index == 0:
                     raise OSError("one failed submit")
                 f = Future()
