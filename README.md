@@ -321,15 +321,19 @@ TPOT（ms/token） = R / Neff
 
 用已有 S7、S15 等采样按同一 rank 比较不同 BS，可以运行 `python profile_ep128.py cases.local.json --u-overlap-rank dp4 --out u_overlap_dp4`。此模式导出第13、14阶段的逐轮数据、按 case 汇总和 trace 证据清单。需要同次同 rank 的 `kernel_details.csv` 和 `trace_view.json`，直接复用已有采样。完整命令及列说明见[固定 rank 的第13／14阶段覆盖分析](docs/usage.md#固定-rank-的第1314阶段覆盖分析)。
 
-**完整业务泳道导出（Windows，复用已有采样）**：需要逐轮核对主模型、草稿模型、下一主模型准备及 Host 提前提交时，使用独立工具 `tools/u_swimlane_probe.py`。它直接按 cases JSON 读取同次同 rank 的 kernel CSV 和 trace，重新进行离线时钟校验与 HC 分段，不依赖旧的有界分享文件，也不启动服务、压测或重新采样。配置中的路径须指向仍可访问的原始文件。
+**完整业务泳道导出 v2（Windows，复用已有采样）**：需要逐轮核对主模型、草稿模型、下一主模型准备及 Host 提前提交时，使用独立工具 `tools/u_swimlane_probe.py`。它直接按 cases JSON 读取同次同 rank 的 kernel CSV 和 trace，重新进行离线时钟校验与 HC 分段，输出 `u_swimlane_v2` 数据。v2增加一级子函数、前处理/DP分计，以及设备锚点的 CPU/API/队列/flow 来源诊断；不依赖旧的有界分享文件，也不启动服务、压测或重新采样。配置中的路径须指向仍可访问的原始文件。
 
 在仓库根目录的 PowerShell 中执行：
 
 ```powershell
-python -B -u .\tools\u_swimlane_probe.py .\cases.local.json --rank dp4 --workers 4 --expected-cases 12 --out .\u_swimlane_all12_dp4
+python -B -u .\tools\u_swimlane_probe.py .\cases.local.json --rank dp4 --workers 4 --expected-cases 12 --detail-rounds 1 --out .\u_swimlane_all12_dp4
 ```
 
 `cases.local.json` 是采样清单，不是 `trace_view.json`。工具默认处理清单中的全部 case；`--expected-cases 12` 用于核对数量，不会自动补齐缺少的组合。若要比较 BS2/4/8/16 × S7/9/15，应在清单中列出对应的12个 case。所有 case 固定使用 dp4，缺失时不借用其他 rank。
+
+`--detail-rounds 1` 默认每个 case 选择1个完整代表轮解析锚点来源，优先从子函数较完整的候选中选取周期中位附近的轮次。需要更多例子时可改为 `--detail-rounds 3`；选中轮次内部不裁剪来源记录。该选项只限制深入回查来源的轮数，全部保留的 HC/U 轮次及目标 Host 函数完整区间仍会导出。具备完整代表轮的对齐 case 正常对完整 trace 分四次流式扫描：时钟锚点、Host及子调用、设备锚点来源的 SQL 关联、原始来源引用与 Python 父 ID 核验；无可用设备锚点或中途失败的 case 不会强行继续。`--workers 4` 按 case 并行处理，不是重新采样。
+
+一级子函数按 Host 父 ID 与同线程包含关系核对。下一主调用入口至 Runner `prepare_inputs` 入口之间，分别统计前处理、DP协调及其嵌套等待，按区间 union 做互斥分解；父子调用不能直接相加。DP总调用包含本地图选择和元数据整理，不能标成纯等待；函数及子函数的 wall time 也不等于纯 CPU busy。
 
 输出目录包含：
 
@@ -337,8 +341,15 @@ python -B -u .\tools\u_swimlane_probe.py .\cases.local.json --rank dp4 --workers
 - `u_swimlane_dp4.zip`：上述 JSON 的压缩文件，可直接传递。
 - `u_swimlane_dp4_parts_<SHA前12位>/part001.txt` 等：同一 JSON 的 gzip + Base64 无损分片，每片不超过64KiB。每个完整 JSON 使用独立的摘要子目录，重复导出不混入旧包的多余分片。
 - `u_swimlane_dp4_package.json`：当前包的 SHA-256 和分片相对路径清单。
+- `u_swimlane_dp4_status.csv`：各 case 的主线 `status`、子函数 `detail_status` 和独立的 `anchor_link_status`。
 
-发送 ZIP 或**最新 `u_swimlane_dp4_package.json` 列出的全部文本分片**即可，不能只取第一片，也不要把不同摘要目录的分片混在一起；原始 CSV/trace 留在原位置。case 的 `READY` 表示至少一轮同时具备四条已验证 Host 业务范围和15个匹配的 U 阶段，不代表所有保留轮次均完整；`complete_rounds`、`incomplete_rounds` 分别记录两类轮次数量。导出会保留各 case 的 `PARTIAL`/`ERROR` 及原因，并继续处理其他 case；存在这些 case 状态时以非零退出码结束。时钟不匹配不会强制对齐，函数缺失、父 ID 不足或 Host lane 不唯一也不会被补成有效泳道。重新离线处理已有文件不能保证12个 case 都匹配；CPU 函数壁钟与设备阶段的时间重叠也不等于纯 CPU 忙碌或已证明的设备提交因果。
+发送 ZIP 或**最新 `u_swimlane_dp4_package.json` 列出的全部文本分片**即可，不能只取第一片，也不要把不同摘要目录的分片混在一起；原始 CSV/trace 留在原位置。
+
+三个状态应分开读取：主线 `status=READY` 表示至少一轮同时具备四条已验证 Host 业务范围和15个匹配的 U 阶段，不代表所有保留轮次均完整；`complete_rounds`、`incomplete_rounds` 分别记录两类轮次数量。`detail_status=READY` 另要求前处理/DP区间可互斥拆分，且 `propose`、Runner `prepare_inputs`、model-state `prepare_attn` 三条主函数均有可用的一级子调用。`anchor_link_status` 单独说明设备来源的完整程度，缺少来源不改变主线READY，也不等于设备箭头已被确认。
+
+导出会保留各 case 的主线 `PARTIAL`/`ERROR` 及原因，并继续处理其他 case；存在这些主线状态时以非零退出码结束。时钟不匹配不会强制对齐，函数缺失、父 ID 不足或 Host lane 不唯一也不会被补成有效泳道。来源诊断有错误或缺失时仍保留有效的 Host/HC 坐标，单独查看其来源状态，不能只凭退出码判断因果链完整。重新离线处理已有文件不能保证12个 case 都匹配。
+
+用于绘图的 `diagram_contract` 要求 Host 按函数名称/类别着色并标注完整壁钟，不按与HC重叠的程度染色。只有明确来源链确认的 Host→设备关系才画实线；推断关系画虚线，缺少来源则不画箭头。CPU阻塞等待不虚构为它直接提交了一个NPU kernel，时间重叠也不自动构成设备提交因果。
 
 脚本默认尝试对源 U1、U2 识别连续的 8+7 个父阶段，并对 Markov 逐位置选 token 保留子阶段。15阶段仅用于解释 U，**不额外加到周期上，也不改变外推结果**。
 
