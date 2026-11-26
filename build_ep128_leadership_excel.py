@@ -23,7 +23,7 @@ import unicodedata
 import ep128_xlsx_writer as xlsx_writer
 from ep128_xlsx_writer import MAX_ROW, Workbook, cell_reference
 
-RENDERER_VERSION = "20261126.1.swimlane_charts"
+RENDERER_VERSION = "20261126.3.exclusive_swimlanes"
 PENDING = "待估算"
 PREVIEW = "版式预览"
 METHOD_SET = "layer_mean_methods"

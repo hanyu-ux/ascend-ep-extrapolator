@@ -15,6 +15,7 @@ from zipfile import ZipFile
 import build_ep128_leadership_excel as renderer
 import profile_ep128 as core
 import test_ep128_swimlane_share as fixtures
+from ep128_swimlane_mechanism import mechanism_drawing
 from test_ep128_layer_mean_excel import residual_report
 
 
@@ -45,6 +46,21 @@ def workbook_names(path):
 
 
 class SwimlaneExcelIntegrationTests(unittest.TestCase):
+    def test_async_mechanism_is_explicitly_non_temporal_and_inside_its_canvas(self):
+        drawing=mechanism_drawing()
+        self.assertFalse(drawing["temporal"])
+        self.assertIn("非实测",drawing["description"])
+        self.assertNotIn("真实时间",drawing["description"])
+        for e in drawing["elements"]:
+            for start,size,bound in (("x","width","width"),("y","height","height")):
+                if start in e:
+                    self.assertGreaterEqual(e[start],0)
+                    self.assertLessEqual(e[start]+e.get(size,0),drawing[bound])
+            for point,bound in (("x1","width"),("x2","width"),("y1","height"),("y2","height")):
+                if point in e:
+                    self.assertGreaterEqual(e[point],0)
+                    self.assertLessEqual(e[point],drawing[bound])
+
     def test_html_is_available_before_excel_save_even_if_excel_export_fails(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
@@ -76,7 +92,7 @@ class SwimlaneExcelIntegrationTests(unittest.TestCase):
             self.assertEqual(workbook_names(target), ["额外图表统计"])
             with ZipFile(target) as archive:
                 drawing = ET.fromstring(archive.read("xl/drawings/drawing1.xml"))
-                self.assertEqual(len(drawing.findall(".//xdr:grpSp", XDR)), 24)
+                self.assertEqual(len(drawing.findall(".//xdr:grpSp", XDR)), 25)  # 24 measured panels + non-temporal mechanism
                 text = " ".join(drawing.itertext())
                 self.assertIn("runner.prepare_attn", text)
                 self.assertIn("CLOCK_MISMATCH", text)
@@ -87,6 +103,9 @@ class SwimlaneExcelIntegrationTests(unittest.TestCase):
             self.assertIn("SYNTHETIC_bs2_s9", document)
             self.assertIn("CLOCK_MISMATCH", document)
             self.assertIn("compute_slot_mappings", document)
+            self.assertIn("横向不表示时间", document)
+            self.assertIn("互斥子阶段汇总", document)
+            self.assertIn("U15全边界来源审计", document)
             self.assertNotIn("Set-Clipboard", document)
 
     def test_full_report_keeps_eleven_sheets_and_old_sheet_xml_unchanged(self):
