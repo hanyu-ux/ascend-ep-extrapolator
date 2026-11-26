@@ -45,6 +45,25 @@ def workbook_names(path):
 
 
 class SwimlaneExcelIntegrationTests(unittest.TestCase):
+    def test_html_is_available_before_excel_save_even_if_excel_export_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            source = sample_source(directory)
+            original = source.read_bytes()
+            target = directory/"early_preview.xlsx"
+            messages = []
+            with patch.object(renderer.Workbook, "save", side_effect=OSError("synthetic Excel write failure")):
+                with self.assertRaisesRegex(OSError, "synthetic Excel"):
+                    renderer.build_swimlane_workbook(target, swimlane_json=source, progress=messages.append)
+            self.assertFalse(target.exists())
+            document = target.with_suffix(".html").read_text(encoding="utf-8")
+            self.assertIn("SYNTHETIC_bs8_s15", document)
+            self.assertIn("swimlane-detail", document)
+            self.assertEqual(source.read_bytes(), original)
+            html_index = next(i for i, text in enumerate(messages) if "HTML泳道已生成" in text)
+            excel_index = next(i for i, text in enumerate(messages) if "绘制全部case总览" in text)
+            self.assertLess(html_index, excel_index)
+
     def test_twelve_cases_draw_locally_without_trace_reads_and_keep_error_cases(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)

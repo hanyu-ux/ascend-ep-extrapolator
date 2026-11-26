@@ -44,6 +44,7 @@ jobs:
           python -B -S -m unittest discover -s tests -p 'test_ep128_host_stack_probe.py' -v
           python -B -S -m unittest discover -s tests -p 'test_ep128_host_stack_evidence.py' -v
           python -B -S -m unittest discover -s tests -p 'test_ep128_swimlane*.py' -v
+          python -B -S -m unittest discover -s tests -p 'test_ep128_xlsx_merge_index.py' -v
       - name: Verify long Windows input paths
         if: ${{ !cancelled() }}
         run: python -B -S -m unittest discover -s tests -p 'test_ep128_windows_paths.py' -v

@@ -74,7 +74,8 @@ class ExcelDiagnosticsTests(unittest.TestCase):
         self.assertIn(519.4321, book["估算总览"][1].values())
         self.assertIn(str(source), book["复核记录"][1].values())
         self.assertTrue(out.with_suffix(".html").is_file())
-        self.assertEqual([message for message in stages if not message.startswith((*INPUT_DIAGNOSTIC_PREFIXES, "HTML："))],
+        self.assertTrue(any(message.startswith("时间账本 1/1：") for message in stages))
+        self.assertEqual([message for message in stages if not message.startswith((*INPUT_DIAGNOSTIC_PREFIXES, "HTML：", "时间账本 "))],
                          ["复用已加载核心报告", "校验核心报告", *renderer.SHEETS,
                           "核对Excel关键结果", "写入XLSX", "写入HTML预览"])
         html_stages = [message for message in stages if message.startswith("HTML：")]
