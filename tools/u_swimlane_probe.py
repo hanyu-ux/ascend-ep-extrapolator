@@ -3,7 +3,8 @@
 
 Reads schema_version=2 cases JSON, kernel CSV and trace JSON only. No model,
 service, benchmark, accelerator package or new capture is started. All complete
-source HC rounds and all recognized Host calls survive lossless ZIP/text export.
+source HC rounds, recognized Host calls and full device task/source catalog are
+saved locally. ZIP/text packaging is optional via --no-package.
 """
 
 import argparse
@@ -23,10 +24,11 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import profile_ep128 as core
 from ep128_swimlane_trace import collect_host_events, pair_rounds
-from ep128_swimlane_links import export_anchor_links
+from ep128_swimlane_links import export_device_catalog, export_device_task_links
 
 
 SCHEMA = "u_swimlane_v3"
+EXPORT_VERSION = "20261126.4.full_device_sources"
 TEXT_CHUNK = 60000
 ROLE_KEYS = ("outer_propose", "runner_inputs", "runner_attn", "state_attn")
 HOST_LANE_KEYS = ("outer_propose", "preparation_dp_aggregate", "runner_inputs", "runner_attn", "state_attn")
@@ -219,14 +221,17 @@ def detail_rounds(rounds, limit):
     if not ordered:
         return [], "PARTIAL"
     middle = len(ordered)//2
-    sequence = sorted(range(len(ordered)), key=lambda i: (abs(i-middle), i))[:limit]
+    sequence = sorted(range(len(ordered)), key=lambda i: (abs(i-middle), i))
+    if limit:
+        sequence = sequence[:limit]
     return [ordered[i] for i in sequence], "READY" if any(detailed(r) for r in candidates) else "PARTIAL"
 
 
-def analyze_case(item, config, base, rank, progress=print, detail_limit=1):
+def analyze_case(item, config, base, rank, progress=print, detail_limit=0):
     result = {"case": item.get("name", "invalid"), "rank": rank, "status": "ERROR", "error": None,
               "rounds": [], "host_events": [], "device_anchors": [], "complete_rounds": 0,
               "incomplete_rounds": 0, "ready_requires_all_rounds": False, "detail_status": "UNAVAILABLE",
+              "device_task_status": "UNAVAILABLE", "export_version": EXPORT_VERSION,
               "ready_definition": "At least one retained round has four verified Host functions, the preparation/DP aggregate, and 15 matched U stages; "
                                   "READY does not mean every retained round is complete"}
     try:
@@ -248,6 +253,10 @@ def analyze_case(item, config, base, rank, progress=print, detail_limit=1):
         result.update(kernel_path=str(kernel), kernel_sha256=capture["sha256"], trace_path=str(trace),
                       declared_trim_rounds=case.get("trim_rounds", 2), exported_trim_rounds=0)
         result["rounds"], result["device_anchors"] = round_coordinates(measured, capture, diagnostic_case)
+        # Device-only CSV evidence survives clock/Host failures. Source and
+        # trace-only task attribution are added only after clock verification.
+        result["device_task_links"] = export_device_catalog(capture, result["rounds"])
+        result["device_task_status"] = "CSV_ONLY_CLOCK_UNVERIFIED"
         result["incomplete_rounds"] = len(result["rounds"])
         progress("Pass 1/4: verifying trace/device clock anchors")
         clock, offset = core.residual_trace_scan(trace, capture["tasks"], progress)
@@ -255,9 +264,16 @@ def analyze_case(item, config, base, rank, progress=print, detail_limit=1):
         if clock.get("status") != "ALIGNED_X_EVENTS" or offset is None:
             raise ValueError("Trace alignment failed: " + str(clock.get("status")))
         progress("Pass 2/4: retaining Host children, coordination, wait and native API calls")
-        host = collect_host_events(core, trace, offset, clock["sha256"], progress)
+        host = collect_host_events(core, trace, offset, clock["sha256"], progress,
+                                   retain_device_events=True, device_trace_metadata=clock)
         result["host_events"] = host["events"]
-        result["host_scan"] = {key: value for key, value in host.items() if key != "events"}
+        result["host_scan"] = {key: value for key, value in host.items() if key not in ("events", "trace_device_events")}
+        # Keep an independent aligned device snapshot before source lookup:
+        # a resolver failure must not discard already read trace-only copies.
+        result["device_task_links"] = export_device_catalog(capture, result["rounds"],
+            trace_device_events=host.get("trace_device_events", ()), trace_meta=clock, offset=offset)
+        result["device_task_links"]["device_event_scan"] = host.get("device_event_scan", {})
+        result["device_task_status"] = "DEVICE_ONLY_SOURCES_NOT_RESOLVED"
         pairs = pair_rounds(core, measured["rounds"], host["events"])
         result["rounds"] = attach_host(result["rounds"], pairs, host["events"])
         ready = [r for r in result["rounds"] if r["host_pairing"]["status"] == "MATCHED"
@@ -266,23 +282,40 @@ def analyze_case(item, config, base, rank, progress=print, detail_limit=1):
         result["incomplete_rounds"] = len(result["rounds"]) - len(ready)
         result["complete_host_rounds"] = sum(set(HOST_LANE_KEYS).issubset(r["host_lanes"]) for r in result["rounds"])
         if ready:
-            selected, result["detail_status"] = detail_rounds(result["rounds"], detail_limit)
-            result["suggested_round_id"] = selected[0]["round_id"]
+            preferred, result["detail_status"] = detail_rounds(result["rounds"], detail_limit)
+            result["suggested_round_id"] = preferred[0]["round_id"]
+            selected = result["rounds"] if not detail_limit else preferred
             result["source_link_round_ids"] = [r["round_id"] for r in selected]
-            result["source_link_scope"] = "Detailed source links for these complete representative rounds; all rounds and target Host calls remain retained"
-            progress("Pass 3/4: resolving device-anchor CPU/API/queue/flow sources")
-            try:
-                with tempfile.TemporaryDirectory(prefix="u-swimlane-links-") as directory:
-                    result["anchor_links"] = export_anchor_links(core, capture, selected, host["events"],
-                        trace, clock, offset, Path(directory), progress)
-            except Exception as error:
-                result["anchor_links"] = {"status": "ERROR", "error": type(error).__name__+": "+str(error),
-                                          "scope": "Valid Host/HC coordinates are preserved; no device arrows are confirmed"}
-                result["detail_status"] = "PARTIAL"
+            result["source_link_scope"] = "Full capture task catalog and sources; selected rounds provide explicit cycle/Host family relations, never time-only ownership"
             result["status"] = "READY"
         else:
+            selected = result["rounds"] if not detail_limit else result["rounds"][:detail_limit]
             result["status"] = "PARTIAL"
             result["error"] = "No round has all four verified Host functions, the preparation/DP aggregate and all 15 matched U stages"
+        # Source diagnostics are independent of Host-chain completeness: all
+        # CSV/trace-only device tasks survive, including unresolved stages,
+        # unassigned work and async work outside selected Host/cycle spans.
+        result["device_source_round_ids"] = [r["round_id"] for r in selected]
+        progress("Pass 3/4: resolving ALL captured device tasks, including metadata/copies and asynchronous sources")
+        try:
+            with tempfile.TemporaryDirectory(prefix="u-swimlane-tasks-") as directory:
+                device = export_device_task_links(core, capture, selected, host["events"],
+                    trace, clock, offset, Path(directory), progress,
+                    trace_device_events=host.get("trace_device_events", ()))
+            result["anchor_links"] = device.pop("anchor_links")
+            device["device_event_scan"] = host.get("device_event_scan", {})
+            if not host.get("trace_device_events"):
+                device["trace_only_task_status"] = "SCANNED_NO_DEVICE_X_EVENTS"
+            result["device_task_links"] = device
+            result["device_task_status"] = device.get("status", "UNAVAILABLE")
+        except Exception as error:
+            message = type(error).__name__+": "+str(error)
+            result["device_task_links"].update(status="ERROR", error=message,
+                scope="Full already-read CSV/trace device catalog survives; source resolution failed; no missing sources are called absent")
+            result["device_task_status"] = "ERROR"
+            result["anchor_links"] = {"status": "ERROR", "error": message,
+                                      "scope": "Valid Host/HC coordinates are preserved; no device arrows are confirmed"}
+            result["detail_status"] = "PARTIAL"
         result["round_selection"] = "All complete CSV HC rounds retained; suggested round is median-cycle among complete candidates"
         if any(stamp(path) != info for path, info in before.items()):
             raise ValueError("An input changed during offline export")
@@ -291,7 +324,7 @@ def analyze_case(item, config, base, rank, progress=print, detail_limit=1):
     return result
 
 
-def worker(index, item, config, base, rank, detail_limit=1):
+def worker(index, item, config, base, rank, detail_limit=0):
     with redirect_stdout(core._CaseProgressStream(sys.stdout, item["name"] + " / " + rank)):
         return index, analyze_case(item, config, base, rank, lambda message: print(message, flush=True), detail_limit)
 
@@ -310,7 +343,7 @@ def checked_outcome(outcome, index, item, rank):
     return outcome
 
 
-def run_cases(items, config, base, rank, workers, detail_limit=1):
+def run_cases(items, config, base, rank, workers, detail_limit=0):
     if workers == 1:
         for index, item in enumerate(items):
             try:
@@ -399,7 +432,8 @@ def write_packages(payload, out, rank):
 
 def write_status(payload, out, rank):
     fields = ("case", "rank", "bs", "S", "status", "detail_status", "rounds", "complete_host_rounds", "complete_rounds", "incomplete_rounds",
-              "suggested_round_id", "trace_status", "anchor_link_status", "error")
+              "suggested_round_id", "trace_status", "anchor_link_status", "device_task_status", "device_tasks", "trace_only_tasks",
+              "metadata_name_matches", "trace_only_task_status", "task_source_counts", "device_task_error", "error")
     with core._io_path(out / ("u_swimlane_" + rank + "_status.csv")).open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fields)
         writer.writeheader()
@@ -407,7 +441,67 @@ def write_status(payload, out, rank):
             row = {key: entry.get(key) for key in fields}
             row.update(rounds=len(entry.get("rounds", [])), trace_status=(entry.get("trace") or {}).get("status"),
                        anchor_link_status=(entry.get("anchor_links") or {}).get("status"))
+            device = entry.get("device_task_links") or {}
+            tasks = device.get("device_tasks") or []
+            row.update(device_tasks=len(tasks) if device else None,
+                       trace_only_tasks=sum(t.get("source_kind") == "TRACE_ONLY" for t in tasks) if device else None,
+                       metadata_name_matches=sum("metadata" in str(t.get("name", "")).casefold() for t in tasks) if device else None,
+                       trace_only_task_status=device.get("trace_only_task_status", "UNAVAILABLE"),
+                       task_source_counts=json.dumps(device.get("source_task_status_counts", {}), ensure_ascii=True, sort_keys=True),
+                       device_task_error=device.get("error"))
             writer.writerow(row)
+
+
+def write_device_tables(payload, out, rank):
+    """Readable task/source/round indexes; full event/flow proof stays in JSON."""
+    stem = "u_swimlane_" + rank
+    catalog_fields = ("case", "rank", "task_key", "source_kind", "csv_row_index", "trace_event_index", "name", "op_type",
+                      "start_ns", "end_ns", "duration_ns", "device_id", "stream_id", "task_id", "model_id",
+                      "context_id", "batch_id", "subtask_id", "task_type", "catalog_identity_status", "source_status")
+    source_fields = ("case", "rank", "task_key", "source_kind", "source_status", "cpu_event_index", "cpu_name", "cpu_start_ns", "cpu_end_ns",
+                     "cpu_leaf_event_index", "cpu_leaf_name", "node_event_index", "node_start_ns", "node_end_ns",
+                     "enqueue_event_index", "enqueue_start_ns", "enqueue_end_ns", "dequeue_event_index", "dequeue_start_ns", "dequeue_end_ns",
+                     "queue_wait_ns", "submit_to_device_ns", "connection_id", "correlation_id",
+                     "flow_ids_json", "host_associations_json", "missing_source_event_indexes_json", "reason")
+    round_fields = ("case", "rank", "task_key", "round_id", "relation", "host_event_index", "host_role", "binding_json")
+    def make_writer(stream, fields):
+        writer = csv.DictWriter(stream, fields, extrasaction="ignore")
+        writer.writeheader()
+        return writer
+    paths = [out/(stem+suffix) for suffix in ("_device_tasks.csv", "_task_sources.csv", "_task_rounds.csv")]
+    with core.atomic_writer(core._io_path(paths[0]), encoding="utf-8-sig") as a, \
+         core.atomic_writer(core._io_path(paths[1]), encoding="utf-8-sig") as b, \
+         core.atomic_writer(core._io_path(paths[2]), encoding="utf-8-sig") as c:
+        tasks_out, sources_out, rounds_out = (make_writer(stream, fields) for stream, fields in
+                                             ((a,catalog_fields),(b,source_fields),(c,round_fields)))
+        for entry in payload.get("cases", []):
+            common = {"case": entry.get("case"), "rank": entry.get("rank", rank)}
+            device = entry.get("device_task_links") or {}
+            statuses = {link.get("task_key"): link.get("status") for link in device.get("links", [])}
+            for task in device.get("device_tasks", []):
+                row = {**common, **task, "source_status": statuses.get(task.get("task_key"), task.get("source_status", "NOT_RESOLVED"))}
+                if row.get("start_ns") is not None and row.get("end_ns") is not None:
+                    row["duration_ns"] = int(row["end_ns"])-int(row["start_ns"])
+                tasks_out.writerow(row)
+            for link in device.get("links", []):
+                row = {**common, **link, "source_status": link.get("status")}
+                for field in ("flow_ids", "host_associations", "missing_source_event_indexes"):
+                    row[field+"_json"] = json.dumps(wire(link.get(field, [])), ensure_ascii=True, separators=(",", ":"))
+                sources_out.writerow(row)
+            for binding in device.get("task_round_bindings", []):
+                rounds_out.writerow({**common, **binding, "host_role": binding.get("role", binding.get("host_role")),
+                                     "binding_json": json.dumps(wire(binding), ensure_ascii=True, separators=(",", ":"))})
+    return paths
+
+
+def detail_limit(value):
+    try:
+        number = int(value)
+    except (ValueError, TypeError) as error:
+        raise argparse.ArgumentTypeError("--detail-rounds must be 0 (all rounds) or a positive integer") from error
+    if number < 0:
+        raise argparse.ArgumentTypeError("--detail-rounds must be 0 (all rounds) or a positive integer")
+    return number
 
 
 def main(argv=None):
@@ -417,8 +511,9 @@ def main(argv=None):
     parser.add_argument("--workers", type=core._cli_positive_workers, default=None)
     parser.add_argument("--case", dest="names", action="append", help="Optional case selection; default exports ALL cases")
     parser.add_argument("--expected-cases", type=core._cli_positive_workers)
-    parser.add_argument("--detail-rounds", type=core._cli_positive_workers, default=1,
-                        help="Complete representative rounds per case for device-source links; all Host calls and HC/U rounds are still retained")
+    parser.add_argument("--detail-rounds", type=detail_limit, default=0,
+                        help="Round relations for task sources: default 0 keeps ALL rounds; positive values explicitly limit round attribution, never the task catalog")
+    parser.add_argument("--no-package", action="store_true", help="Keep full JSON and readable CSVs locally; skip ZIP/base64 packaging")
     parser.add_argument("--out", type=Path, default=Path("u_swimlane_all_dp4"))
     args = parser.parse_args(argv)
     if not args.rank or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-" for c in args.rank):
@@ -476,7 +571,7 @@ def main(argv=None):
             parser.error("Output directory would overwrite a source input")
     core._io_path(out).mkdir(parents=True, exist_ok=True)
     workers = core._cli_case_workers(args.workers, len(selected), "swimlane case (fixed " + args.rank + ")")
-    payload = {"schema": SCHEMA, "profile_version": core.PROFILE_VERSION, "rank": args.rank,
+    payload = {"schema": SCHEMA, "profile_version": core.PROFILE_VERSION, "export_version": EXPORT_VERSION, "rank": args.rank,
                "manifest_sha256": hashlib.sha256(core._io_path(manifest).read_bytes()).hexdigest(),
                "planned_cases": len(selected), "completed_cases": 0,
                "execution": {"parallelism": "case", "workers": workers}, "cases": [],
@@ -489,7 +584,9 @@ def main(argv=None):
                                     "confirmed_device_edge": "solid", "inferred_or_source_only_edge": "dashed",
                                     "cpu_wait": "Do not invent a directly submitted device kernel"},
                "retention": {"all_complete_hc_rounds": True, "all_recognized_host_calls": True,
-                             "host_calls_clipped": False, "byte_budget_truncation": False},
+                             "all_csv_device_tasks": True, "trace_only_device_x_events": True,
+                             "all_round_source_relations": args.detail_rounds == 0,
+                             "host_calls_clipped": False, "device_spans_clipped": False, "byte_budget_truncation": False},
                "scope": "Existing CSV/trace offline diagnostic only. HC envelopes are not full graphs or continuous busy time. "
                         "Host calls are full wall ranges. Round association by Host order/graph entry is labeled inference, "
                         "not a complete device flow proof. Missing/ambiguous/unaligned data are never filled from other rounds."}
@@ -501,15 +598,21 @@ def main(argv=None):
         core.atomic_json(core._io_path(out/("u_swimlane_"+args.rank+".json")), wire(payload))
         print(f"[{len(complete)}/{len(selected)}] {entry['case']} {entry['status']}; complete rounds={entry.get('complete_rounds', 0)}", flush=True)
     write_status(payload, out, args.rank)
-    archive, parts = write_packages(payload, out, args.rank)
+    tables = write_device_tables(payload, out, args.rank)
+    archive, parts = (None, []) if args.no_package else write_packages(payload, out, args.rank)
     ready = sum(e["status"] == "READY" for e in payload["cases"])
     detailed = sum(e.get("detail_status") == "READY" for e in payload["cases"])
     print(f"READY={ready}/{len(selected)}; child-detail READY={detailed}/{len(selected)}; full coordinates were not truncated", flush=True)
-    print("Local full-history archive: " + str(archive), flush=True)
-    print("Full-history text parts: " + str(len(parts)) + "; keep this archive locally", flush=True)
+    for path in tables:
+        print("Device evidence: " + str(path), flush=True)
+    if archive is not None:
+        print("Local full-history archive: " + str(archive), flush=True)
+        print("Full-history text parts: " + str(len(parts)) + "; keep this archive locally", flush=True)
+    else:
+        print("Full JSON and CSVs kept locally; ZIP/base64 packaging skipped (--no-package)", flush=True)
     print("For copy/paste PPT evidence, run tools/u_swimlane_share.py on " +
           str(out / ("u_swimlane_" + args.rank + ".json")), flush=True)
-    return int(ready != len(selected))
+    return int(ready != len(selected) or any(e.get("device_task_status") == "ERROR" for e in payload["cases"]))
 
 
 if __name__ == "__main__":

@@ -27,6 +27,8 @@ _SINGLE_REFS = {
 _MANY_REFS = {
     "ancestor_event_indexes", "parent_event_indexes", "explicit_parent_event_indexes", "event_indexes",
     "source_event_indexes", "missing_source_event_indexes", "missing_host_event_indexes",
+    "host_family_event_indexes", "host_scope_event_indexes", "source_required_event_indexes",
+    "flow_event_indexes",
 }
 _STAMP_KEYS = {"start_ns", "end_ns", "origin_ns", "timestamp_ns", "clock_offset_ns", "csv_start_ns", "trace_start_ns"}
 _DUPLICATE_REF_FIELDS = ("name", "kind", "start_ns", "end_ns", "duration_ns", "event_type")
@@ -242,6 +244,176 @@ def _link_subset(original, round_id):
     return result, _refs(links) | _refs(edges), rows
 
 
+def _task_key(record):
+    """Keep the task namespace separate from event indexes and CSV row IDs.
+
+    Trace-only tasks use ``trace:<event_index>`` and may retain a negative
+    internal resolver row. Neither is interpreted as a physical CSV row.
+    """
+    key = record.get("task_key")
+    if key is not None:
+        if not isinstance(key, str) or not key:
+            raise ValueError("Saved device task_key must be a nonempty string")
+        return key
+    row = record.get("row_index")
+    if isinstance(row, bool) or not isinstance(row, (int, str)):
+        if row is None:
+            return None
+        raise ValueError("Saved task row must be an integer")
+    return "row:" + str(int(row))
+
+
+def _binding_relation(binding):
+    return binding.get("relation", binding.get("binding_type", binding.get("type")))
+
+
+def _edge_in_round(edge, round_id):
+    """Read explicit edge context; task membership alone does not own an edge."""
+    identities = edge.get("round_ids") or []
+    if not isinstance(identities, (list, tuple)):
+        raise ValueError("Saved task edge round_ids must be a list")
+    return edge.get("round_id") == round_id or round_id in identities
+
+
+def _observation_task_keys(observation):
+    keys = set(observation.get("candidate_task_keys") or [])
+    for key in ("represented_by_task_key", "task_key"):
+        value = observation.get(key)
+        if isinstance(value, str) and value:
+            keys.add(value)
+    return keys
+
+
+def _device_only_binding(binding):
+    # Only a recorded device-cycle relation is trusted when Host alignment
+    # failed. Unexpected Host fields cannot leak through this allowlist.
+    allowed = {"round_id", "task_key", "row_index", "csv_row_index", "trace_event_index", "source_kind",
+               "relation", "binding_type", "type", "cycle_start_ns", "cycle_end_ns", "round_start_ns",
+               "round_end_ns", "device_start_ns", "device_end_ns", "overlap_start_ns", "overlap_end_ns",
+               "overlap_ns", "overlap_duration_ns", "cycle_overlap_ns", "time_relation", "scope", "status"}
+    return {key: deepcopy(value) for key, value in binding.items() if key in allowed}
+
+
+def _task_link_subset(original, round_id, *, trusted=True, untrusted_status="CLOCK_UNALIGNED"):
+    """Keep every explicitly bound selected-round task, not only U anchors.
+
+    A selected Host can have submitted a task that executes beyond the cycle
+    or beyond its own return. Its recorded binding survives unchanged; no new
+    round membership or submission confidence is inferred from timestamps.
+    """
+    if not isinstance(original, dict):
+        return None, set(), set()
+    array_keys = {"device_tasks", "links", "source_events", "task_round_bindings", "drawable_edges", "task_edges",
+                  "ambiguous_trace_device_observations", "trace_device_observations", "host_family_scopes",
+                  "ambiguity_context_device_tasks", "missing_host_event_indexes"}
+    result = deepcopy({key: value for key, value in original.items() if key not in array_keys})
+    all_bindings = original.get("task_round_bindings") or []
+    selected = [deepcopy(binding) for binding in all_bindings if binding.get("round_id") == round_id
+                and (trusted or _binding_relation(binding) == "DEVICE_CYCLE_OVERLAP")]
+    if not trusted:
+        selected = [_device_only_binding(binding) for binding in selected]
+    keys = {_task_key(binding) for binding in selected}
+    if None in keys:
+        raise ValueError("Saved selected-round task binding has no task identity")
+    tasks = [deepcopy(task) for task in original.get("device_tasks") or [] if _task_key(task) in keys]
+    present = {_task_key(task) for task in tasks}
+    missing_tasks = sorted(keys - present)
+    all_bound = {_task_key(binding) for binding in all_bindings}
+    all_bound.discard(None)
+    result.update(selected_round_id=round_id, task_round_bindings=selected, device_tasks=tasks,
+                  links=[], source_events=[], drawable_edges=[], task_edges=[], ambiguous_trace_device_observations=[],
+                  trace_device_observations=[], host_family_scopes=[], ambiguity_context_device_tasks=[],
+                  selection_scope="All recorded tasks explicitly bound to the selected round; includes stage-internal and delayed tasks, not only U boundaries",
+                  original_catalog_task_count=len(original.get("device_tasks") or []),
+                  selected_catalog_task_count=len(tasks),
+                  omitted_catalog_task_count=len(original.get("device_tasks") or [])-len(tasks),
+                  omitted_unbound_catalog_task_count=sum(_task_key(task) not in all_bound
+                                                       for task in original.get("device_tasks") or []),
+                  missing_device_task_keys=missing_tasks)
+    if not trusted:
+        result.update(status=untrusted_status, source_status="UNAVAILABLE", source_task_status_counts={},
+                      selection_reference_status="UNAVAILABLE", missing_event_indexes=[],
+                      reason="Original clock/source case is untrusted; only recorded device-cycle task membership is retained")
+        return result, set(), keys
+    selected_links = [deepcopy(link) for link in original.get("links") or [] if _task_key(link) in keys]
+    edges = [deepcopy(edge) for edge in original.get("drawable_edges") or []
+             if edge.get("round_id") == round_id and _task_key(edge) in keys]
+    task_edges = [deepcopy(edge) for edge in original.get("task_edges") or []
+                  if _edge_in_round(edge, round_id) and _task_key(edge) in keys]
+    for edge in task_edges:
+        if "round_ids" in edge:
+            edge["original_round_ids"] = edge["round_ids"]
+            edge["round_ids"] = [round_id]
+    observations = [deepcopy(item) for item in original.get("ambiguous_trace_device_observations") or []
+                    if _observation_task_keys(item).intersection(keys)]
+    trace_observations = [deepcopy(item) for item in original.get("trace_device_observations") or []
+                          if _observation_task_keys(item).intersection(keys)]
+    families = [deepcopy(item) for item in original.get("host_family_scopes") or [] if item.get("round_id") == round_id]
+    ambiguity_keys = {key for item in observations + trace_observations
+                      for key in item.get("candidate_task_keys") or []} - keys
+    context_tasks = [deepcopy(task) for task in original.get("device_tasks") or [] if _task_key(task) in ambiguity_keys]
+    linked = {_task_key(link) for link in selected_links}
+    result.update(links=selected_links, drawable_edges=edges, task_edges=task_edges,
+                  ambiguous_trace_device_observations=observations,
+                  trace_device_observations=trace_observations, host_family_scopes=families,
+                  ambiguity_context_device_tasks=context_tasks,
+                  missing_ambiguity_candidate_task_keys=sorted(ambiguity_keys - {_task_key(task) for task in context_tasks}),
+                  missing_device_source_task_keys=sorted(present - linked),
+                  source_task_status_counts=dict(Counter(link.get("status", "UNKNOWN") for link in selected_links)))
+    if "source_task_status_counts" in original:
+        result["original_source_task_status_counts"] = deepcopy(original["source_task_status_counts"])
+    return result, _refs(selected_links) | _refs(edges) | _refs(task_edges) | _refs(selected) | _refs(families), keys
+
+
+def _task_reference_status(result, available, wanted):
+    """Expose missing saved proof and never keep a confirmed partial path."""
+    available_ids = set(available)
+    missing = set(wanted) - available_ids
+    incomplete_tasks = set(result.get("missing_device_task_keys") or [])
+    binding_missing = {}
+    for number, binding in enumerate(result.get("task_round_bindings") or []):
+        absent = _closure(_refs(binding), available) - available_ids
+        binding_missing[number] = absent
+        if absent:
+            incomplete_tasks.add(_task_key(binding))
+            missing.update(absent)
+    for link in result.get("links") or []:
+        if _closure(_refs(link), available) - available_ids:
+            incomplete_tasks.add(_task_key(link))
+    for number, binding in enumerate(result.get("task_round_bindings") or []):
+        if binding_missing[number] or _task_key(binding) in incomplete_tasks:
+            if (_binding_relation(binding) == "EXPLICIT_SOURCE_OWNER"
+                    or binding.get("runtime_submission_confirmed") is True):
+                binding["original_relation"] = _binding_relation(binding)
+                binding["original_runtime_submission_confirmed"] = binding.get("runtime_submission_confirmed")
+                binding.update(relation="UNVERIFIED_SOURCE_OWNER", runtime_submission_confirmed=False,
+                               line_style="dashed")
+            binding["selection_evidence_status"] = "MISSING_SAVED_REFERENCES_OR_TASK"
+            if binding_missing[number]:
+                binding["missing_source_event_indexes"] = sorted(binding_missing[number])
+    for link in result.get("links") or []:
+        link_missing = _closure(_refs(link), available) - available_ids
+        if link_missing or _task_key(link) in incomplete_tasks:
+            incomplete_tasks.add(_task_key(link))
+            link["missing_source_event_indexes"] = sorted(set(link.get("missing_source_event_indexes") or []) | link_missing)
+            for association in link.get("host_associations") or []:
+                if association.get("runtime_submission_confirmed"):
+                    association["original_runtime_submission_confirmed"] = True
+                association.update(runtime_submission_confirmed=False, line_style="dashed")
+                association["selection_evidence_status"] = "MISSING_SAVED_REFERENCES_OR_TASK"
+        missing.update(link_missing)
+    for edge in [*(result.get("drawable_edges") or []), *(result.get("task_edges") or [])]:
+        if _closure(_refs(edge), available) - available_ids or _task_key(edge) in incomplete_tasks:
+            if edge.get("runtime_submission_confirmed"):
+                edge["original_runtime_submission_confirmed"] = True
+            edge.update(runtime_submission_confirmed=False, line_style="dashed",
+                        selection_evidence_status="MISSING_SAVED_REFERENCES")
+    result.update(missing_event_indexes=sorted(missing), selection_reference_status="PARTIAL" if (
+        missing or result.get("missing_device_task_keys") or result.get("missing_device_source_task_keys")
+        or result.get("missing_ambiguity_candidate_task_keys")) else "COMPLETE")
+    return missing
+
+
 def _deduplicate_child_fields(row, host_lookup):
     removed = 0
     def walk(value):
@@ -284,7 +456,7 @@ def _device_rows(value):
 
 def _case_evidence(case, core, host_analysis, attach_host, rank, source_case_index):
     output = deepcopy({key: value for key, value in case.items()
-                       if key not in ("rounds", "host_events", "anchor_links", "device_anchors")
+                       if key not in ("rounds", "host_events", "anchor_links", "device_anchors", "device_task_links")
                        and key not in _HISTORY_FIELDS})
     for key, renamed in _HISTORY_FIELDS.items():
         if key in case:
@@ -316,6 +488,10 @@ def _case_evidence(case, core, host_analysis, attach_host, rank, source_case_ind
                                       if _index(task.get("row_index")) in _device_rows(row)],
                       anchor_links={"status": "UNAVAILABLE", "reason": "Untrusted source case; no device-source arrows copied",
                                     "anchor_bindings": [], "links": [], "drawable_edges": [], "source_events": [], "device_tasks": []})
+        if isinstance(case.get("device_task_links"), dict):
+            tasks, _, _ = _task_link_subset(case["device_task_links"], row["round_id"], trusted=False,
+                                           untrusted_status="CLOCK_UNALIGNED" if not clock_ok else "SOURCE_UNTRUSTED")
+            output["device_task_links"] = tasks
         return output
     host_events, host_lookup = _events(case.get("host_events") or [])
     # The complete saved set is necessary here: filtering first could erase a
@@ -323,35 +499,57 @@ def _case_evidence(case, core, host_analysis, attach_host, rank, source_case_ind
     pairs = host_analysis.pair_rounds(core, [row], host_events)
     row = attach_host([row], pairs, host_events)[0]
     links, source_seeds, linked_rows = _link_subset(case.get("anchor_links"), row["round_id"])
+    task_original = case.get("device_task_links")
+    if isinstance(task_original, dict):
+        trace_sha = (case.get("trace") or {}).get("sha256")
+        if trace_sha and task_original.get("trace_sha256") and trace_sha != task_original["trace_sha256"]:
+            raise ValueError("Device task source evidence belongs to a different trace SHA256")
+    task_clock_ok = not isinstance(task_original, dict) or task_original.get("clock_alignment_status", "ALIGNED_X_EVENTS") == "ALIGNED_X_EVENTS"
+    tasks, task_seeds, _ = _task_link_subset(task_original, row["round_id"], trusted=task_clock_ok)
     source_events, source_lookup = _events((case.get("anchor_links") or {}).get("source_events") or [])
     available = _available(host_lookup, source_lookup)
+    task_events, task_lookup = _events((task_original or {}).get("source_events") or [] if task_clock_ok else [])
+    available = _available(available, task_lookup)
     source_wanted = _closure(source_seeds, available)
-    host_wanted = _closure(_round_refs(row) | source_seeds, available)
+    task_wanted = _closure(task_seeds, available)
+    anchor_host_wanted = _closure(_round_refs(row) | source_seeds, available)
+    host_wanted = _closure(_round_refs(row) | source_seeds | task_seeds, available)
     kept_host = [deepcopy(event) for event in host_events if event["event_index"] in host_wanted]
     # Host proofs can have a recorded ancestor only in the raw source table.
     # It must survive even when it was not also a selected device-link source.
-    needed_source = source_wanted | (host_wanted - host_lookup.keys())
-    kept_source = [deepcopy(event) for event in source_events if event["event_index"] in needed_source]
+    needed_source = source_wanted | (anchor_host_wanted - host_lookup.keys())
+    kept_source = [deepcopy(available[number]) for number in sorted(needed_source) if number in available]
     links["source_events"] = kept_source
     links["missing_host_event_indexes"] = sorted(
         _index(number) for number in (case.get("anchor_links") or {}).get("missing_host_event_indexes", [])
         if _index(number) in host_wanted)
     links["selected_round_id"] = row["round_id"]
+    task_missing = set()
+    if tasks is not None and task_clock_ok:
+        tasks["source_events"] = [deepcopy(available[number]) for number in sorted(task_wanted) if number in available]
+        task_missing = _task_reference_status(tasks, available, task_wanted)
+        output["device_task_links"] = tasks
+    elif tasks is not None:
+        output["device_task_links"] = tasks
     removed = _deduplicate_child_fields(row, host_lookup)
     selected_rows = linked_rows | _device_rows(row)
     exported_ids = {event["event_index"] for event in kept_host + kept_source}
+    task_exported_ids = {event["event_index"] for event in (tasks or {}).get("source_events", [])}
     complete_host = set(HOST_LANES).issubset(row["host_lanes"])
     complete_round = row["host_pairing"].get("status") == "MATCHED" and complete_host and row.get("stage_status") == "MATCHED"
     output.update(rounds=[row], host_events=kept_host, anchor_links=links,
                   device_anchors=[deepcopy(task) for task in case.get("device_anchors", [])
                                   if _index(task.get("row_index")) in selected_rows],
-                  missing_event_indexes=sorted((host_wanted | source_wanted) - exported_ids),
+                  missing_event_indexes=sorted(((host_wanted | source_wanted | task_wanted)
+                                               - (exported_ids | task_exported_ids)) | task_missing),
                   source_link_round_ids=[row["round_id"]] if links.get("anchor_bindings") else [],
                   selected_complete_host_rounds=int(complete_host), selected_complete_rounds=int(complete_round),
                   representative_status="READY" if complete_round else "PARTIAL",
                   deduplicated_child_fields=removed,
                   selection_counts={"source_host_events": len(host_events), "selected_host_events": len(kept_host),
-                                    "source_source_events": len(source_events), "selected_source_events": len(kept_source)})
+                                    "source_source_events": len(source_events), "selected_source_events": len(kept_source),
+                                    "source_task_source_events": len(task_events),
+                                    "selected_task_source_events": len(task_exported_ids)})
     return output
 
 
@@ -377,11 +575,13 @@ def build_ppt_evidence(payload, core, host_analysis, attach_host, source_info, r
               "diagram_contract": {"host_lane_order": ["outer_propose", "preparation_dp_aggregate", "runner_inputs", "runner_attn", "state_attn"],
                   "host_color_by": "function_kind", "host_labels": "function name and wall time",
                   "show_hc_overlap_labels": False, "children_depth_to_display": 1,
-                  "confirmed_device_edge": "solid only when the original recorded evidence confirms submission and a unique boundary",
+                  "confirmed_device_edge": "solid only when the original recorded evidence confirms submission; "
+                                           "U-boundary arrows additionally require a unique boundary",
                   "inferred_or_source_only_edge": "dashed", "unknown": "Leave missing lanes/intervals/arrows blank; never borrow another rank or round",
                   "cpu_wait": "Do not invent a directly submitted device kernel"},
               "scope": "PPT representative-round evidence, not the full run or a full-history statistical summary. "
-                       "Original full export stays unchanged; every recorded selected-round child and source proof is retained. "
+                       "Original full export stays unchanged; every recorded selected-round child and source proof is retained, "
+                       "including tasks internal to stages and tasks that execute after their owning Host scope returns. "
                        "Source confidence is copied and never strengthened by this selection.",
               "representation": {"event_namespace": "case + rank + original trace SHA256 + event_index",
                   "host_children": "Reconstruct from host_pairing.child_layer.by_role refs and this case's event tables; "
@@ -389,8 +589,11 @@ def build_ppt_evidence(payload, core, host_analysis, attach_host, source_info, r
                   "deduplicated_ref_fields": list(_DUPLICATE_REF_FIELDS),
                   "ref_resolution": "When a child ref field is absent, read it from host_events[event_index]; "
                                     "only equal duplicate fields are removed. Proof/ownership fields stay on the ref. "
-                                    "Parent/source references resolve in the union of the case's host_events and anchor_links.source_events.",
+                                    "Parent/source references resolve in the union of the case's host_events, "
+                                    "anchor_links.source_events and device_task_links.source_events.",
                   "anchor_binding_indexes": "Remapped to the selected anchor_bindings; source_binding_indexes records old indexes",
+                  "device_task_membership": "Selected only from recorded task_round_bindings, independently of U anchor bindings; "
+                                            "task_key is the identity. Timestamp overlap does not prove submission ownership.",
                   "status": "case status is original source status; representative_status separately describes the rebuilt selected round"}}
     for number, case in enumerate(payload["cases"]):
         if progress:
