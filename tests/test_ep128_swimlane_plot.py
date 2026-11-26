@@ -10,6 +10,8 @@ import xml.etree.ElementTree as ET
 
 import ep128_swimlane_plot as plot
 import test_ep128_swimlane_share as fixtures
+import test_ep128_swimlane_anchor_audit as audit_fixtures
+from ep128_swimlane_anchor_audit import audit_stage_anchors
 
 
 def lane(panel, role):
@@ -24,6 +26,28 @@ def summarize(data=None, **kwargs):
 
 
 class SwimlanePlotEvidenceTests(unittest.TestCase):
+    def test_default_child_view_partitions_each_parent_once_without_nested_double_count(self):
+        panel, = summarize()["panels"]
+        self.assertEqual(len(panel["child_plot_rows"]), len(panel["host_lanes"]))
+        for group in panel["child_plot_rows"]:
+            self.assertTrue(group["exclusive"])
+            parent = panel["host_lanes"][group["lane"]]
+            pieces = group["events"]
+            self.assertEqual(sum(p["duration_ns"] for p in pieces), parent["duration_ns"])
+            self.assertEqual(pieces[0]["start_ns"], parent["start_ns"])
+            self.assertEqual(pieces[-1]["end_ns"], parent["end_ns"])
+            self.assertTrue(all(a["end_ns"] == b["start_ns"] for a,b in zip(pieces,pieces[1:])))
+
+    def test_worker_outer_scope_sets_axis_without_changing_device_cycle(self):
+        result=summarize()
+        panel,=result["panels"]
+        business=panel["worker_business"]
+        self.assertTrue(business["closed"])
+        self.assertLessEqual(result["x_min_ms"],min(s["start_ms"] for s in business["outer_scopes"]))
+        self.assertGreaterEqual(result["x_max_ms"],max(s["end_ms"] for s in business["outer_scopes"]))
+        self.assertEqual(panel["duration_ns"],300)
+        self.assertNotEqual(business["duration_ns"],panel["duration_ns"])
+
     def test_full_v2_recovers_runner_attention_without_reading_trace_or_mutating_input(self):
         data = fixtures.payload()
         before = deepcopy(data)
@@ -171,6 +195,41 @@ class SwimlanePlotEvidenceTests(unittest.TestCase):
 
 
 class SwimlanePlotGeometryTests(unittest.TestCase):
+    def test_all_thirty_destinations_are_visible_and_shared_task_endpoint_is_drawn_once(self):
+        panel, = summarize()["panels"]
+        panel["anchor_audit"] = audit_stage_anchors(audit_fixtures.fixture(), audit_fixtures.EPOCH)
+        drawing = plot.panel_drawing(panel)
+        labels = [e for e in drawing["elements"] if e.get("role") == "anchor_destination"]
+        ids = [key for e in labels for key in e["anchor_ids"]]
+        self.assertEqual(sorted(ids), sorted("U"+str(i)+"."+side for i in range(1,16) for side in ("start","end")))
+        self.assertEqual(len(ids), len(set(ids)))
+        edges = [e for e in drawing["elements"] if e.get("role") == "source_edge"]
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0]["anchor_ids"], ["U1.end", "U2.start"])
+        self.assertTrue(edges[0]["runtime_submission_confirmed"])
+        self.assertEqual(edges[0]["dash"], "solid")
+        self.assertIn("无已证实提交线", plot.render_svg(drawing))
+
+    def test_clock_failure_has_thirty_audits_but_no_source_scope_or_source_arrow(self):
+        source = fixtures.payload()
+        source["cases"][0].update(status="ERROR", error="CLOCK_MISMATCH")
+        source["cases"][0]["trace"]["status"] = "CLOCK_MISMATCH"
+        panel, = summarize(source)["panels"]
+        drawing = plot.panel_drawing(panel)
+        self.assertEqual(len(panel["anchor_audit"]["audit_entries"]), 30)
+        self.assertFalse(any(e.get("role") in ("source_edge", "source_scope") for e in drawing["elements"]))
+
+    def test_shared_endpoint_never_promotes_an_unmatched_stage_to_solid(self):
+        panel, = summarize()["panels"]
+        data = audit_fixtures.fixture()
+        data["rounds"][0]["u_windows"][0]["stages"][1]["status"]="UNRESOLVED"
+        panel["anchor_audit"] = audit_stage_anchors(data,audit_fixtures.EPOCH)
+        drawing=plot.panel_drawing(panel)
+        edges=[e for e in drawing["elements"] if e.get("role")=="source_edge"]
+        self.assertEqual([e["anchor_ids"] for e in edges],[["U1.end"]])
+        labels=[e for e in drawing["elements"] if e.get("role")=="anchor_destination"]
+        self.assertTrue(any(e["anchor_ids"]==["U2.start"] for e in labels))
+
     def drawing(self, **kwargs):
         result = summarize()
         return plot.panel_drawing(result["panels"][0], width=1600,
