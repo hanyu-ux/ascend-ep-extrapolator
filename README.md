@@ -41,7 +41,7 @@ ascend-ep-extrapolator/
 | `docs/usage.md` | 输入配置与操作说明 |
 | `docs/presentations/` | HC 周期拆解的一页 PPT、PDF 和预览图 |
 
-主脚本、Excel生成器、XLSX写入器、Attention准备识别模块及U主要耗时模块应放在同一目录。统计核心版本为 `20261123.1.u_hotspots`，Excel生成器为 `20261126.1.swimlane_charts`，写入器为 `20261126.1.native_vectors`；泳道绘图还需同步`ep128_swimlane_plot.py`、`ep128_swimlane_excel.py`及已有泳道证据模块。
+主脚本、Excel生成器、XLSX写入器、Attention准备识别模块及U主要耗时模块应放在同一目录。统计核心版本为 `20261123.1.u_hotspots`，Excel生成器为 `20261126.1.swimlane_charts`，写入器为 `20261126.2.merge_index`；泳道绘图还需同步`ep128_swimlane_plot.py`、`ep128_swimlane_excel.py`及已有泳道证据模块。
 
 ## 快速运行
 
@@ -327,13 +327,15 @@ python -X utf8 -B -u .\profile_ep128.py --u-swimlane-json .\u_swimlane_ppt_dp4\u
 
 输出`u_swimlane_charts_dp4/u_swimlane.xlsx`和`u_swimlane.html`。独立模式的工作簿只含“额外图表统计”页，上方排列全部case的统一毫秒轴总览，随后连续排列各case放大图，底部保留全部已导出的子调用及来源候选明细；总览、放大图和明细间有内部跳转。一个工作表可以向下滚动，不表示把12份细节硬挤在一张打印纸里。
 
+只需要看这批泳道时，不要传`--u-swimlane-report`。独立模式先写HTML并打印可打开的路径，再生成Excel；图和明细按case输出进度。完整报表模式还会重建时间账本、各方法页等其他工作表，耗时与已有报告明细量有关。日志中已有报告的`failures`是其保存的历史错误，不代表泳道绘图重新读取了那些CSV。合并单元格冲突校验使用按行索引及小区域直接查找，常用明细表不再为每个单元格扫描全部既有表格；冲突检查和全部明细保留。
+
 **要保留原完整报表的11个工作表，并把泳道加进其“额外图表统计”页**，同一命令再加已有核心报告路径：
 
 ```powershell
-python -X utf8 -B -u .\profile_ep128.py --u-swimlane-json .\u_swimlane_ppt_dp4\u_swimlane_ppt_dp4.json --u-swimlane-rank dp4 --u-swimlane-report .\ep128_report_11\model_architecture_report.json --out .\ep128_report_with_swimlane
+python -X utf8 -B -u .\profile_ep128.py --u-swimlane-json .\u_swimlane_ppt_dp4\u_swimlane_ppt_dp4.json --u-swimlane-rank dp4 --u-swimlane-report .\本次完整报告\model_architecture_report.json --out .\ep128_report_with_swimlane
 ```
 
-也可直接用Excel生成器`--report 原报告.json --swimlane-json 泳道.json --swimlane-rank dp4 --out 新报表.xlsx`。该模式从已有核心JSON重建完整Excel；不修改输入报告或原XLSX，不改变已有外推值。泳道代表轮与方法页的外推均值分别标注，不把单轮值写回外推。输出目录应与输入JSON分开。
+把`本次完整报告`替换为实际路径，并核对日志里的生成日期和case清单，不要误用旧报告。也可直接用Excel生成器`--report 原报告.json --swimlane-json 泳道.json --swimlane-rank dp4 --out 新报表.xlsx`。该模式从已有核心JSON重建完整Excel；不修改输入报告或原XLSX，不改变已有外推值。泳道代表轮与方法页的外推均值分别标注，不把单轮值写回外推。输出目录应与输入JSON分开。
 
 图使用Excel原生矢量形状，函数名、子调用、竖分界和箭头可缩放；HTML复用同一几何。五条Host线分别为`propose`、下一轮前处理/DP聚合、Runner输入、Runner块表/slot、model-state metadata。U前8段与后7段沿用原设备锚点，竖线贯穿CPU/NPU；Host按函数着色，不按HC重叠染色。DP总范围、已验证wait及协调外wall分别显示，嵌套子调用不能相加。图只展开一层有语义的子函数，透明wrapper折叠；全部已保留子调用及精确时间在同页底部表中，图中省略的长名称可回查完整名称。
 

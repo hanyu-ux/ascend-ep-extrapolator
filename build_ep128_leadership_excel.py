@@ -1919,7 +1919,8 @@ def _extra_charts_sheet(book, report):
     row += 2
     if getattr(book, "swimlane_summary", None) is not None:
         from ep128_swimlane_excel import append_swimlanes
-        row = append_swimlanes(sheet, row, book.swimlane_summary, note=_note, table=_table)
+        row = append_swimlanes(sheet, row, book.swimlane_summary, note=_note, table=_table,
+                               progress=getattr(book, "progress", None))
     row = _u_hotspots_excel_section(sheet, row, report)
     groups = _extra_residual_groups(report)
     if not groups:
@@ -3140,7 +3141,10 @@ def _ledger_sheet(book, report):
     row = 5
     fields = ("source_cycle_ms", "source_main_chain_ms", "source_draft_chain_ms",
               "cross_role_tail_residual_ms", "partition_total_ms", "closed", "scope")
-    for case in report["cases"]:
+    progress = getattr(book, "progress", None)
+    for case_index, case in enumerate(report["cases"]):
+        if progress:
+            progress("时间账本 " + str(case_index+1) + "/" + str(len(report["cases"])) + "：" + case["name"])
         _set_table_case(sheet, case)
         row = _note(sheet, row, case["name"] + "；" + LAYER_RESIDUAL_NOTE)
         for identity in METHOD_IDS:
@@ -3154,6 +3158,8 @@ def _ledger_sheet(book, report):
             diagnostic = capture.get("step_residuals")
             if diagnostic is None:
                 continue
+            if progress:
+                progress("时间账本 " + case["name"] + " / " + str(capture.get("rank")) + "：阶段与来源表")
             trace = diagnostic.get("trace") or {}
             row = _note(sheet, row, "源rank=" + _text(capture.get("rank")) + " · HC周期剩余区间实测；状态="
                         + _text(diagnostic.get("status")) + "；host trace=" + _text(trace.get("status")))
@@ -4062,7 +4068,16 @@ def build_swimlane_workbook(out, *, swimlane_json, rank="dp4", progress=None):
     if progress:
         progress("仅读取已有泳道JSON，不读取CSV/trace，不重新采样")
     summary = _load_swimlane_summary(source, rank)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    document = ('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Host / HC / U 同轮泳道</title>'
+                '<style>body{margin:20px;color:#173451;font:14px system-ui}table{border-collapse:collapse;width:100%}'
+                'th,td{border:1px solid #d2dde8;padding:7px}th{background:#edf2f7}svg{display:block}</style>'
+                + html_section(summary) + '</html>')
+    destination.with_suffix(".html").write_text(document, encoding="utf-8")
+    if progress:
+        progress("HTML泳道已生成，可先打开：" + str(destination.with_suffix(".html")))
     book = Workbook()
+    book.progress = progress
     book.detail_rows, book.report_origin = DEFAULT_DETAIL_ROWS, str(source)
     sheet = book.add_sheet(SHEETS[10], widths=[12] * 24, paper_size=8)
     sheet.detail_rows, sheet.report_origin = book.detail_rows, book.report_origin
@@ -4070,13 +4085,8 @@ def build_swimlane_workbook(out, *, swimlane_json, rank="dp4", progress=None):
     sheet.row_height(1, 29).row_height(2, 14).freeze(3, 0)
     if progress:
         progress("绘制全部case总览、放大泳道及调用明细")
-    append_swimlanes(sheet, 4, summary, note=_note, table=_table)
+    append_swimlanes(sheet, 4, summary, note=_note, table=_table, progress=progress)
     path = book.save(destination)
-    document = ('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Host / HC / U 同轮泳道</title>'
-                '<style>body{margin:20px;color:#173451;font:14px system-ui}table{border-collapse:collapse;width:100%}'
-                'th,td{border:1px solid #d2dde8;padding:7px}th{background:#edf2f7}svg{display:block}</style>'
-                + html_section(summary) + '</html>')
-    destination.with_suffix(".html").write_text(document, encoding="utf-8")
     if progress:
         progress("独立泳道工作簿已写出；工作表：额外图表统计")
     return Path(path)
@@ -4180,6 +4190,7 @@ def build_workbook(out, *, report=None, report_data=None, cases=None, reference=
         for message in _input_report_diagnostics(payload, report or cases, reused=report_data is not None):
             progress(message)
     book = Workbook()
+    book.progress = progress
     book.detail_rows = detail_rows
     book.report_origin = str(report or cases)
     if swimlane_json is not None:

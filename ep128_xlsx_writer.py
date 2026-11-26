@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
-WRITER_VERSION = "20261126.1.native_vectors"
+WRITER_VERSION = "20261126.2.merge_index"
 MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -747,7 +747,75 @@ def _styles():
     return root
 
 
+class _MergeList(list):
+    """A normal ordered merge list with a revision for exact cache invalidation.
+
+    External diagnostics may inspect or replace ``Worksheet.merges``. Retaining
+    list behavior while tracking every mutator also catches same-length slice
+    replacements, which a length-only cache check cannot notice.
+    """
+    def __init__(self, values=()):
+        super().__init__(tuple(value) for value in values)
+        self.revision = 0
+
+    def append(self, value):
+        super().append(tuple(value))
+        self.revision += 1
+
+    def extend(self, values):
+        converted = [tuple(value) for value in values]
+        super().extend(converted)
+        self.revision += 1
+
+    def insert(self, index, value):
+        super().insert(index, tuple(value))
+        self.revision += 1
+
+    def __setitem__(self, index, value):
+        super().__setitem__(index, [tuple(item) for item in value] if isinstance(index, slice) else tuple(value))
+        self.revision += 1
+
+    def __delitem__(self, index):
+        super().__delitem__(index)
+        self.revision += 1
+
+    def pop(self, index=-1):
+        value = super().pop(index)
+        self.revision += 1
+        return value
+
+    def remove(self, value):
+        super().remove(tuple(value))
+        self.revision += 1
+
+    def clear(self):
+        super().clear()
+        self.revision += 1
+
+    def reverse(self):
+        super().reverse()
+        self.revision += 1
+
+    def sort(self, *args, **kwargs):
+        try:
+            super().sort(*args, **kwargs)
+        finally:
+            self.revision += 1
+
+    def __iadd__(self, values):
+        self.extend(values)
+        return self
+
+    def __imul__(self, count):
+        super().__imul__(count)
+        self.revision += 1
+        return self
+
+
 class Worksheet:
+    _SHORT_MERGE_ROWS = 64
+    _DIRECT_CELL_CHECKS = 4096
+
     def __init__(self, name, widths, landscape, paper_size, print_area):
         self.name = name
         self.widths = list(widths or [])
@@ -767,6 +835,56 @@ class Worksheet:
         self.vector_drawings = []
         self.internal_links = {}
 
+    @property
+    def merges(self):
+        return self._merges
+
+    @merges.setter
+    def merges(self, values):
+        if values is getattr(self, "_merges", None):
+            return  # Attribute += has already invalidated the tracked list.
+        self._merges = _MergeList(values)
+        self._merge_rows = {}
+        self._tall_merges = []
+        self._merge_index_revision = -1
+
+    def _index_merge(self, rectangle):
+        r1, _, r2, _ = rectangle
+        if r2 - r1 + 1 <= self._SHORT_MERGE_ROWS:
+            for row in range(r1, r2 + 1):
+                self._merge_rows.setdefault(row, []).append(rectangle)
+        else:
+            self._tall_merges.append(rectangle)
+
+    def _ensure_merge_index(self):
+        if self._merge_index_revision == self._merges.revision:
+            return
+        self._merge_rows = {}
+        self._tall_merges = []
+        for rectangle in self._merges:
+            if len(rectangle) != 4:
+                raise ValueError("Merged ranges require four one-based coordinates")
+            r1, c1, r2, c2 = rectangle
+            self._check_position(r1, c1)
+            self._check_position(r2, c2)
+            if r1 > r2 or c1 > c2:
+                raise ValueError("Merged range is reversed")
+            self._index_merge(rectangle)
+        self._merge_index_revision = self._merges.revision
+
+    def _merge_candidates(self, first_row, last_row):
+        """Only intersecting row buckets are needed for ordinary report tables."""
+        if last_row - first_row + 1 > self._SHORT_MERGE_ROWS:
+            yield from self._merges
+            return
+        seen = set()
+        for row in range(first_row, last_row + 1):
+            for rectangle in self._merge_rows.get(row, ()):
+                if rectangle not in seen:
+                    seen.add(rectangle)
+                    yield rectangle
+        yield from self._tall_merges
+
     def _check_position(self, row, col):
         try:
             _position(row, col)
@@ -777,7 +895,8 @@ class Worksheet:
         self._check_position(row, col)
         if style not in STYLE_IDS:
             raise ValueError("Unknown worksheet style: " + str(style))
-        for r1, c1, r2, c2 in self.merges:
+        self._ensure_merge_index()
+        for r1, c1, r2, c2 in self._merge_candidates(row, row):
             if r1 <= row <= r2 and c1 <= col <= c2 and (row, col) != (r1, c1):
                 raise ValueError("Cannot write into a non-anchor merged cell")
         value_type, serialized = _value_type(value)
@@ -817,15 +936,25 @@ class Worksheet:
         self._check_position(r2, c2)
         if r1 > r2 or c1 > c2:
             raise ValueError("Merged range is reversed")
+        self._ensure_merge_index()
         if any(not (r2 < a or r1 > b or c2 < c or c1 > d)
-               for a, c, b, d in self.merges):
+               for a, c, b, d in self._merge_candidates(r1, r2)):
             raise ValueError("Merged ranges must not overlap")
-        if any(r1 <= row <= r2 and c1 <= col <= c2 and (row, col) != (r1, c1)
-               for row, col in self.cells):
+        if (r2-r1+1) * (c2-c1+1) <= self._DIRECT_CELL_CHECKS:
+            hides_cells = any((row, col) in self.cells
+                              for row in range(r1, r2+1) for col in range(c1, c2+1)
+                              if (row, col) != (r1, c1))
+        else:
+            hides_cells = any(r1 <= row <= r2 and c1 <= col <= c2 and (row, col) != (r1, c1)
+                              for row, col in self.cells)
+        if hides_cells:
             raise ValueError("Merged range would hide existing cells")
         self.write(r1, c1, value, style)
         if (r1, c1) != (r2, c2):
-            self.merges.append((r1, c1, r2, c2))
+            rectangle = (r1, c1, r2, c2)
+            self._merges.append(rectangle)
+            self._index_merge(rectangle)
+            self._merge_index_revision = self._merges.revision
         return self
 
     def row_height(self, row, pt):

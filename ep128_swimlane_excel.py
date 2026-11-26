@@ -46,7 +46,7 @@ def _drawing(sheet, row, drawing, first=1, last=25):
     return row + rows + 2
 
 
-def append_swimlanes(sheet, row, summary, *, note, table):
+def append_swimlanes(sheet, row, summary, *, note, table, progress=None):
     """All diagrams precede the full child tables, with internal navigation."""
     panels = _ordered(summary)
     row = note(sheet, row, "Host / HC / U 同轮泳道 · " + str(summary.get("rank", "")), columns=24)
@@ -59,6 +59,8 @@ def append_swimlanes(sheet, row, summary, *, note, table):
     overview_links = []
     row = note(sheet, row, "全部case总览 · 按BS、S排序；点击case进入放大泳道", columns=24)
     for offset in range(0, len(panels), 3):
+        if progress:
+            progress("泳道总览 " + str(offset+1) + "–" + str(min(offset+3, len(panels))) + "/" + str(len(panels)))
         top, end = row, row
         for column, panel in enumerate(panels[offset:offset + 3]):
             left, right = 1 + column * 8, 9 + column * 8
@@ -71,6 +73,8 @@ def append_swimlanes(sheet, row, summary, *, note, table):
     row = note(sheet, row, "各case放大泳道 · 函数名、一级语义子调用及U边界；下方附全部已保留调用明细", columns=24)
     detail_positions, table_links = {}, []
     for index, panel in enumerate(panels):
+        if progress:
+            progress("泳道放大图 " + str(index+1) + "/" + str(len(panels)) + "：" + str(panel.get("case")))
         title = str(panel.get("case", "unknown")) + " · rank=" + str(panel.get("rank", summary.get("rank", "")))
         title += " · " + str(panel.get("round_id", panel.get("selected_round_id", "未知轮次")))
         detail_positions[index] = row
@@ -83,6 +87,9 @@ def append_swimlanes(sheet, row, summary, *, note, table):
     table_positions = {}
     row = note(sheet, row, "源数据与调用明细 · 精确时间用ms存为数值，原event_index保留便于回查", columns=24)
     for index, panel in enumerate(panels):
+        if progress:
+            progress("泳道调用明细 " + str(index+1) + "/" + str(len(panels)) + "：" + str(panel.get("case"))
+                     + "；记录=" + str(len(panel.get("detail_rows") or [])))
         table_positions[index] = row
         sheet.merge(row, 1, row, 19, str(panel.get("case", "unknown")) + " · 源调用明细", "header").row_height(row, 30)
         sheet.merge(row, 20, row, 24, "返回该case放大图", "link")
